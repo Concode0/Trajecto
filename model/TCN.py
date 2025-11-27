@@ -18,7 +18,8 @@ class TCN(nn.Module):
                  output_size: int = 3, 
                  tcn_channels: List[int] = [64, 64, 64, 64], 
                  kernel_size: int = 3, 
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 tcn_dilation_factors: List[int] = None):
         """Initializes the TCN model.
 
         Args:
@@ -27,8 +28,15 @@ class TCN(nn.Module):
             tcn_channels (List[int]): A list where each element is the number of output channels for a TCN layer.
             kernel_size (int): The size of the convolutional kernel.
             dropout (float): The dropout rate for regularization.
+            tcn_dilation_factors (List[int], optional): Dilation factor for each TCN layer. 
+                If None, defaults to `[2**i for i in range(len(tcn_channels))]`.
         """
         super(TCN, self).__init__()
+
+        if tcn_dilation_factors is None:
+            tcn_dilation_factors = [2**i for i in range(len(tcn_channels))]
+        elif len(tcn_dilation_factors) != len(tcn_channels):
+            raise ValueError("Length of tcn_dilation_factors must match length of tcn_channels.")
 
         self.tcn_layers = nn.ModuleList()
         in_channels = input_size
@@ -36,10 +44,12 @@ class TCN(nn.Module):
         # The TCN is built as a stack of 1D convolutional layers.
         # Each layer is followed by a non-linearity (ReLU) and dropout for regularization.
         # Padding is added to maintain the sequence length through the convolutions.
-        for out_channels in tcn_channels:
+        for i, out_channels in enumerate(tcn_channels):
+            dilation = tcn_dilation_factors[i]
+            padding = (kernel_size - 1) * dilation // 2
             self.tcn_layers.append(
                 nn.Conv1d(in_channels, out_channels, kernel_size, 
-                         padding=(kernel_size-1)//2, dilation=1)
+                         padding=padding, dilation=dilation)
             )
             self.tcn_layers.append(nn.ReLU())
             self.tcn_layers.append(nn.Dropout(dropout))

@@ -18,7 +18,8 @@ class AEKFTCN_model(BaseFilterTCNModel):
                  tcn_channels: List[int] = [64, 64, 64, 64], 
                  kernel_size: int = 3, 
                  dropout: float = 0.1, 
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 tcn_dilation_factors: List[int] = None):
         """Initializes the AEKF-TCN hybrid model.
 
         Args:
@@ -27,13 +28,15 @@ class AEKFTCN_model(BaseFilterTCNModel):
             kernel_size (int): The kernel size for TCN convolutions.
             dropout (float): The dropout rate for TCN regularization.
             device (str): The compute device ('cpu', 'cuda', 'mps').
+            tcn_dilation_factors (List[int], optional): Dilation factor for each TCN layer.
         """
         super(AEKFTCN_model, self).__init__(
             tcn_input_size=tcn_input_size,
             tcn_channels=tcn_channels, 
             kernel_size=kernel_size, 
             dropout=dropout, 
-            device=device
+            device=device,
+            tcn_dilation_factors=tcn_dilation_factors
         )
         self.filter = ExtendedKalmanFilter(device=device)
 

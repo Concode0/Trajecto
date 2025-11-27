@@ -22,7 +22,7 @@ class BaseFilterTCNModel(nn.Module):
     Subclasses must implement the filter-specific methods for state initialization
     and single-step filtering.
     """
-    def __init__(self, tcn_input_size: int = 17, tcn_channels: List[int] = [64, 64, 64, 64], kernel_size: int = 3, dropout: float = 0.1, device: str = 'cpu'):
+    def __init__(self, tcn_input_size: int = 17, tcn_channels: List[int] = [64, 64, 64, 64], kernel_size: int = 3, dropout: float = 0.1, device: str = 'cpu', tcn_dilation_factors: List[int] = None):
         super(BaseFilterTCNModel, self).__init__()
         self.device = device
         
@@ -31,7 +31,7 @@ class BaseFilterTCNModel(nn.Module):
 
         # --- TCN for Residual Correction ---
         self.tcn_input_norm = nn.BatchNorm1d(tcn_input_size)
-        self.tcn = TCN(input_size=tcn_input_size, output_size=3, tcn_channels=tcn_channels, kernel_size=kernel_size, dropout=dropout)
+        self.tcn = TCN(input_size=tcn_input_size, output_size=3, tcn_channels=tcn_channels, kernel_size=kernel_size, dropout=dropout, tcn_dilation_factors=tcn_dilation_factors)
         
         # --- Lever Arm Compensation ---
         # This constant represents the physical offset from the IMU sensor to the pen tip.
