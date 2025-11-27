@@ -94,7 +94,7 @@ class BaseFilterTCNModel(nn.Module):
             # velocity of the pen tip. This is calculated by adding the tangential velocity
             # caused by rotation around the IMU center. v_tip = v_imu + ω × r
             angular_velocity_b = gyro_b_raw - gyro_bias_b
-            tangential_vel_b = torch.cross(angular_velocity_b, self.pen_tip_offset_b, dim=-1)
+            tangential_vel_b = torch.cross(angular_velocity_b, self.pen_tip_offset_b.unsqueeze(0), dim=-1)
             pen_tip_vel_b = tcn_features_from_filter['body_velocity'] + tangential_vel_b
 
             tcn_input_vec = torch.cat([

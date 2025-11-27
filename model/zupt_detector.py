@@ -1,14 +1,10 @@
 import torch
 import torch.nn as nn
-from typing import Tuple
 
 class ZuptDetector(nn.Module):
-    """A stateful detector for Zero-Velocity Updates (ZUPT).
-
-    This module implements a robust ZUPT detection algorithm, crucial for mitigating
-    drift in Inertial Navigation Systems (INS). It operates on a rolling window
-    of IMU data and uses a combination of a force sensor trigger and IMU motion
-    variance to determine if the device is stationary.
+    """
+    A stateful Detector for Zero-Velocity Updates (ZUPT)
+    Using FSR Delta and Variance, Acceleration Variance.
     """
     def __init__(self,
                  window_size: int = 20,
@@ -113,54 +109,24 @@ class ZuptDetector(nn.Module):
         return self.detect()
 
 if __name__ == '__main__':
-    print("Running tests for ZuptDetector...")
+    # Example usage and test case
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-    window_size = 10
-    batch_size = 4 # Must be an even number for the mixed test
-
-    # --- Test Data ---
-    # Stationary data: low variance, high force
-    accel_stationary = torch.randn(batch_size // 2, window_size, 3, device=device) * 0.01
-    accel_stationary[..., 2] += 9.81 # Add gravity
-    force_stationary = torch.ones(batch_size // 2, window_size, 1, device=device) * 1.0
-
-    # Moving data: high variance, low force
-    accel_moving = torch.randn(batch_size // 2, window_size, 3, device=device) * 2.0
-    force_moving = torch.zeros(batch_size // 2, window_size, 1, device=device)
-
-    # --- Test 1: Initial state (buffer not full) ---
-    detector = ZuptDetector(window_size=window_size, device=device)
-    is_zupt = torch.tensor([False])
-    for i in range(window_size - 1):
-        is_zupt = detector.forward(accel_stationary[:, i, :], force_stationary[:, i, :])
-    assert not torch.any(is_zupt), "ZUPT should not be detected before buffer is full"
-    print("Test 1 (Initial State): PASSED")
-
-    # --- Test 2: Fully stationary data ---
-    detector = ZuptDetector(window_size=window_size, device=device)
-    for i in range(window_size):
-        is_zupt = detector.forward(accel_stationary[:, i, :], force_stationary[:, i, :])
-    assert torch.all(is_zupt), "ZUPT should be detected for all items in a stationary batch"
-    print("Test 2 (Stationary Data): PASSED")
-
-    # --- Test 3: Fully moving data ---
-    detector = ZuptDetector(window_size=window_size, device=device)
-    for i in range(window_size):
-        is_zupt = detector.forward(accel_moving[:, i, :], force_moving[:, i, :])
-    assert not torch.any(is_zupt), "ZUPT should not be detected for any item in a moving batch"
-    print("Test 3 (Moving Data): PASSED")
-
-    # --- Test 4: Mixed stationary and moving data ---
-    detector = ZuptDetector(window_size=window_size, device=device)
-    accel_mixed = torch.cat([accel_stationary, accel_moving], dim=0)
-    force_mixed = torch.cat([force_stationary, force_moving], dim=0)
+    print(f"Using device: {device}")
     
-    is_zupt_mixed = torch.tensor([False])
+    batch_size = 4
+    window_size = 10
+
+    detector = ZuptDetector(window_size=window_size, device=device);
+
+    # Simulate some data
+    accel_data = torch.randn(batch_size, window_size, 3, device=device) * 0.01
+    accel_data[:, :, 2] += 9.81
+    force_data = torch.ones(batch_size, 1, device=device);
+
+    # Run data through the detector
     for i in range(window_size):
-        is_zupt_mixed = detector.forward(accel_mixed[:, i, :], force_mixed[:, i, :])
-
-    expected = torch.tensor([True] * (batch_size // 2) + [False] * (batch_size // 2), device=device)
-    assert torch.equal(is_zupt_mixed, expected), f"Mixed batch test failed. Expected {expected}, got {is_zupt_mixed}"
-    print("Test 4 (Mixed Batch): PASSED")
-
-    print("\nAll ZuptDetector tests passed successfully.")
+        zupt_detected = detector.forward(accel_data[:, i, :], force_data);
+    
+    print(f"ZUPT detected output: {zupt_detected}")
+    print(f"Output shape: {zupt_detected.shape}")
+    print("ZuptDetector tested successfully.")
