@@ -17,4 +17,5 @@ dependencies = [
     "textual-plotext>=1.0.1",
     "scipy>=1.16.3",
     "tqdm>=4.67.1",
+    "panel>=1.8.3",
 ]
