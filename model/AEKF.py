@@ -169,12 +169,21 @@ class ExtendedKalmanFilter(nn.Module):
         K = torch.linalg.solve(S, H @ P_pred.transpose(-2, -1)).transpose(-2, -1)
 
         state_updated = state_pred + (K @ innovation.unsqueeze(-1)).squeeze(-1)
-        state_updated[..., 6:10] = F.normalize(state_updated[..., 6:10], p=2, dim=-1)
+        
+        # Normalize the quaternion part without modifying the tensor in-place.
+        quat_b_to_w = state_updated[..., 6:10]
+        quat_b_to_w_normalized = F.normalize(quat_b_to_w, p=2, dim=-1)
+        state_updated = torch.cat([
+            state_updated[..., :6],
+            quat_b_to_w_normalized,
+            state_updated[..., 10:]
+        ], dim=-1)
 
         I = torch.eye(self.state_dim, device=state_pred.device, dtype=state_pred.dtype)
         P_updated = (I - K @ H) @ P_pred @ (I - K @ H).transpose(-2, -1) + K @ R_adaptive @ K.transpose(-2, -1)
         return state_updated, P_updated, innovation
     
+
     def _calculate_zupt_update(self, state: torch.Tensor, P: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculates the state and covariance correction from a ZUPT."""
         B = state.shape[0]
@@ -191,7 +200,15 @@ class ExtendedKalmanFilter(nn.Module):
         state_updated = state + (K_zupt @ innov_zupt.unsqueeze(-1)).squeeze(-1)
         P_updated = (torch.eye(self.state_dim, device=state.device) - K_zupt @ H_zupt) @ P
         
-        state_updated[..., 6:10] = F.normalize(state_updated[..., 6:10], p=2, dim=-1)
+        # Normalize the quaternion part without modifying the tensor in-place.
+        quat_b_to_w = state_updated[..., 6:10]
+        quat_b_to_w_normalized = F.normalize(quat_b_to_w, p=2, dim=-1)
+        state_updated = torch.cat([
+            state_updated[..., :6],
+            quat_b_to_w_normalized,
+            state_updated[..., 10:]
+        ], dim=-1)
+        
         return state_updated, P_updated
 
     def forward(self, state: torch.Tensor, P: torch.Tensor, gyro_b_raw: torch.Tensor, accel_b_raw: torch.Tensor, force_raw: torch.Tensor,
@@ -200,39 +217,30 @@ class ExtendedKalmanFilter(nn.Module):
         state_pred, P_pred = self.predict(state, P, gyro_b_raw, accel_b_raw)
         
         is_zupt = self.zupt_detector(accel_b_raw, force_raw)
-        
-        final_state = state_pred.clone()
-        final_P = P_pred.clone()
-        innovation = torch.zeros(state.shape[0], self.obs_dim, device=self.device, dtype=gyro_b_raw.dtype)
 
         # --- Update Step ---
-        # Case 1: Stationary (ZUPT). Correct velocity and align with gravity.
-        zupt_mask = is_zupt
-        if torch.any(zupt_mask):
-            state_zupt, P_zupt = self._calculate_zupt_update(state_pred[zupt_mask], P_pred[zupt_mask])
-            
-            # For gravity alignment, use a high-confidence (low noise) R matrix for the accelerometer
-            R_gravity = torch.diag(torch.tensor([self.zupt_gravity_R_factor] * 3 + [1e3] * 3, device=self.device))
-            R_gravity = R_gravity.unsqueeze(0).repeat(torch.sum(zupt_mask), 1, 1)
+        # To avoid in-place operations, we compute both ZUPT and motion updates
+        # and then use torch.where to select the correct one based on `is_zupt`.
 
-            state_gravity, P_gravity, innovation_gravity = self.update(
-                state_zupt, P_zupt, measurement[zupt_mask], accel_b_raw[zupt_mask], R_override=R_gravity)
-            
-            final_state[zupt_mask] = state_gravity
-            final_P[zupt_mask] = P_gravity
-            innovation[zupt_mask] = innovation_gravity
-
-        # Case 2: In Motion. Perform a standard update.
-        non_zupt_mask = ~is_zupt
-        if torch.any(non_zupt_mask) and measurement is not None:
-            state_motion, P_motion, innovation_motion = self.update(
-                state_pred[non_zupt_mask], P_pred[non_zupt_mask], 
-                measurement[non_zupt_mask], accel_b_raw[non_zupt_mask])
-            
-            final_state[non_zupt_mask] = state_motion
-            final_P[non_zupt_mask] = P_motion
-            innovation[non_zupt_mask] = innovation_motion
+        # 1. ZUPT update calculations
+        state_zupt_calculated, P_zupt_calculated = self._calculate_zupt_update(state_pred, P_pred)
         
+        R_gravity = torch.diag(torch.tensor([self.zupt_gravity_R_factor] * 3 + [1e3] * 3, device=self.device))
+        R_gravity = R_gravity.unsqueeze(0).repeat(state.shape[0], 1, 1)
+        
+        state_gravity, P_gravity, innovation_gravity = self.update(
+            state_zupt_calculated, P_zupt_calculated, measurement, accel_b_raw, R_override=R_gravity)
+
+        # 2. Motion update calculations
+        state_motion, P_motion, innovation_motion = self.update(
+            state_pred, P_pred, measurement, accel_b_raw)
+
+        # 3. Select final state, covariance, and innovation based on ZUPT mask
+        zupt_mask_expanded = is_zupt.unsqueeze(-1)
+        final_state = torch.where(zupt_mask_expanded, state_gravity, state_motion)
+        final_P = torch.where(zupt_mask_expanded.unsqueeze(-1), P_gravity, P_motion)
+        innovation = torch.where(zupt_mask_expanded, innovation_gravity, innovation_motion)
+
         # --- Assemble Features for TCN ---
         vel_w = final_state[..., 3:6]
         quat_b_to_w = final_state[..., 6:10]
