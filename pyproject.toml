@@ -1,0 +1,19 @@
+[project]
+name = "inku"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "bleak>=1.1.1",
+    "dash>=3.2.0",
+    "h5py>=3.14.0",
+    "matplotlib>=3.10.6",
+    "numpy>=2.3.2",
+    "pandas>=2.3.2",
+    "plotly>=6.3.0",
+    "torch>=2.8.0",
+    "textual>=0.70.0",
+    "textual-plotext>=1.0.1",
+    "scipy>=1.16.3",
+]
