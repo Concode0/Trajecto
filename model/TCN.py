@@ -1,9 +1,5 @@
 """
-A simplified Temporal Convolutional Network (TCN) for sequence modeling.
-
-TCNs are a powerful architecture for sequence modeling that use 1D convolutions
-to efficiently process sequences with a large receptive field. This makes them
-a strong alternative to RNNs for learning from time-series data like IMU signals.
+A Temporal Convolutional Network (TCN) for sequence modeling.
 """
 
 import torch

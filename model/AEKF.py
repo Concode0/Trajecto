@@ -1,7 +1,5 @@
 """
 AEKF (Adaptive Extended Kalman Filter) for 3D Pen Trajectory Reconstruction.
-This module provides a batch-aware EKF with a robust, stateful Zero-Velocity Update (ZUPT)
-mechanism to mitigate drift in inertial navigation.
 """
 
 import torch

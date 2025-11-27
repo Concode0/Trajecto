@@ -1,11 +1,5 @@
 """
 ESKF (Error-State Kalman Filter) for 3D Pen Trajectory Reconstruction.
-
-This module implements an Error-State Kalman Filter (ESKF) for IMU state
-estimation. The ESKF is a powerful alternative to the standard EKF that operates
-by tracking the error of a 'nominal' state. This often leads to a more stable
-and accurate filter because the error dynamics are typically more linear than
-the full state dynamics.
 """
 
 import torch

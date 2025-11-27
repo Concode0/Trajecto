@@ -37,7 +37,6 @@ def quaternion_to_rotation_matrix(quat_b_to_w: torch.Tensor) -> torch.Tensor:
     w, x, y, z = quat_norm.unbind(-1)
 
     # Conversion formula from quaternion to rotation matrix
-    # See: https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation#Quaternion-derived_rotation_matrix
     rot_mat_b_to_w = torch.stack([
         torch.stack([1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)], -1),
         torch.stack([2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)], -1),

@@ -36,7 +36,7 @@ class BaseFilterTCNModel(nn.Module):
         # --- Lever Arm Compensation ---
         # This constant represents the physical offset from the IMU sensor to the pen tip.
         # It is crucial for accurately tracking the tip's trajectory.
-        self.register_buffer('pen_tip_offset_b', torch.tensor([-1.0, 0.0, -0.02], device=device))
+        self.register_buffer('pen_tip_offset_b', torch.tensor([0.145, 0.002, -0.02], device=device))
 
     def _initialize_state(self, batch_size: int, dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
         """Initializes the state and covariance for the Kalman filter."""
