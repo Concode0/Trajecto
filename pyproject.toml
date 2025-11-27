@@ -16,4 +16,5 @@ dependencies = [
     "textual>=0.70.0",
     "textual-plotext>=1.0.1",
     "scipy>=1.16.3",
+    "tqdm>=4.67.1",
 ]
