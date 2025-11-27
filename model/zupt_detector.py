@@ -112,7 +112,7 @@ if __name__ == '__main__':
     # Example usage and test case
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     print(f"Using device: {device}")
-    
+
     batch_size = 4
     window_size = 10
 
@@ -126,7 +126,7 @@ if __name__ == '__main__':
     # Run data through the detector
     for i in range(window_size):
         zupt_detected = detector.forward(accel_data[:, i, :], force_data);
-    
+
     print(f"ZUPT detected output: {zupt_detected}")
     print(f"Output shape: {zupt_detected.shape}")
     print("ZuptDetector tested successfully.")

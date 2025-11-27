@@ -20,7 +20,7 @@ class ExtendedKalmanFilter(nn.Module):
     - Accelerometer bias in the body frame (3)
     """
 
-    def __init__(self, 
+    def __init__(self,
                  state_dim: int = 16,
                  obs_dim: int = 6,  # 3 accel + 3 gyro
                  dt: float = 0.01,
@@ -30,7 +30,7 @@ class ExtendedKalmanFilter(nn.Module):
                  zupt_force_var_threshold: float = 0.01,
                  zupt_force_delta_threshold: float = 0.1):
         """Initializes the EKF module.
-        
+
         Args:
             state_dim (int): Dimension of the state vector (16).
             obs_dim (int): Dimension of the observation vector (6).
@@ -65,7 +65,7 @@ class ExtendedKalmanFilter(nn.Module):
             force_delta_threshold=zupt_force_delta_threshold,
             device=device
         )
-        
+
         # --- Tuning Factors ---
         self.adaptive_R_factor  = 0.1
         self.zupt_R_factor       = 1e-6
@@ -150,14 +150,14 @@ class ExtendedKalmanFilter(nn.Module):
         P_pred = F @ P @ F.transpose(-2, -1) + Q
         return state_pred, P_pred
 
-    def update(self, state_pred: torch.Tensor, P_pred: torch.Tensor, 
+    def update(self, state_pred: torch.Tensor, P_pred: torch.Tensor,
                measurement: torch.Tensor, accel_b_raw: torch.Tensor,
                R_override: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Performs the EKF update step (measurement update)."""
         h_pred = self._measurement_function(state_pred)
         innovation = measurement - h_pred
         H = self._compute_jacobian_H(state_pred)
-        
+
         if R_override is not None:
             R_adaptive = R_override
         else:
@@ -169,7 +169,7 @@ class ExtendedKalmanFilter(nn.Module):
         K = torch.linalg.solve(S, H @ P_pred.transpose(-2, -1)).transpose(-2, -1)
 
         state_updated = state_pred + (K @ innovation.unsqueeze(-1)).squeeze(-1)
-        
+
         # Normalize the quaternion part without modifying the tensor in-place.
         quat_b_to_w = state_updated[..., 6:10]
         quat_b_to_w_normalized = F.normalize(quat_b_to_w, p=2, dim=-1)
@@ -182,7 +182,7 @@ class ExtendedKalmanFilter(nn.Module):
         I = torch.eye(self.state_dim, device=state_pred.device, dtype=state_pred.dtype)
         P_updated = (I - K @ H) @ P_pred @ (I - K @ H).transpose(-2, -1) + K @ R_adaptive @ K.transpose(-2, -1)
         return state_updated, P_updated, innovation
-    
+
 
     def _calculate_zupt_update(self, state: torch.Tensor, P: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculates the state and covariance correction from a ZUPT."""
@@ -199,7 +199,7 @@ class ExtendedKalmanFilter(nn.Module):
 
         state_updated = state + (K_zupt @ innov_zupt.unsqueeze(-1)).squeeze(-1)
         P_updated = (torch.eye(self.state_dim, device=state.device) - K_zupt @ H_zupt) @ P
-        
+
         # Normalize the quaternion part without modifying the tensor in-place.
         quat_b_to_w = state_updated[..., 6:10]
         quat_b_to_w_normalized = F.normalize(quat_b_to_w, p=2, dim=-1)
@@ -208,14 +208,14 @@ class ExtendedKalmanFilter(nn.Module):
             quat_b_to_w_normalized,
             state_updated[..., 10:]
         ], dim=-1)
-        
+
         return state_updated, P_updated
 
     def forward(self, state: torch.Tensor, P: torch.Tensor, gyro_b_raw: torch.Tensor, accel_b_raw: torch.Tensor, force_raw: torch.Tensor,
                 measurement: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """Executes one full predict-update cycle of the EKF."""
         state_pred, P_pred = self.predict(state, P, gyro_b_raw, accel_b_raw)
-        
+
         is_zupt = self.zupt_detector(accel_b_raw, force_raw)
 
         # --- Update Step ---
@@ -224,10 +224,10 @@ class ExtendedKalmanFilter(nn.Module):
 
         # 1. ZUPT update calculations
         state_zupt_calculated, P_zupt_calculated = self._calculate_zupt_update(state_pred, P_pred)
-        
+
         R_gravity = torch.diag(torch.tensor([self.zupt_gravity_R_factor] * 3 + [1e3] * 3, device=self.device))
         R_gravity = R_gravity.unsqueeze(0).repeat(state.shape[0], 1, 1)
-        
+
         state_gravity, P_gravity, innovation_gravity = self.update(
             state_zupt_calculated, P_zupt_calculated, measurement, accel_b_raw, R_override=R_gravity)
 
@@ -246,13 +246,13 @@ class ExtendedKalmanFilter(nn.Module):
         quat_b_to_w = final_state[..., 6:10]
         rot_mat_w_to_b = quaternion_to_rotation_matrix(quat_b_to_w).transpose(-2, -1)
         vel_b = (rot_mat_w_to_b @ vel_w.unsqueeze(-1)).squeeze(-1)
-        
+
         tcn_features = {
-            'body_velocity': vel_b, 
-            'innovation': innovation, 
+            'body_velocity': vel_b,
+            'innovation': innovation,
             'zupt_flag': is_zupt.float().unsqueeze(-1)
         }
-        
+
         return final_state, final_P, tcn_features
 
 if __name__ == "__main__":

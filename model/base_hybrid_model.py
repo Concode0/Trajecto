@@ -119,11 +119,12 @@ class BaseFilterTCNModel(nn.Module):
         offset_w = (rot_mat_b_to_w @ self.pen_tip_offset_b.view(1, 1, 3, 1)).squeeze(-1)
         pen_tip_pos_w_base = positions_w + offset_w
         
-        # 2. Use the TCN to predict the residual error.
+        # 2. Use the TCN to predict the residual error in the BODY frame.
         tcn_features_norm = self.tcn_input_norm(tcn_features.permute(0, 2, 1)).permute(0, 2, 1)
-        position_correction_w = self.tcn(tcn_features_norm)
+        position_correction_b = self.tcn(tcn_features_norm)
 
-        # 3. Add the learned correction to the baseline trajectory.
+        # 3. Rotate the correction to the WORLD frame and add it to the baseline.
+        position_correction_w = (rot_mat_b_to_w @ position_correction_b.unsqueeze(-1)).squeeze(-1)
         final_trajectory_w = pen_tip_pos_w_base + position_correction_w
 
         return final_trajectory_w

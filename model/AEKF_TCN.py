@@ -13,11 +13,11 @@ class AEKFTCN_model(BaseFilterTCNModel):
     This class specializes the `BaseFilterTCNModel` by implementing the
     AEKF-specific methods for state initialization and filtering.
     """
-    def __init__(self, 
+    def __init__(self,
                  tcn_input_size: int = 17,
-                 tcn_channels: List[int] = [64, 64, 64, 64], 
-                 kernel_size: int = 3, 
-                 dropout: float = 0.1, 
+                 tcn_channels: List[int] = [64, 64, 64, 64],
+                 kernel_size: int = 3,
+                 dropout: float = 0.1,
                  device: str = 'cpu',
                  tcn_dilation_factors: List[int] = None):
         """Initializes the AEKF-TCN hybrid model.
@@ -32,9 +32,9 @@ class AEKFTCN_model(BaseFilterTCNModel):
         """
         super(AEKFTCN_model, self).__init__(
             tcn_input_size=tcn_input_size,
-            tcn_channels=tcn_channels, 
-            kernel_size=kernel_size, 
-            dropout=dropout, 
+            tcn_channels=tcn_channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
             device=device,
             tcn_dilation_factors=tcn_dilation_factors
         )
@@ -47,8 +47,8 @@ class AEKFTCN_model(BaseFilterTCNModel):
         P = torch.eye(16, device=self.device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1, 1) * 0.1
         return (state, P)
 
-    def _filter_step(self, 
-                     state_tuple: Tuple[torch.Tensor, torch.Tensor], 
+    def _filter_step(self,
+                     state_tuple: Tuple[torch.Tensor, torch.Tensor],
                      imu_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
                      ) -> Tuple[torch.Tensor, ...]:
         """Performs a single predict-update step of the AEKF."""
