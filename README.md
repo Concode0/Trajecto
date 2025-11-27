@@ -24,16 +24,16 @@ To overcome the inherent drift problem of single IMU sensors, this study propose
 ## 🛠️ System Architecture
 
 ### 1. The Paradigm Shift: From AEKF to ESKF
-초기 모델은 AEKF(Adaptive EKF)를 사용했으나, 3차원 필기의 급격한 회전 운동에서 발생하는 쿼터니언 정규화 문제와 수렴 불안정성을 해결하기 위해 **ESKF(Error-State Kalman Filter)**로 고도화했습니다.
+While the initial model used **AEKF (Adaptive EKF)**, it was upgraded to **ESKF (Error-State Kalman Filter)** to address quaternion normalization issues and convergence instability occurring during the rapid rotational movements of 3D handwriting .
 
-* **Nominal State:** 빠른 주파수의 IMU 데이터를 적분하여 '명목 궤적' 생성.
-* **Error State:** 느린 주파수의 오차(Bias, Drift)를 선형화하여 추정.
-* **Advantage:** 짐벌 락(Gimbal Lock) 방지 및 연산 효율성 극대화.
+* **Nominal State:** Generates the 'nominal trajectory' by integrating high-frequency IMU data.
+* **Error State:** Estimates low-frequency errors (Bias, Drift) through linearization.
+* **Advantage:** Prevents Gimbal Lock and maximizes computational efficiency.
 
 ### 2. Deep Learning Correction (TCN)
-ESKF가 추정한 궤적의 잔여 오차(Residual)를 보정합니다.
-* **Input Feature Optimization:** 단순 센서 값이 아닌, ESKF 잔차 및 회전 불변량(Rotation Invariants)을 입력으로 가공하여 학습 효율 증대.
-* **Batch Aware Optimization:** 가변적인 필기 획 길이를 고려한 배치 구성을 통해 학습 시 시간적 맥락(Temporal Context) 손실 최소화.
+Corrects the residual errors of the trajectory estimated by the ESKF
+* **Input Feature Optimization:** Improves learning efficiency by processing ESKF residuals and Rotation Invariants as inputs, rather than simple sensor values.
+* **Batch Aware Optimization:** Minimizes the loss of Temporal Context during training by configuring batches that account for variable stroke lengths.
 
 ---
 
