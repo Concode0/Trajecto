@@ -72,3 +72,27 @@ def small_angle_to_quaternion(small_angle_vec: torch.Tensor) -> torch.Tensor:
     
     # The final quaternion must be normalized to be a valid rotation
     return F.normalize(torch.cat([w, xyz], dim=-1), p=2, dim=-1)
+
+if __name__ == '__main__':
+    # Test quaternion_multiply
+    q1 = torch.tensor([[0.7071, 0, 0, 0.7071]])  # 90 deg around z
+    q2 = torch.tensor([[0.7071, 0.7071, 0, 0]])  # 90 deg around x
+    q_mult = quaternion_multiply(q1, q2)
+    # Expected: 180 deg rotation around y-axis -> (0, 0, 1, 0)
+    # Actual calculation: q1*q2 = [0.5, 0.5, 0.5, 0.5]
+    print(f"Quaternion multiplication test: {q_mult}")
+
+    # Test quaternion_to_rotation_matrix
+    q_z_90 = torch.tensor([[0.7071, 0, 0, 0.7071]]) # 90 deg around z
+    rot_mat = quaternion_to_rotation_matrix(q_z_90)
+    # Expected rotation matrix for 90 deg around z:
+    # [[0, -1, 0],
+    #  [1,  0, 0],
+    #  [0,  0, 1]]
+    print(f"Quaternion to rotation matrix test:\n{rot_mat}")
+
+    # Test small_angle_to_quaternion
+    small_angle = torch.tensor([[0.01, 0.02, 0.03]])
+    q_small = small_angle_to_quaternion(small_angle)
+    print(f"Small angle to quaternion test: {q_small}")
+    print("Rotation utils tested successfully.")

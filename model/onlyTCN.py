@@ -64,26 +64,42 @@ class TCN(nn.Module):
         return corrected_trajectory
 
 if __name__ == '__main__':
-    # Example usage
+    print("Running tests for onlyTCN.py...")
+    # --- Test Parameters ---
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-    print(f"Using device: {device}")
-
-    # Model parameters
     input_size = 7  # accel(3), gyro(3), force(1)
     output_size = 3 # position(3)
     sequence_length = 100
     batch_size = 32
 
-    # Create a model instance
-    model = TCN(input_size=input_size, output_size=output_size).to(device)
+    print(f"Using device: {device}")
 
-    # Create some dummy data
+    # --- Test 1: Model Instantiation and Forward Pass ---
+    try:
+        model = TCN(input_size=input_size, output_size=output_size).to(device)
+        model.eval() # Ensure model can be switched to evaluation mode
+        print("Test 1 (Instantiation): PASSED")
+    except Exception as e:
+        print(f"Test 1 (Instantiation): FAILED - {e}")
+        exit()
+
+    # --- Test 2: Shape Verification ---
+    # Create dummy data
     dummy_imu_data = torch.randn(batch_size, sequence_length, input_size).to(device)
-
+    
     # Forward pass
-    predicted_trajectory = model(dummy_imu_data)
+    try:
+        predicted_trajectory = model(dummy_imu_data)
+        
+        # Verify output shape
+        expected_shape = (batch_size, sequence_length, output_size)
+        assert predicted_trajectory.shape == expected_shape, f"Shape mismatch. Expected {expected_shape}, got {predicted_trajectory.shape}"
+        
+        print(f"Input shape: {dummy_imu_data.shape}")
+        print(f"Output shape: {predicted_trajectory.shape}")
+        print("Test 2 (Shape Verification): PASSED")
+    except Exception as e:
+        print(f"Test 2 (Shape Verification): FAILED - {e}")
+        exit()
 
-    print("TCN model changed to residual correction structure.")
-    print(f"Input shape: {dummy_imu_data.shape}")
-    print(f"Output shape: {predicted_trajectory.shape}")
-    print("TCN model created and tested successfully.")
+    print("\nAll onlyTCN tests passed successfully.")
