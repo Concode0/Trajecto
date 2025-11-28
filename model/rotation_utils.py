@@ -5,6 +5,9 @@ from typing import Tuple
 def quaternion_from_two_vectors(v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
     """Calculates the quaternion that rotates vector v1 to vector v2.
 
+    This implementation uses atan2 for a more robust angle calculation and
+    handles parallel and anti-parallel cases.
+
     Args:
         v1 (torch.Tensor): A batch of vectors of shape `[B, 3]`.
         v2 (torch.Tensor): A batch of vectors of shape `[B, 3]`.
@@ -12,38 +15,46 @@ def quaternion_from_two_vectors(v1: torch.Tensor, v2: torch.Tensor) -> torch.Ten
     Returns:
         torch.Tensor: The resulting quaternion of shape `[B, 4]`.
     """
-    v1 = F.normalize(v1, p=2, dim=-1)
-    v2 = F.normalize(v2, p=2, dim=-1)
-
-    dot = torch.sum(v1 * v2, dim=-1)
+    v1_norm = F.normalize(v1, p=2, dim=-1)
+    v2_norm = F.normalize(v2, p=2, dim=-1)
     
-    # Handle parallel and anti-parallel cases
-    # If vectors are parallel, the rotation is identity
+    dot = torch.sum(v1_norm * v2_norm, dim=-1)
+    
+    # Handle parallel vectors
     identity_quat = torch.zeros_like(v1.new_empty(v1.shape[0], 4))
     identity_quat[:, 0] = 1.0
 
-    # If vectors are anti-parallel, the rotation is 180 degrees around a perpendicular axis
-    # We can find an arbitrary perpendicular axis by crossing with a non-parallel vector.
-    axis = torch.cross(v1, torch.tensor([1.0, 0.0, 0.0], device=v1.device, dtype=v1.dtype).expand_as(v1))
-    # If v1 was parallel to [1,0,0], cross product is zero. Try another axis.
+    # Handle anti-parallel vectors (180-degree rotation)
+    # Find a perpendicular axis to v1
+    axis = torch.cross(v1_norm, torch.tensor([1.0, 0.0, 0.0], device=v1.device, dtype=v1.dtype).expand_as(v1_norm))
     mask_parallel_x = torch.all(torch.isclose(axis, torch.zeros_like(axis)), dim=-1)
     if mask_parallel_x.any():
-        axis[mask_parallel_x] = torch.cross(v1[mask_parallel_x], torch.tensor([0.0, 1.0, 0.0], device=v1.device, dtype=v1.dtype).expand_as(v1[mask_parallel_x]))
+        axis[mask_parallel_x] = torch.cross(v1_norm[mask_parallel_x], torch.tensor([0.0, 1.0, 0.0], device=v1.device, dtype=v1.dtype).expand_as(v1_norm[mask_parallel_x]))
     
     axis = F.normalize(axis, p=2, dim=-1)
-    anti_parallel_quat = torch.cat([torch.zeros_like(dot.unsqueeze(-1)), axis], dim=-1)
-
-    # For the general case, use the cross product and dot product
-    cross_prod = torch.cross(v1, v2, dim=-1)
-    w = torch.sqrt((v1.norm(dim=-1) ** 2) * (v2.norm(dim=-1) ** 2)) + dot
-    general_quat = torch.cat([w.unsqueeze(-1), cross_prod], dim=-1)
-    general_quat = F.normalize(general_quat, p=2, dim=-1)
+    anti_parallel_quat = torch.cat([torch.zeros_like(dot).unsqueeze(-1), axis], dim=-1)
+    
+    # General case using atan2
+    cross_prod = torch.cross(v1_norm, v2_norm, dim=-1)
+    cross_prod_norm = torch.norm(cross_prod, p=2, dim=-1)
+    
+    angle = torch.atan2(cross_prod_norm, dot)
+    half_angle = angle / 2.0
+    
+    w = torch.cos(half_angle)
+    sin_half_angle = torch.sin(half_angle)
+    
+    # Normalize cross product to get rotation axis
+    axis = F.normalize(cross_prod, p=2, dim=-1, eps=1e-8)
+    xyz = axis * sin_half_angle.unsqueeze(-1)
+    
+    general_quat = torch.cat([w.unsqueeze(-1), xyz], dim=-1)
 
     # Combine results based on dot product
     quat = torch.where(dot.unsqueeze(-1) > 0.99999, identity_quat,
                        torch.where(dot.unsqueeze(-1) < -0.99999, anti_parallel_quat, general_quat))
     
-    return quat
+    return F.normalize(quat, p=2, dim=-1)
 
 def quaternion_multiply(quat_1: torch.Tensor, quat_2: torch.Tensor) -> torch.Tensor:
     """Performs batch-aware multiplication of two quaternions, q_new = q1 * q2.
@@ -100,18 +111,18 @@ def small_angle_to_quaternion(small_angle_vec: torch.Tensor) -> torch.Tensor:
     angle_sq_norm = torch.sum(small_angle_vec * small_angle_vec, dim=-1, keepdim=True)
     angle_norm = torch.sqrt(angle_sq_norm)
     half_angle = angle_norm / 2.0
-    
+
     # The real part of the quaternion is cos(theta/2)
     w = torch.cos(half_angle)
-    
+
     # The vector part is sin(theta/2) * rotation_axis
     sin_half_angle = torch.sin(half_angle)
-    
+
     # Normalize the angle vector to get the rotation axis
     # Use a small epsilon to avoid division by zero for near-zero rotations
     axis = F.normalize(small_angle_vec, p=2, dim=-1, eps=1e-8)
     xyz = axis * sin_half_angle
-    
+
     # The final quaternion must be normalized to be a valid rotation
     return F.normalize(torch.cat([w, xyz], dim=-1), p=2, dim=-1)
 
@@ -143,5 +154,5 @@ if __name__ == '__main__':
     small_angle = torch.tensor([[0.01, 0.02, 0.03]], device=device)
     q_small = small_angle_to_quaternion(small_angle)
     print(f"Small angle to quaternion result shape: {q_small.shape}")
-    
+
     print("Rotation utils tested successfully.")
