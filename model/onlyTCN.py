@@ -19,7 +19,7 @@ class TCN(nn.Module):
 
         for out_channels in tcn_channels:
             self.tcn_layers.append(
-                nn.Conv1d(in_channels, out_channels, kernel_size, 
+                nn.Conv1d(in_channels, out_channels, kernel_size,
                          padding=(kernel_size-1)//2, dilation=1)
             )
             self.tcn_layers.append(nn.ReLU())
@@ -33,7 +33,7 @@ class TCN(nn.Module):
         Forward pass for the TCN model with residual correction.
 
         Args:
-            imu_sequence: [batch_size, sequence_length, input_size] 
+            imu_sequence: [batch_size, sequence_length, input_size]
                           (assuming accel is the first 3 features)
 
         Returns:
@@ -41,10 +41,10 @@ class TCN(nn.Module):
         """
         # 1. Compute a naive base trajectory by double-integrating acceleration
         accel_data = imu_sequence[:, :, :3]
-        
+
         # First integration (acceleration to velocity)
         velocity = torch.cumsum(accel_data * self.dt, dim=1)
-        
+
         # Second integration (velocity to position)
         # We need to add the initial velocity contribution to each step
         base_trajectory = torch.cumsum(velocity * self.dt, dim=1)
