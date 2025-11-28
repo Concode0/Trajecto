@@ -2,9 +2,11 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import torch
-from typing import List, Tuple
+import torch.nn.functional as F
+from typing import List, Tuple, Optional
 from AEKF import ExtendedKalmanFilter
 from base_hybrid_model import BaseFilterTCNModel
+from rotation_utils import quaternion_from_two_vectors
 
 class AEKFTCN_model(BaseFilterTCNModel):
     """A hybrid model combining an Adaptive Extended Kalman Filter (AEKF)
@@ -43,10 +45,39 @@ class AEKFTCN_model(BaseFilterTCNModel):
         )
         self.filter = ExtendedKalmanFilter(device=device, dt=dt)
 
-    def _initialize_state(self, batch_size: int, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _initialize_state(self, batch_size: int, dtype: torch.dtype, imu_data_seq: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Initializes the state and covariance for the AEKF."""
         state = torch.zeros(batch_size, 16, device=self.device, dtype=dtype)
-        state[:, 6] = 1.0  # Initialize orientation to identity quaternion
+        
+        if imu_data_seq is not None:
+            # Use the first accelerometer reading to determine initial orientation (leveling)
+            accel_init = imu_data_seq[:, 0, :3]
+            accel_norm = torch.norm(accel_init, p=2, dim=-1)
+
+            # Check if acceleration is strong enough to be reliable (i.e., mostly gravity)
+            reliable_mask = (accel_norm > 4.9) & (accel_norm < 14.7)
+
+            quat_b_to_w = torch.zeros(batch_size, 4, device=self.device, dtype=dtype)
+
+            if reliable_mask.any():
+                # Target vector is gravity pointing up along Z-axis in world frame
+                gravity_up_w = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=dtype).expand(reliable_mask.sum(), -1)
+                
+                # Calculate quaternion to align measured acceleration with world gravity
+                init_quat = quaternion_from_two_vectors(accel_init[reliable_mask], gravity_up_w)
+                quat_b_to_w[reliable_mask] = init_quat
+
+            # For unreliable measurements, fallback to identity
+            identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device, dtype=dtype)
+            quat_b_to_w[~reliable_mask] = identity_quat.expand((~reliable_mask).sum(), -1)
+            
+            # The AEKF state vector is [pos, vel, quat, bias_g, bias_a]
+            state[:, 6:10] = quat_b_to_w
+
+        else:
+            # Default to identity if no IMU data is provided
+            state[:, 6] = 1.0
+
         P = torch.eye(16, device=self.device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1, 1) * 0.1
         return (state, P)
 
@@ -79,6 +110,8 @@ if __name__ == '__main__':
 
     model = AEKFTCN_model(device=device).to(device)
     dummy_imu_data = torch.randn(4, 100, 7, device=device)
+    # Simulate realistic initial acceleration (gravity) for one sample
+    dummy_imu_data[0, 0, :3] = torch.tensor([0.5, 0.5, 9.8])
     model_output = model(dummy_imu_data)
 
     print(f"Input IMU sequence shape: {dummy_imu_data.shape}")

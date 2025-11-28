@@ -44,7 +44,7 @@ class BaseFilterTCNModel(nn.Module):
         # vector in the body frame, which is then used as a feature for the TCN.
         self.register_buffer('gravity_w', torch.tensor([0.0, 0.0, -9.81], device=device))
 
-    def _initialize_state(self, batch_size: int, dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
+    def _initialize_state(self, batch_size: int, dtype: torch.dtype, imu_data_seq: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
         """Initializes the state and covariance for the Kalman filter."""
         raise NotImplementedError("This method must be implemented by the subclass.")
 
@@ -78,7 +78,7 @@ class BaseFilterTCNModel(nn.Module):
         """
         batch_size, seq_len, _ = imu_data_seq.shape
 
-        state_tuple = self._initialize_state(batch_size, imu_data_seq.dtype) if initial_state is None else initial_state
+        state_tuple = self._initialize_state(batch_size, imu_data_seq.dtype, imu_data_seq) if initial_state is None else initial_state
 
         positions_w_seq = []
         quaternions_b_to_w_seq = []

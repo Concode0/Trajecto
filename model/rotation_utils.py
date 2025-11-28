@@ -2,6 +2,49 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple
 
+def quaternion_from_two_vectors(v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
+    """Calculates the quaternion that rotates vector v1 to vector v2.
+
+    Args:
+        v1 (torch.Tensor): A batch of vectors of shape `[B, 3]`.
+        v2 (torch.Tensor): A batch of vectors of shape `[B, 3]`.
+
+    Returns:
+        torch.Tensor: The resulting quaternion of shape `[B, 4]`.
+    """
+    v1 = F.normalize(v1, p=2, dim=-1)
+    v2 = F.normalize(v2, p=2, dim=-1)
+
+    dot = torch.sum(v1 * v2, dim=-1)
+    
+    # Handle parallel and anti-parallel cases
+    # If vectors are parallel, the rotation is identity
+    identity_quat = torch.zeros_like(v1.new_empty(v1.shape[0], 4))
+    identity_quat[:, 0] = 1.0
+
+    # If vectors are anti-parallel, the rotation is 180 degrees around a perpendicular axis
+    # We can find an arbitrary perpendicular axis by crossing with a non-parallel vector.
+    axis = torch.cross(v1, torch.tensor([1.0, 0.0, 0.0], device=v1.device, dtype=v1.dtype).expand_as(v1))
+    # If v1 was parallel to [1,0,0], cross product is zero. Try another axis.
+    mask_parallel_x = torch.all(torch.isclose(axis, torch.zeros_like(axis)), dim=-1)
+    if mask_parallel_x.any():
+        axis[mask_parallel_x] = torch.cross(v1[mask_parallel_x], torch.tensor([0.0, 1.0, 0.0], device=v1.device, dtype=v1.dtype).expand_as(v1[mask_parallel_x]))
+    
+    axis = F.normalize(axis, p=2, dim=-1)
+    anti_parallel_quat = torch.cat([torch.zeros_like(dot.unsqueeze(-1)), axis], dim=-1)
+
+    # For the general case, use the cross product and dot product
+    cross_prod = torch.cross(v1, v2, dim=-1)
+    w = torch.sqrt((v1.norm(dim=-1) ** 2) * (v2.norm(dim=-1) ** 2)) + dot
+    general_quat = torch.cat([w.unsqueeze(-1), cross_prod], dim=-1)
+    general_quat = F.normalize(general_quat, p=2, dim=-1)
+
+    # Combine results based on dot product
+    quat = torch.where(dot.unsqueeze(-1) > 0.99999, identity_quat,
+                       torch.where(dot.unsqueeze(-1) < -0.99999, anti_parallel_quat, general_quat))
+    
+    return quat
+
 def quaternion_multiply(quat_1: torch.Tensor, quat_2: torch.Tensor) -> torch.Tensor:
     """Performs batch-aware multiplication of two quaternions, q_new = q1 * q2.
     This corresponds to applying rotation q2 followed by rotation q1.
@@ -76,6 +119,14 @@ if __name__ == '__main__':
     # Simple test case to verify functionality and shapes.
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     print(f"Using device: {device}")
+
+    # Test quaternion_from_two_vectors
+    v1 = torch.tensor([[0.0, 0.0, 1.0]], device=device)
+    v2 = torch.tensor([[0.0, 1.0, 0.0]], device=device)
+    q_from_vecs = quaternion_from_two_vectors(v1, v2)
+    print(f"Quaternion from two vectors result shape: {q_from_vecs.shape}")
+    # Expected: rotation of -90 deg around x-axis -> [0.7071, -0.7071, 0, 0]
+    print(f"Quaternion from two vectors result: {q_from_vecs}")
 
     # Test quaternion_multiply
     q1 = torch.tensor([[0.7071, 0, 0, 0.7071]], device=device)  # 90 deg around z
