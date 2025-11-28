@@ -14,12 +14,13 @@ class AEKFTCN_model(BaseFilterTCNModel):
     AEKF-specific methods for state initialization and filtering.
     """
     def __init__(self,
-                 tcn_input_size: int = 17,
+                 tcn_input_size: int = 20,
                  tcn_channels: List[int] = [64, 64, 64, 64],
                  kernel_size: int = 3,
                  dropout: float = 0.1,
                  device: str = 'cpu',
-                 tcn_dilation_factors: List[int] = None):
+                 tcn_dilation_factors: List[int] = None,
+                 dt: float = 0.01):
         """Initializes the AEKF-TCN hybrid model.
 
         Args:
@@ -29,6 +30,7 @@ class AEKFTCN_model(BaseFilterTCNModel):
             dropout (float): The dropout rate for TCN regularization.
             device (str): The compute device ('cpu', 'cuda', 'mps').
             tcn_dilation_factors (List[int], optional): Dilation factor for each TCN layer.
+            dt (float): The time delta for integration.
         """
         super(AEKFTCN_model, self).__init__(
             tcn_input_size=tcn_input_size,
@@ -36,9 +38,10 @@ class AEKFTCN_model(BaseFilterTCNModel):
             kernel_size=kernel_size,
             dropout=dropout,
             device=device,
-            tcn_dilation_factors=tcn_dilation_factors
+            tcn_dilation_factors=tcn_dilation_factors,
+            dt=dt
         )
-        self.filter = ExtendedKalmanFilter(device=device)
+        self.filter = ExtendedKalmanFilter(device=device, dt=dt)
 
     def _initialize_state(self, batch_size: int, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
         """Initializes the state and covariance for the AEKF."""
