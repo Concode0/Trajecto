@@ -18,7 +18,7 @@ class BaseFilterTCNModel(nn.Module):
         the residual error of the Kalman filter's position estimate.
     4.  This predicted error is added back to the filter's output to produce a
         final, corrected trajectory.
-    
+
     Subclasses must implement the filter-specific methods for state initialization
     and single-step filtering.
     """
@@ -26,19 +26,19 @@ class BaseFilterTCNModel(nn.Module):
         super(BaseFilterTCNModel, self).__init__()
         self.device = device
         self.dt = dt
-        
+
         # The specific Kalman Filter (AEKF or ESKF) is defined by the subclass.
-        self.filter = None 
+        self.filter = None
 
         # --- TCN for Residual Correction ---
         self.tcn_input_norm = nn.BatchNorm1d(tcn_input_size)
         self.tcn = TCN(input_size=tcn_input_size, output_size=3, tcn_channels=tcn_channels, kernel_size=kernel_size, dropout=dropout, tcn_dilation_factors=tcn_dilation_factors)
-        
+
         # --- Lever Arm Compensation ---
         # This constant represents the physical offset from the IMU sensor to the pen tip.
         # It is crucial for accurately tracking the tip's trajectory.
         self.register_buffer('pen_tip_offset_b', torch.tensor([0.145, 0.002, -0.02], device=device))
-        
+
         # --- Gravity Vector ---
         # The gravity vector in the world frame. This is used to calculate the gravity
         # vector in the body frame, which is then used as a feature for the TCN.
@@ -55,7 +55,7 @@ class BaseFilterTCNModel(nn.Module):
     def _get_position_and_quaternion(self, filter_output: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extracts position and orientation from the filter's output tuple."""
         raise NotImplementedError("This method must be implemented by the subclass.")
-    
+
     def _get_gyro_bias(self, filter_output: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Extracts gyroscope bias from the filter's output tuple."""
         raise NotImplementedError("This method must be implemented by the subclass.")
@@ -73,9 +73,9 @@ class BaseFilterTCNModel(nn.Module):
             torch.Tensor: The final corrected 3D trajectory of the pen tip, with shape `[B, T, 3]`.
         """
         batch_size, seq_len, _ = imu_data_seq.shape
-        
+
         state_tuple = self._initialize_state(batch_size, imu_data_seq.dtype) if initial_state is None else initial_state
-        
+
         positions_w_seq = []
         quaternions_b_to_w_seq = []
         tcn_feature_seq = []
@@ -84,9 +84,9 @@ class BaseFilterTCNModel(nn.Module):
             accel_b_raw = imu_data_seq[:, t, :3]
             gyro_b_raw = imu_data_seq[:, t, 3:6]
             force_raw = imu_data_seq[:, t, 6:]
-            
+
             filter_output = self._filter_step(state_tuple, (gyro_b_raw, accel_b_raw, force_raw))
-            
+
             pos_w, quat_b_to_w = self._get_position_and_quaternion(filter_output)
             gyro_bias_b = self._get_gyro_bias(filter_output)
 
@@ -95,7 +95,7 @@ class BaseFilterTCNModel(nn.Module):
 
             # --- TCN Feature Engineering ---
             # A rich feature vector is created to help the TCN learn the filter's error dynamics.
-            
+
             # 1. Calculate gravity vector in body frame
             rot_mat_b_to_w_t = quaternion_to_rotation_matrix(quat_b_to_w)
             rot_mat_w_to_b_t = rot_mat_b_to_w_t.transpose(-1, -2)
@@ -130,7 +130,7 @@ class BaseFilterTCNModel(nn.Module):
         rot_mat_b_to_w = rot_mat_b_to_w.view(batch_size, seq_len, 3, 3)
         offset_w = (rot_mat_b_to_w @ self.pen_tip_offset_b.view(1, 1, 3, 1)).squeeze(-1)
         pen_tip_pos_w_base = positions_w + offset_w
-        
+
         # 2. Use the TCN to predict the residual VELOCITY error in the BODY frame.
         tcn_features_norm = self.tcn_input_norm(tcn_features.permute(0, 2, 1)).permute(0, 2, 1)
         velocity_correction_b = self.tcn(tcn_features_norm)
@@ -138,9 +138,12 @@ class BaseFilterTCNModel(nn.Module):
         # 3. Rotate the velocity correction to the WORLD frame.
         velocity_correction_w = (rot_mat_b_to_w @ velocity_correction_b.unsqueeze(-1)).squeeze(-1)
 
-        # 4. Integrate the world-frame velocity correction to get position correction.
-        position_correction_w = torch.cumsum(velocity_correction_w * self.dt, dim=1)
-        
+        # 4.'Trapezoidal' Integrate the world-frame velocity correction to get position correction
+        vel_curr = velocity_correction_w
+        vel_prev = torch.cat([torch.zeros_like(vel_curr[:, :1, :]), vel_curr[:, :-1, :]], dim=1)
+        avg_vel = (vel_curr + vel_prev) / 2.0
+        position_correction_w = torch.cumsum(avg_vel * self.dt, dim=1)
+
         # 5. Add the integrated correction to the baseline trajectory.
         final_trajectory_w = pen_tip_pos_w_base + position_correction_w
 
