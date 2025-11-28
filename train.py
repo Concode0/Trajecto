@@ -9,19 +9,54 @@ from tqdm import tqdm
 
 from model.ESKF_TCN import ESKFTCN_model
 from model.AEKF_TCN import AEKFTCN_model
+from model.rotation_utils import quaternion_to_rotation_matrix
+
+class HybridTrajectoryLoss(nn.Module):
+    def __init__(self, dt=0.01):
+        """
+        dt: Sampling time (e.g., 100Hz -> 0.01s)
+        """
+        super().__init__()
+        self.dt = dt
+        self.criterion = nn.SmoothL1Loss()
+
+    def forward(self,
+                pred_vel_resid_b,
+                filter_vel_w,
+                filter_quat,
+                gt_vel_w,
+                gt_pos_w,
+                start_pos_w,
+                alpha,
+                beta):
+
+        # 1. Velocity Loss (World Frame)
+        rot_mat_b_to_w = quaternion_to_rotation_matrix(filter_quat)
+        pred_vel_resid_w = (rot_mat_b_to_w @ pred_vel_resid_b.unsqueeze(-1)).squeeze(-1)
+
+        pred_final_vel_w = filter_vel_w + pred_vel_resid_w
+        loss_vel = self.criterion(pred_final_vel_w, gt_vel_w)
+
+        # 2. Position Loss (World Frame)
+        vel_avg = (pred_final_vel_w[:, :-1] + pred_final_vel_w[:, 1:]) / 2.0
+        vel_first = pred_final_vel_w[:, 0:1]
+        vel_integrand = torch.cat([vel_first, vel_avg], dim=1)
+
+        pred_traj_w = torch.cumsum(vel_integrand * self.dt, dim=1) + start_pos_w
+        loss_pos = self.criterion(pred_traj_w, gt_pos_w)
+
+        # 3. Total Loss
+        total_loss = (alpha * loss_vel) + (beta * loss_pos)
+        return total_loss, loss_vel.item(), loss_pos.item()
 
 class TrajectoryDataset(Dataset):
-    """
-    Dataset for loading trajectory data from HDF5 files.
-    Each item in the dataset corresponds to a sample trajectory.
-    """
-    def __init__(self, sensor_file, truth_file, sequence_length=300):
+    def __init__(self, sensor_file, truth_file, sequence_length=300, dt=0.01):
         self.sensor_file = sensor_file
         self.truth_file = truth_file
         self.sequence_length = sequence_length
+        self.dt = dt
 
         with h5py.File(self.sensor_file, 'r') as f:
-            # Assuming the number of samples can be inferred from the top-level groups
             self.num_samples = len(f.keys())
 
     def __len__(self):
@@ -29,100 +64,109 @@ class TrajectoryDataset(Dataset):
 
     def __getitem__(self, idx):
         sample_key = f'Samples_{idx}'
-        
+
         with h5py.File(self.sensor_file, 'r') as f:
-            accel_x = f[f'{sample_key}/Ax'][:]
-            accel_y = f[f'{sample_key}/Ay'][:]
-            accel_z = f[f'{sample_key}/Az'][:]
-            gyro_x = f[f'{sample_key}/Gx'][:]
-            gyro_y = f[f'{sample_key}/Gy'][:]
-            gyro_z = f[f'{sample_key}/Gz'][:]
-            force = f[f'{sample_key}/Force'][:]
-            
-            # Stack the sensor data
-            imu_data = np.stack([accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, force], axis=1)
+            imu_data = np.stack([
+                f[f'{sample_key}/Ax'][:], f[f'{sample_key}/Ay'][:], f[f'{sample_key}/Az'][:],
+                f[f'{sample_key}/Gx'][:], f[f'{sample_key}/Gy'][:], f[f'{sample_key}/Gz'][:],
+                f[f'{sample_key}/Force'][:]
+            ], axis=1)
 
         with h5py.File(self.truth_file, 'r') as f:
-            x = f[f'{sample_key}/x'][:]
-            y = f[f'{sample_key}/y'][:]
-            z = f[f'{sample_key}/z'][:]
-            
-            # Stack the ground truth data
-            truth_data = np.stack([x, y, z], axis=1)
+            gt_pos_w = np.stack([
+                f[f'{sample_key}/x'][:], f[f'{sample_key}/y'][:], f[f'{sample_key}/z'][:]
+            ], axis=1)
 
-        # TODO: Implement Dynamic Time Warping (DTW) for time alignment
-        # As a placeholder, we assume the data is already aligned.
-        # If lengths are different, truncate to the shorter length.
-        min_len = min(len(imu_data), len(truth_data))
+        min_len = min(len(imu_data), len(gt_pos_w))
         imu_data = imu_data[:min_len]
-        truth_data = truth_data[:min_len]
+        gt_pos_w = gt_pos_w[:min_len]
 
-        # Convert to tensors
-        imu_tensor = torch.from_numpy(imu_data).float()
-        truth_tensor = torch.from_numpy(truth_data).float()
+        # Calculate ground truth velocity in world frame
+        gt_vel_w = np.gradient(gt_pos_w, self.dt, axis=0)
 
-        return imu_tensor, truth_tensor
+        start_pos_w = gt_pos_w[0:1, :]
 
-def train(model, dataloader, epochs, lr, device, model_path):
-    """
-    Training loop for the hybrid model.
-    """
-    criterion = nn.MSELoss()
+        return {
+            "imu": torch.from_numpy(imu_data).float(),
+            "gt_pos_w": torch.from_numpy(gt_pos_w).float(),
+            "gt_vel_w": torch.from_numpy(gt_vel_w).float(),
+            "start_pos_w": torch.from_numpy(start_pos_w).float(),
+        }
+
+def train(model, dataloader, epochs, lr, device, model_path, warmup_epochs, alpha, beta_final):
+    criterion = HybridTrajectoryLoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
+
     model.to(device)
     model.train()
 
     for epoch in range(epochs):
-        epoch_loss = 0.0
-        
-        # Using tqdm for a progress bar
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-        
-        for imu_data, truth_data in pbar:
-            imu_data, truth_data = imu_data.to(device), truth_data.to(device)
-            
+        # Linear ramp-up for beta
+        if epoch < warmup_epochs:
+            beta = beta_final * (epoch + 1) / warmup_epochs
+        else:
+            beta = beta_final
+
+        epoch_loss, epoch_loss_vel, epoch_loss_pos = 0.0, 0.0, 0.0
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs} (beta: {beta:.2f})")
+
+        for data_batch in pbar:
+            imu_data = data_batch["imu"].to(device)
+            gt_pos_w = data_batch["gt_pos_w"].to(device)
+            gt_vel_w = data_batch["gt_vel_w"].to(device)
+            start_pos_w = data_batch["start_pos_w"].to(device)
+
             optimizer.zero_grad()
-            
-            # Forward pass
-            predicted_trajectory = model(imu_data)
-            
-            loss = criterion(predicted_trajectory, truth_data)
-            
-            # Backward pass and optimization
+
+            model_out = model(imu_data)
+
+            loss, loss_vel, loss_pos = criterion(
+                pred_vel_resid_b=model_out["pred_vel_resid_b"],
+                filter_vel_w=model_out["filter_vel_w"],
+                filter_quat=model_out["filter_quat"],
+                gt_vel_w=gt_vel_w,
+                gt_pos_w=gt_pos_w,
+                start_pos_w=start_pos_w,
+                alpha=alpha,
+                beta=beta
+            )
+
             loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Optional: gradient clipping
             optimizer.step()
-            
+
             epoch_loss += loss.item()
-            pbar.set_postfix({'Loss': loss.item()})
+            epoch_loss_vel += loss_vel
+            epoch_loss_pos += loss_pos
+            pbar.set_postfix({'Loss': loss.item(), 'Vel_Loss': loss_vel, 'Pos_Loss': loss_pos})
 
         avg_epoch_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch+1}/{epochs}, Average Loss: {avg_epoch_loss:.4f}")
+        avg_loss_vel = epoch_loss_vel / len(dataloader)
+        avg_loss_pos = epoch_loss_pos / len(dataloader)
+        print(f"Epoch {epoch+1}/{epochs}, Avg Loss: {avg_epoch_loss:.4f}, Vel: {avg_loss_vel:.4f}, Pos: {avg_loss_pos:.4f}")
 
-    # Save the trained model
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Train a hybrid Kalman Filter-TCN model.")
-    parser.add_argument('--model', type=str, choices=['eskf', 'aekf'], required=True,
-                        help="Model to train: 'eskf' or 'aekf'.")
+    parser.add_argument('--model', type=str, choices=['eskf', 'aekf'], required=True, help="Model to train: 'eskf' or 'aekf'.")
     parser.add_argument('--epochs', type=int, default=10, help="Number of training epochs.")
     parser.add_argument('--lr', type=float, default=1e-3, help="Learning rate.")
     parser.add_argument('--batch_size', type=int, default=32, help="Batch size.")
     parser.add_argument('--device', type=str, default='cpu', help="Device to train on ('cpu', 'cuda', 'mps').")
-    
+    parser.add_argument('--warmup_epochs', type=int, default=5, help="Number of warm-up epochs for the position loss.")
+    parser.add_argument('--alpha', type=float, default=1.0, help="Weight for the velocity loss.")
+    parser.add_argument('--beta', type=float, default=10.0, help="Final weight for the position loss.")
+
     args = parser.parse_args()
 
-    # File paths
     sensor_file = 'data/Sensor_Board_Data_1.h5'
-    truth_file = 'data/Groud_Truth_Data_1.h5' # Corrected typo from Groud to Ground
+    truth_file = 'data/Ground_Truth_Data_1.h5'
 
-    # Dataset and DataLoader
     dataset = TrajectoryDataset(sensor_file, truth_file)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # Model selection
     if args.model == 'eskf':
         model = ESKFTCN_model(device=args.device)
         model_path = 'eskf_tcn_model.pth'
@@ -133,8 +177,7 @@ def main():
         raise ValueError("Invalid model choice. Choose 'eskf' or 'aekf'.")
 
     print(f"Training {args.model.upper()}-TCN model for {args.epochs} epochs...")
-    
-    train(model, dataloader, args.epochs, args.lr, args.device, model_path)
+    train(model, dataloader, args.epochs, args.lr, args.device, model_path, args.warmup_epochs, args.alpha, args.beta)
 
 if __name__ == '__main__':
     main()
