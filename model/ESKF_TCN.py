@@ -81,8 +81,14 @@ if __name__ == '__main__':
 
     model = ESKFTCN_model(device=device).to(device)
     dummy_imu_data = torch.randn(4, 100, 7, device=device)
-    final_trajectory = model(dummy_imu_data)
+    model_output = model(dummy_imu_data)
 
     print(f"Input IMU sequence shape: {dummy_imu_data.shape}")
-    print(f"Output trajectory shape: {final_trajectory.shape}")
+    print("Output dictionary shapes:")
+    for key, value in model_output.items():
+        print(f"  - {key}: {value.shape}")
+
+    assert 'pred_pos_w' in model_output
+    assert model_output['pred_pos_w'].shape == (4, 100, 3)
+
     print("ESKF-TCN model created and tested successfully.")
