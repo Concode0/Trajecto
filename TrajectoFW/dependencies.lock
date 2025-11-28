@@ -47,7 +47,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.1
+    version: 5.4.3
 direct_dependencies:
 - espressif2022/bmi270
 - idf
