@@ -1,89 +1,190 @@
+"""
+This module defines a standalone Temporal Convolutional Network (TCN) model
+(`OnlyTCN`) designed for direct trajectory correction.
+
+Instead of being integrated into a Kalman filter, this TCN model takes raw
+and normalized IMU data to first compute a naive, double-integrated trajectory
+and then predicts a correction to this baseline, directly outputting a
+corrected 3D position trajectory.
+"""
+
+import os
+import sys
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 
-class TCN(nn.Module):
-    """
-    Temporal Convolutional Network for residual error correction of a trajectory.
-    Input: IMU data (accelerometer, gyroscope, force)
-    Output: Corrected trajectory (3D position)
-    """
-    def __init__(self, input_size=7, output_size=3, tcn_channels=[64, 64, 64, 64], kernel_size=3, dropout=0.1, dt=0.01):
-        super(TCN, self).__init__()
+# Adjust sys.path for relative imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-        self.dt = dt
-        self.tcn_layers = nn.ModuleList()
+
+class OnlyTCN(nn.Module):
+    """A standalone Temporal Convolutional Network (TCN) for direct trajectory correction.
+
+    This model takes raw IMU data to compute a naive trajectory via double
+    integration and uses normalized IMU data to predict a residual correction
+    for this naive trajectory. The final output is a corrected 3D position
+    trajectory.
+    """
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        input_size: int = 7,
+        output_size: int = 3,
+        tcn_channels: List[int] = [64, 64, 64, 64],
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        dt: float = 0.01,
+        tcn_dilation_factors: Optional[List[int]] = None, # Add tcn_dilation_factors to __init__ for consistency
+    ):
+        """Initializes the OnlyTCN model.
+
+        Args:
+            device: The computation device ('cpu', 'cuda', 'mps').
+            input_size: The number of features in the input IMU sequence
+                (e.g., 3 for accel, 3 for gyro, 1 for force = 7).
+            output_size: The number of features in the output (e.g., 3 for 3D position).
+            tcn_channels: A list specifying the number of channels (filters)
+                for each convolutional layer in the TCN.
+            kernel_size: The size of the convolutional kernel for TCN layers.
+            dropout: The dropout rate applied within the TCN for regularization.
+            dt: The time step (delta time) in seconds, used for numerical
+                integration of the raw IMU data.
+            tcn_dilation_factors: Optional list of dilation factors for each
+                TCN layer. If None, defaults to powers of 2 (1, 2, 4, 8, ...).
+        """
+        super().__init__()
+
+        self.dt = dt  # Time step for numerical integration.
+        self.tcn_layers = nn.ModuleList()  # Container for TCN blocks.
         in_channels = input_size
 
-        for out_channels in tcn_channels:
+        # Default dilation factors if not provided, typically powers of 2.
+        if tcn_dilation_factors is None:
+            tcn_dilation_factors = [2**i for i in range(len(tcn_channels))]
+        else:
+            if len(tcn_dilation_factors) != len(tcn_channels):
+                raise ValueError("Length of tcn_dilation_factors must match tcn_channels")
+
+        # Build TCN layers: Convolution -> ReLU -> Dropout
+        for i, out_channels in enumerate(tcn_channels):
+            # Causal convolution (padding ensures output length matches input length)
             self.tcn_layers.append(
-                nn.Conv1d(in_channels, out_channels, kernel_size, 
-                         padding=(kernel_size-1)//2, dilation=1)
+                nn.Conv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    padding=(kernel_size - 1) * tcn_dilation_factors[i],
+                    dilation=tcn_dilation_factors[i],
+                )
             )
             self.tcn_layers.append(nn.ReLU())
             self.tcn_layers.append(nn.Dropout(dropout))
             in_channels = out_channels
 
+        # The output layer maps the TCN's final feature representation to the
+        # desired correction dimensions (e.g., 3D position correction).
         self.output_layer = nn.Linear(tcn_channels[-1], output_size)
+        
+        # Calculate receptive field for informational purposes.
+        self.receptive_field = 1
+        for i, dilation in enumerate(tcn_dilation_factors):
+            self.receptive_field += 2 * (kernel_size - 1) * dilation
 
-    def forward(self, imu_sequence):
-        """
-        Forward pass for the TCN model with residual correction.
+
+    def forward(
+        self, imu_sequence_raw: torch.Tensor, imu_sequence_norm: torch.Tensor
+    ) -> torch.Tensor:
+        """Forward pass for the OnlyTCN model to predict a corrected trajectory.
 
         Args:
-            imu_sequence: [batch_size, sequence_length, input_size] 
-                          (assuming accel is the first 3 features)
+            imu_sequence_raw: Raw IMU data for physics-based integration
+                [batch_size, sequence_length, input_size].
+                Expected to contain accelerometer data in the first 3 channels.
+            imu_sequence_norm: Normalized IMU data for TCN feature extraction
+                [batch_size, sequence_length, input_size].
 
         Returns:
-            corrected_trajectory: [batch_size, sequence_length, output_size]
+            corrected_trajectory: The predicted 3D position trajectory
+                [batch_size, sequence_length, output_size].
         """
-        # 1. Compute a naive base trajectory by double-integrating acceleration
-        accel_data = imu_sequence[:, :, :3]
-        
+        # 1. Compute a naive base trajectory by double-integrating RAW acceleration.
+        # This provides a baseline trajectory estimate through dead-reckoning.
+        accel_data = imu_sequence_raw[:, :, :3]  # Extract 3-axis accelerometer data.
+
         # First integration (acceleration to velocity)
+        # Numerical integration using cumulative sum (Euler method).
+        # v = ∫ a dt
         velocity = torch.cumsum(accel_data * self.dt, dim=1)
-        
+
         # Second integration (velocity to position)
-        # We need to add the initial velocity contribution to each step
+        # p = ∫ v dt
         base_trajectory = torch.cumsum(velocity * self.dt, dim=1)
 
-        # 2. Use TCN to predict the correction
-        # Transpose for conv1d: [batch, features, sequence]
-        tcn_input = imu_sequence.transpose(1, 2)
+        # 2. Use TCN on NORMALIZED data to predict the correction.
+        # Normalized data is generally preferred for neural network inputs.
+        # Transpose for Conv1d: [batch, sequence_length, features] -> [batch, features, sequence_length]
+        tcn_input = imu_sequence_norm.transpose(1, 2)
 
+        # Pass through TCN layers.
         for layer in self.tcn_layers:
             tcn_input = layer(tcn_input)
 
-        # Transpose back and get position corrections
-        tcn_output = tcn_input.transpose(1, 2)  # [batch, seq, channels]
+        # Transpose back to original shape: [batch, features, sequence_length] -> [batch, sequence_length, features]
+        tcn_output = tcn_input.transpose(1, 2)
+        # The output layer maps the TCN's final feature map to a 3D correction vector.
         correction = self.output_layer(tcn_output)
 
-        # 3. Add the correction to the base trajectory
+        # 3. Add the correction to the base trajectory.
+        # The TCN learns to predict the residual error or deviation from the
+        # naive dead-reckoned trajectory.
         corrected_trajectory = base_trajectory + correction
 
         return corrected_trajectory
 
-if __name__ == '__main__':
-    # Example usage
-    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+
+if __name__ == "__main__":
+    # Example usage and testing of the OnlyTCN model.
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Model parameters
+    # Model parameters.
     input_size = 7  # accel(3), gyro(3), force(1)
-    output_size = 3 # position(3)
+    output_size = 3  # position(3)
     sequence_length = 100
     batch_size = 32
+    dt_val = 0.01
 
-    # Create a model instance
-    model = TCN(input_size=input_size, output_size=output_size).to(device)
+    # Create a model instance.
+    model = OnlyTCN(
+        device=device,
+        input_size=input_size,
+        output_size=output_size,
+        dt=dt_val,
+    ).to(device)
 
-    # Create some dummy data
-    dummy_imu_data = torch.randn(batch_size, sequence_length, input_size).to(device)
+    # Create some dummy data. `imu_sequence_raw` and `imu_sequence_norm`
+    # can be the same for this basic test, but typically `imu_sequence_norm`
+    # would be scaled/normalized version of `imu_sequence_raw`.
+    dummy_imu_data_raw = torch.randn(batch_size, sequence_length, input_size).to(
+        device
+    )
+    # Simple normalization for demonstration.
+    dummy_imu_data_norm = (dummy_imu_data_raw - dummy_imu_data_raw.mean(dim=(0, 1))) / (
+        dummy_imu_data_raw.std(dim=(0, 1)) + 1e-6
+    )
 
-    # Forward pass
-    predicted_trajectory = model(dummy_imu_data)
+    # Perform a forward pass.
+    predicted_trajectory = model(dummy_imu_data_raw, dummy_imu_data_norm)
 
-    print("TCN model changed to residual correction structure.")
-    print(f"Input shape: {dummy_imu_data.shape}")
-    print(f"Output shape: {predicted_trajectory.shape}")
-    print("TCN model created and tested successfully.")
+    print(f"\nInput raw IMU sequence shape: {dummy_imu_data_raw.shape}")
+    print(f"Input normalized IMU sequence shape: {dummy_imu_data_norm.shape}")
+    print(f"Output corrected trajectory shape: {predicted_trajectory.shape}")
+    print(f"Model receptive field: {model.receptive_field} steps")
+
+    # Assertions to ensure the output shape is as expected.
+    assert predicted_trajectory.shape == (batch_size, sequence_length, output_size)
+
+    print("\nOnlyTCN model created and tested successfully.")
