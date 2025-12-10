@@ -4,7 +4,15 @@ __pycache__/
 build/
 dist/
 wheels/
+data/
+Firmware/
+.vscode/
+acquired_data/
+data/
+.vscode
+.gitignore
 *.egg-info
+docs/
 
 # Virtual environments
 .venv

@@ -3,4 +3,18 @@
         "board/esp32c3-builtin.cfg"
     ],
     "idf.port": "/dev/tty.usbmodem1101"
+    {
+    // [Paste Image] 이미지를 현재 파일 위치의 'assets' 폴더에 자동 저장
+    "pasteImage.path": "${currentFileDir}/assets",
+    "pasteImage.prefix": "./assets/",
+    "pasteImage.namePrefix": "img_",
+    "pasteImage.forceUnixStyleSeparator": true, // 윈도우에서도 경로 슬래시(/) 사용
+
+    // [Markdown Preview Enhanced] 수식 및 테마 설정
+    "markdown-preview-enhanced.mathRenderingOption": "KaTeX", // 수식 렌더링 엔진
+    "markdown-preview-enhanced.previewTheme": "github-light.css", // 깔끔한 GitHub 스타일
+
+    // [Files] 마크다운 파일 저장 시 자동으로 불필요한 공백 제거
+    "files.trimTrailingWhitespace": true
+    }
 }
