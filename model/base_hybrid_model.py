@@ -1,129 +1,458 @@
+"""
+This module provides a base class for hybrid models that combine a Kalman Filter
+(such as ESKF or AEKF) with a Temporal Convolutional Network (TCN).
+
+It defines the common architecture and forward pass logic for such hybrid systems,
+allowing subclasses to implement specific filter dynamics and state management.
+The TCN component typically processes filter-derived features to provide corrections
+or adaptive parameters back to the filter, operating in either a closed-loop
+or open-loop configuration.
+"""
+
+import os
+import sys
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from typing import List, Tuple, Optional
+
+# Add parent directory to sys.path for relative imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from TCN import TCN
 from rotation_utils import quaternion_to_rotation_matrix
 
+
 class BaseFilterTCNModel(nn.Module):
-    """Base class for a hybrid Kalman Filter-TCN model for trajectory reconstruction.
+    """Base class for a hybrid Kalman Filter-TCN model architecture.
 
-    This class defines a hybrid architecture that combines a physics-based Kalman
-    filter (like AEKF or ESKF) with a data-driven Temporal Convolutional Network (TCN).
-    The architecture operates as follows:
-    1.  A Kalman filter processes raw IMU data sequentially to produce a baseline
-        state estimate (position, velocity, orientation).
-    2.  At each time step, a rich feature vector is constructed, including raw
-        IMU data, filter state estimates, and internal filter metrics (e.g., innovation).
-    3.  A TCN processes the sequence of these feature vectors to learn and predict
-        the residual error of the Kalman filter's position estimate.
-    4.  This predicted error is added back to the filter's output to produce a
-        final, corrected trajectory.
-    
-    Subclasses must implement the filter-specific methods for state initialization
-    and single-step filtering.
+    This class sets up the common structure for models that integrate a
+    state-estimation filter (like an ESKF or AEKF) with a Temporal
+    Convolutional Network (TCN). The filter operates step-by-step on raw
+    sensor data, while the TCN processes a sliding window of features
+    derived from the filter's output. The TCN's predictions (e.g., velocity
+    corrections, adaptive noise parameters, ZUPT probabilities) can then be
+    used to refine the filter's estimates in a closed-loop fashion, or applied
+    as post-processing in an open-loop setup.
+
+    Attributes:
+        device (str): The computation device ('cpu', 'cuda', 'mps').
+        dt (float): The time step (delta time) used for filter integration.
+        tcn_input_size (int): The dimensionality of the feature vector fed into the TCN.
+        loop_type (str): Specifies how TCN corrections are applied ('closed' or 'open').
+        filter (nn.Module): Placeholder for the specific Kalman filter
+            implementation (e.g., ESKF, AEKF), to be instantiated by subclasses.
+        tcn (TCN): The Temporal Convolutional Network used for feature processing.
+        input_norm_layer (nn.LayerNorm): Layer normalization applied to TCN inputs.
+        pen_tip_offset_b (torch.Tensor): Constant offset from IMU to pen tip in body frame.
+        gravity_w (torch.Tensor): Constant gravity vector in world frame.
     """
-    def __init__(self, tcn_input_size: int = 17, tcn_channels: List[int] = [64, 64, 64, 64], kernel_size: int = 3, dropout: float = 0.1, device: str = 'cpu'):
-        super(BaseFilterTCNModel, self).__init__()
-        self.device = device
-        
-        # The specific Kalman Filter (AEKF or ESKF) is defined by the subclass.
-        self.filter = None 
 
-        # --- TCN for Residual Correction ---
-        self.tcn_input_norm = nn.BatchNorm1d(tcn_input_size)
-        self.tcn = TCN(input_size=tcn_input_size, output_size=3, tcn_channels=tcn_channels, kernel_size=kernel_size, dropout=dropout)
-        
-        # --- Lever Arm Compensation ---
-        # This constant represents the physical offset from the IMU sensor to the pen tip.
-        # It is crucial for accurately tracking the tip's trajectory.
-        self.register_buffer('pen_tip_offset_b', torch.tensor([-1.0, 0.0, -0.02], device=device))
-
-    def _initialize_state(self, batch_size: int, dtype: torch.dtype) -> Tuple[torch.Tensor, ...]:
-        """Initializes the state and covariance for the Kalman filter."""
-        raise NotImplementedError("This method must be implemented by the subclass.")
-
-    def _filter_step(self, state_tuple: Tuple[torch.Tensor, ...], imu_data: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, ...]:
-        """Performs a single predict-update step of the Kalman filter."""
-        raise NotImplementedError("This method must be implemented by the subclass.")
-
-    def _get_position_and_quaternion(self, filter_output: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extracts position and orientation from the filter's output tuple."""
-        raise NotImplementedError("This method must be implemented by the subclass.")
-    
-    def _get_gyro_bias(self, filter_output: Tuple[torch.Tensor, ...]) -> torch.Tensor:
-        """Extracts gyroscope bias from the filter's output tuple."""
-        raise NotImplementedError("This method must be implemented by the subclass.")
-
-    def forward(self, imu_data_seq: torch.Tensor, initial_state: Optional[Tuple[torch.Tensor, ...]] = None) -> torch.Tensor:
-        """Performs a full forward pass of the hybrid model.
+    def __init__(
+        self,
+        tcn_input_size: int = 20,
+        tcn_channels: List[int] = [64, 64, 64, 64],
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        device: str = "cpu",
+        tcn_dilation_factors: Optional[List[int]] = None,
+        dt: float = 0.01,
+        loop_type: str = "closed",
+    ):
+        """Initializes the BaseFilterTCNModel.
 
         Args:
-            imu_data_seq (torch.Tensor): A sequence of IMU data with shape `[B, T, 7]`,
-                containing (accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, force).
-            initial_state (Optional[Tuple[torch.Tensor, ...]]): An optional tuple to
-                initialize the Kalman filter's state and covariance.
+            tcn_input_size: The number of features in the TCN input vector.
+            tcn_channels: A list specifying the number of channels (filters)
+                for each layer in the TCN.
+            kernel_size: The kernel size for TCN convolutions.
+            dropout: The dropout rate applied within the TCN for regularization.
+            device: The computation device ('cpu', 'cuda', 'mps').
+            tcn_dilation_factors: Optional list of dilation factors for each
+                TCN layer. If None, default dilation factors are used.
+            dt: The time step (delta time) in seconds, crucial for the filter's
+                integration steps.
+            loop_type: Defines how TCN corrections are applied.
+                'closed': TCN outputs directly influence the filter's state/covariance updates.
+                'open': TCN outputs are used for post-correction of the filter's trajectory.
+        """
+        super().__init__()
+        self.device = device
+        self.dt = dt
+        self.tcn_input_size = tcn_input_size
+        self.loop_type = loop_type
+
+        # The specific Kalman filter (ESKF/AEKF) must be instantiated by a subclass.
+        self.filter: Optional[nn.Module] = None
+
+        # --- TCN for Closed-Loop Correction or Post-processing ---
+        # The TCN takes a sequence of features derived from the filter's operation
+        # and outputs corrections or adaptive parameters.
+        self.tcn = TCN(
+            input_size=tcn_input_size,
+            tcn_channels=tcn_channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+            tcn_dilation_factors=tcn_dilation_factors,
+            # TCN in this context primarily predicts corrections, not state directly.
+            # Its dt is often implicitly handled by feature sampling rate.
+        )
+
+        # --- Normalization Layer for TCN Input ---
+        # Layer normalization helps stabilize TCN training by normalizing its input features.
+        self.input_norm_layer = nn.LayerNorm(tcn_input_size)
+
+        # --- Physical Constants ---
+        # Pen tip offset from the IMU's origin, expressed in the IMU's body frame.
+        self.register_buffer(
+            "pen_tip_offset_b", torch.tensor([0.145, 0.002, -0.02], device=device)
+        )
+        # Gravity vector in the world frame (assuming +Z is up).
+        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, 9.81], device=device))
+
+    def _initialize_state(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        imu_data_seq: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Abstract method to initialize the filter's state and covariance.
+
+        Subclasses must implement this method to provide initial conditions
+        for their specific Kalman filter (e.g., ESKF or AEKF).
+
+        Args:
+            batch_size: The number of sequences in the current batch.
+            dtype: The desired data type for the state and covariance tensors.
+            imu_data_seq: Optional. Initial IMU data that might be used for
+                state initialization (e.g., for 'leveling' the initial orientation).
 
         Returns:
-            torch.Tensor: The final corrected 3D trajectory of the pen tip, with shape `[B, T, 3]`.
+            A tuple containing the initialized state vector and covariance matrix.
         """
-        batch_size, seq_len, _ = imu_data_seq.shape
-        
-        state_tuple = self._initialize_state(batch_size, imu_data_seq.dtype) if initial_state is None else initial_state
-        
-        positions_w_seq = []
-        quaternions_b_to_w_seq = []
-        tcn_feature_seq = []
+        raise NotImplementedError
 
+    def _filter_step(
+        self,
+        state_tuple: Tuple[torch.Tensor, ...],
+        imu_data: Tuple[torch.Tensor, ...],
+        tcn_output: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Abstract method to perform a single step of the Kalman filter.
+
+        Subclasses must implement this method to execute one predict-update
+        cycle of their specific Kalman filter.
+
+        Args:
+            state_tuple: A tuple containing the current state vector and
+                its covariance matrix.
+            imu_data: A tuple containing raw IMU measurements (gyro, accel, force)
+                for the current time step.
+            tcn_output: Optional. A dictionary of outputs from the TCN that
+                can be used to influence the filter's current step (e.g., noise
+                adaptation, state corrections).
+
+        Returns:
+            A tuple containing the updated state vector, covariance matrix,
+            and any other filter-specific outputs (e.g., innovation, features
+            for the TCN).
+        """
+        raise NotImplementedError
+
+    def _get_position_and_quaternion(
+        self, filter_output: Tuple[torch.Tensor, ...]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Abstract method to extract position and quaternion from the filter's state.
+
+        Subclasses must implement this to correctly parse their filter's
+        state vector format.
+
+        Args:
+            filter_output: The full output tuple from the filter's step,
+                where the first element is typically the state vector.
+
+        Returns:
+            A tuple containing:
+                - pos_w (torch.Tensor): The 3D position in the world frame.
+                - quat_b_to_w (torch.Tensor): The 4-element body-to-world quaternion.
+        """
+        raise NotImplementedError
+
+    def _get_gyro_bias(
+        self, filter_output: Tuple[torch.Tensor, ...]
+    ) -> torch.Tensor:
+        """Abstract method to extract gyroscope bias from the filter's state.
+
+        Subclasses must implement this to correctly parse their filter's
+        state vector format.
+
+        Args:
+            filter_output: The full output tuple from the filter's step,
+                where the first element is typically the state vector.
+
+        Returns:
+            gyro_bias_b (torch.Tensor): The 3D gyroscope bias in the body frame.
+        """
+        raise NotImplementedError
+
+    def forward(
+        self,
+        imu_data_raw: torch.Tensor,
+        imu_data_norm: torch.Tensor,
+        initial_state: Optional[Tuple[torch.Tensor, ...]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Performs the forward pass of the hybrid filter-TCN model.
+
+        This method processes an entire sequence of IMU data, iteratively
+        applying the Kalman filter step by step, feeding filter-derived
+        features to the TCN, and applying TCN corrections.
+
+        Args:
+            imu_data_raw: Raw IMU data sequence [batch_size, seq_len, imu_features].
+                Typically includes accel (3), gyro (3), and force (1).
+            imu_data_norm: Normalized IMU data sequence [batch_size, seq_len, imu_features].
+                Used for feature engineering for the TCN.
+            initial_state: Optional. A tuple containing the initial state vector
+                and its covariance matrix. If None, `_initialize_state` is called.
+
+        Returns:
+            A dictionary containing various predicted and intermediate outputs,
+            such as:
+                - "pred_pos_w": Final corrected trajectory in world frame.
+                - "pred_vel_resid_b": TCN-predicted residual velocity in body frame.
+                - "pred_zupt_prob": TCN-predicted ZUPT probability.
+                - "pred_covariance_R": TCN-predicted measurement noise covariance.
+                - "filter_vel_w": Velocity from the filter in world frame.
+                - "filter_quat": Orientation quaternions from the filter.
+                - "filter_innovation": Raw innovation from the filter.
+                - "tcn_output_mask": Mask indicating when TCN outputs were used.
+        """
+        batch_size, seq_len, _ = imu_data_raw.shape
+
+        # Initialize the filter's state and covariance.
+        state_tuple = (
+            self._initialize_state(batch_size, imu_data_raw.dtype, imu_data_raw)
+            if initial_state is None
+            else initial_state
+        )
+
+        # Retrieve the TCN's receptive field size. This determines how much
+        # historical data the TCN needs to make a prediction.
+        receptive_field = self.tcn.receptive_field
+
+        # Buffers for storing sequences of filter outputs and TCN predictions.
+        positions_w_seq: List[torch.Tensor] = []
+        quaternions_b_to_w_seq: List[torch.Tensor] = []
+        pred_vel_resid_b_seq: List[torch.Tensor] = []
+        pred_zupt_prob_seq: List[torch.Tensor] = []
+        pred_covariance_R_seq: List[torch.Tensor] = []
+        filter_vel_w_seq: List[torch.Tensor] = []
+        filter_innovation_seq: List[torch.Tensor] = []
+
+        # Buffer to store TCN input features for the entire sequence.
+        # This allows for efficient windowing for the TCN.
+        tcn_feature_seq = torch.zeros(
+            batch_size,
+            seq_len,
+            self.tcn_input_size,
+            device=self.device,
+            dtype=imu_data_norm.dtype,
+        )
+        # Mask to indicate which time steps had valid TCN outputs (i.e., after RF).
+        tcn_output_mask = torch.zeros(
+            batch_size, seq_len, dtype=torch.bool, device=self.device
+        )
+
+        # Iterate through the sequence, applying the filter step by step.
         for t in range(seq_len):
-            accel_b_raw = imu_data_seq[:, t, :3]
-            gyro_b_raw = imu_data_seq[:, t, 3:6]
-            force_raw = imu_data_seq[:, t, 6:]
-            
-            filter_output = self._filter_step(state_tuple, (gyro_b_raw, accel_b_raw, force_raw))
-            
+            # Extract raw IMU data for the current time step.
+            accel_b_raw = imu_data_raw[:, t, :3]
+            gyro_b_raw = imu_data_raw[:, t, 3:6]
+            force_raw = imu_data_raw[:, t, 6:]
+
+            tcn_output: Optional[Dict[str, torch.Tensor]] = None
+            # TCN prediction: only if enough history (at least receptive_field steps) is available.
+            if t >= receptive_field:
+                # Create a sliding window of features for the TCN.
+                start_idx = t - receptive_field
+                tcn_input_window = tcn_feature_seq[:, start_idx:t, :].clone()
+
+                # Normalize the TCN input window.
+                tcn_input_norm = self.input_norm_layer(tcn_input_window)
+
+                # Get predictions from the TCN. The TCN typically outputs a sequence
+                # of corrections/parameters; we take the latest prediction.
+                tcn_output_seq = self.tcn(tcn_input_norm)
+                tcn_output = {k: v[:, -1, :] for k, v in tcn_output_seq.items()}
+
+                # Store TCN predictions for later use or loss calculation.
+                pred_vel_resid_b_seq.append(tcn_output["vel_corr"])
+                pred_zupt_prob_seq.append(tcn_output["zupt_prob"])
+                pred_covariance_R_seq.append(tcn_output["covariance_R"])
+                tcn_output_mask[:, t] = True
+
+            # Perform one step of the Kalman filter (prediction and update).
+            # The tcn_output is passed to allow for closed-loop adaptation.
+            filter_output = self._filter_step(
+                state_tuple, (gyro_b_raw, accel_b_raw, force_raw), tcn_output
+            )
+
+            # Unpack results from the filter step for the next iteration and logging.
             pos_w, quat_b_to_w = self._get_position_and_quaternion(filter_output)
             gyro_bias_b = self._get_gyro_bias(filter_output)
-
-            tcn_features_from_filter = filter_output[-1]
+            # The last element of filter_output is usually a dict of TCN features.
+            tcn_features_from_filter: Dict[str, torch.Tensor] = filter_output[-1]
+            # The state and covariance are updated for the next iteration.
             state_tuple = filter_output[:-1]
 
-            # --- TCN Feature Engineering ---
-            # A rich feature vector is created to help the TCN learn the filter's error dynamics.
-            
-            # Lever Arm Velocity Compensation: The filter tracks the IMU's velocity, but we need the
-            # velocity of the pen tip. This is calculated by adding the tangential velocity
-            # caused by rotation around the IMU center. v_tip = v_imu + ω × r
+            # Store the raw innovation from the filter for potential loss functions.
+            raw_innovation = tcn_features_from_filter["innovation"]
+            filter_innovation_seq.append(raw_innovation)
+
+            # --- Feature Engineering for the *next* TCN input ---
+            # These features are crucial for the TCN to learn effective corrections.
+            # They are derived from normalized IMU data and current filter estimates.
+            accel_b_norm_t = imu_data_norm[:, t, :3]
+            gyro_b_norm_t = imu_data_norm[:, t, 3:6]
+            force_norm_t = imu_data_norm[:, t, 6:]
+
+            # Rotate current quaternion to get world-to-body rotation matrix.
+            rot_mat_b_to_w_t = quaternion_to_rotation_matrix(quat_b_to_w)
+            rot_mat_w_to_b_t = rot_mat_b_to_w_t.transpose(-1, -2)
+
+            # Calculate estimated gravity vector in the body frame and normalize it.
+            # This provides a sense of the current orientation relative to gravity.
+            gravity_b_raw = (
+                rot_mat_w_to_b_t @ self.gravity_w.expand(batch_size, -1).unsqueeze(-1)
+            ).squeeze(-1)
+            gravity_b_norm = gravity_b_raw / 9.81  # Normalize by magnitude of gravity
+
+            # Calculate angular velocity and tangential velocity of pen tip.
             angular_velocity_b = gyro_b_raw - gyro_bias_b
-            tangential_vel_b = torch.cross(angular_velocity_b, self.pen_tip_offset_b, dim=-1)
-            pen_tip_vel_b = tcn_features_from_filter['body_velocity'] + tangential_vel_b
+            # Tangential velocity of a point (pen tip) due to rotation relative to IMU origin.
+            tangential_vel_b = torch.cross(
+                angular_velocity_b, self.pen_tip_offset_b.unsqueeze(0), dim=-1
+            )
+            # Combined pen tip velocity in body frame (filter's linear velocity + tangential).
+            pen_tip_vel_b = tcn_features_from_filter["body_velocity"] + tangential_vel_b
 
-            tcn_input_vec = torch.cat([
-                gyro_b_raw, accel_b_raw, force_raw,
-                pen_tip_vel_b,
-                tcn_features_from_filter['zupt_flag'],
-                tcn_features_from_filter['innovation']
-            ], dim=-1)
+            # Apply tanh squashing to bound feature values within a reasonable range [-1, 1].
+            # This can improve the stability and performance of neural networks.
+            pen_tip_vel_b_squashed = torch.tanh(pen_tip_vel_b)
+            innovation_squashed = torch.tanh(raw_innovation)
 
+            # Construct the comprehensive TCN input vector for this time step.
+            tcn_input_vec = torch.cat(
+                [
+                    gyro_b_norm_t,
+                    accel_b_norm_t,
+                    force_norm_t,
+                    pen_tip_vel_b_squashed,
+                    gravity_b_norm,
+                    tcn_features_from_filter["zupt_flag"],
+                    innovation_squashed,
+                ],
+                dim=-1,
+            )
+            # Store the constructed feature vector.
+            tcn_feature_seq[:, t, :] = tcn_input_vec
+
+            # Log current position and quaternion from the filter for final trajectory calculation.
             positions_w_seq.append(pos_w)
             quaternions_b_to_w_seq.append(quat_b_to_w)
-            tcn_feature_seq.append(tcn_input_vec)
 
-        positions_w = torch.stack(positions_w_seq, dim=1)
+            # Also log filter's world-frame velocity.
+            filter_vel_w = (
+                rot_mat_b_to_w_t @ pen_tip_vel_b.unsqueeze(-1)
+            ).squeeze(-1)
+            filter_vel_w_seq.append(filter_vel_w)
+
+        # --- Helper for padding sequences ---
+        def pad_sequence(
+            seq: List[torch.Tensor], final_dim: int, dtype: torch.dtype
+        ) -> torch.Tensor:
+            """Pads a list of tensors to a consistent sequence length for concatenation."""
+            if not seq:
+                # If sequence is empty, return a zero tensor of the expected final shape.
+                return torch.zeros(
+                    batch_size, seq_len, final_dim, device=self.device, dtype=dtype
+                )
+            # Calculate how many initial time steps were skipped (due to TCN receptive field).
+            num_missing = seq_len - len(seq)
+            # Create padding tensor for the skipped steps.
+            padding_tensor = torch.zeros(
+                batch_size, num_missing, final_dim, device=self.device, dtype=dtype
+            )
+            stacked_seq = torch.stack(seq, dim=1)
+            return torch.cat([padding_tensor, stacked_seq], dim=1)
+
+        # --- Stack and process collected sequences ---
+        raw_trajectory_w = torch.stack(positions_w_seq, dim=1)
         quaternions_b_to_w = torch.stack(quaternions_b_to_w_seq, dim=1)
-        tcn_features = torch.stack(tcn_feature_seq, dim=1)
+        # Convert all quaternions in the sequence to rotation matrices (body to world).
+        rot_mat_b_to_w = quaternion_to_rotation_matrix(
+            quaternions_b_to_w.reshape(-1, 4)
+        ).view(batch_size, seq_len, 3, 3)
 
-        # --- Final Trajectory Correction ---
-        # 1. Apply lever arm correction to the filter's position output.
-        rot_mat_b_to_w = quaternion_to_rotation_matrix(quaternions_b_to_w.reshape(-1, 4))
-        rot_mat_b_to_w = rot_mat_b_to_w.view(batch_size, seq_len, 3, 3)
-        offset_w = (rot_mat_b_to_w @ self.pen_tip_offset_b.view(1, 1, 3, 1)).squeeze(-1)
-        pen_tip_pos_w_base = positions_w + offset_w
-        
-        # 2. Use the TCN to predict the residual error.
-        tcn_features_norm = self.tcn_input_norm(tcn_features.permute(0, 2, 1)).permute(0, 2, 1)
-        position_correction_w = self.tcn(tcn_features_norm)
+        # Pad TCN prediction sequences.
+        pred_vel_resid_b = pad_sequence(pred_vel_resid_b_seq, 3, imu_data_raw.dtype)
+        pred_zupt_prob = pad_sequence(pred_zupt_prob_seq, 1, imu_data_raw.dtype)
+        # Note: If TCN predicts R as a full matrix, final_dim would be different.
+        # Assuming diagonal elements or specific covariance parameterization.
+        pred_covariance_R = pad_sequence(pred_covariance_R_seq, 6, imu_data_raw.dtype)
+        filter_innovation = pad_sequence(filter_innovation_seq, 6, imu_data_raw.dtype)
+        stacked_filter_vel_w = torch.stack(filter_vel_w_seq, dim=1)
 
-        # 3. Add the learned correction to the baseline trajectory.
-        final_trajectory_w = pen_tip_pos_w_base + position_correction_w
+        # --- Final Trajectory Calculation (Open-loop vs. Closed-loop) ---
+        final_pen_tip_trajectory_w: torch.Tensor
+        if self.loop_type == "open":
+            # In open-loop, TCN corrections are applied *after* the filter has run.
+            # This means the filter's state itself is not directly modified by TCN velocity corrections.
+            # 1. Rotate residual velocity from body to world frame using filter's orientation.
+            pred_vel_resid_w = (
+                rot_mat_b_to_w @ pred_vel_resid_b.unsqueeze(-1)
+            ).squeeze(-1)
 
-        return final_trajectory_w
+            # 2. Add residual velocity to the filter's world-frame velocity.
+            corrected_vel_w = stacked_filter_vel_w + pred_vel_resid_w
+
+            # 3. Integrate the corrected velocity to obtain the final trajectory.
+            # Use the first position from the filter as the initial condition for integration.
+            initial_pos_w = raw_trajectory_w[:, 0, :].unsqueeze(1)
+
+            # Cumulative sum of velocity deltas (delta_p = v * dt) gives displacement.
+            # We start integration from the second time step as we have initial_pos_w.
+            corrected_pos_deltas = torch.cumsum(
+                corrected_vel_w[:, 1:, :] * self.dt, dim=1
+            )
+
+            # Reconstruct the trajectory by adding displacements to the initial position.
+            corrected_trajectory_w = torch.cat(
+                [initial_pos_w, initial_pos_w + corrected_pos_deltas], dim=1
+            )
+
+            # Add pen tip offset in the world frame to get the final pen tip trajectory.
+            pen_tip_offset_w = (
+                rot_mat_b_to_w @ self.pen_tip_offset_b.view(1, 1, 3, 1)
+            ).squeeze(-1)
+            final_pen_tip_trajectory_w = corrected_trajectory_w + pen_tip_offset_w
+        else:  # loop_type == 'closed'
+            # In closed-loop, TCN corrections (e.g., velocity residuals) are
+            # directly integrated into the filter's state propagation or update.
+            # Therefore, `raw_trajectory_w` already reflects the TCN's influence.
+            # We just need to add the pen tip offset.
+            pen_tip_offset_w = (
+                rot_mat_b_to_w @ self.pen_tip_offset_b.view(1, 1, 3, 1)
+            ).squeeze(-1)
+            final_pen_tip_trajectory_w = raw_trajectory_w + pen_tip_offset_w
+
+        return {
+            "pred_pos_w": final_pen_tip_trajectory_w,
+            "pred_vel_resid_b": pred_vel_resid_b,
+            "pred_zupt_prob": pred_zupt_prob,
+            "pred_covariance_R": pred_covariance_R,
+            "filter_vel_w": stacked_filter_vel_w,
+            "filter_quat": quaternions_b_to_w,
+            "filter_innovation": filter_innovation,
+            "tcn_output_mask": tcn_output_mask,
+        }
