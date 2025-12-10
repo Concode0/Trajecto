@@ -1,0 +1,123 @@
+#list-widget {
+  dock: top;
+}
+
+#content {
+  dock: top;
+  display: none;
+  border: tall $primary;
+  background: $boost;
+  max-height: 90%;
+  padding: 0 1;
+}
+
+OptionList {
+  max-height: 95%;
+}
+
+.view-dataset #dirs {
+  display: none;
+}
+.view-dataset #content {
+  display: block;
+}
+.view-dataset #dtable {
+  display: none;
+}
+
+.view-plot #data {
+  display: none;
+}
+.view-plot #plot {
+  display: block;
+}
+.view-plot #dtable {
+  display: none;
+}
+
+.view-dtable #data {
+  display: none;
+}
+.view-dtable #plot {
+  display: none;
+}
+.view-dtable #dtable {
+  display: block;
+}
+
+#plot {
+  dock: top;
+  display: none;
+}
+#dtable {
+  dock: top;
+  display: block;
+}
+
+#header {
+  background: $boost;
+  border: tall $success;
+  padding: 0 1;
+  margin: 1 0;
+}
+
+Toast {
+  padding: 1;
+  margin: 0;
+}
+
+AttributeScreen {
+  align: center middle;
+}
+#dialog {
+    grid-size: 2;
+    grid-gutter: 1 2;
+    grid-rows: 1fr 3;
+    padding: 0 1;
+    width: 80%;
+    height: 80%;
+    border: thick $background 80%;
+    background: $surface;
+}
+#attr_title {
+    column-span: 2;
+    height: 10%;
+    width: 1fr;
+    content-align: center middle;
+}
+.attr_col {
+    column-span: 1;
+    height: 1fr;
+    width: 1fr;
+}
+#attr_content_scroll {
+  margin: 1 0;
+}
+#attr_content {
+  border: tall $secondary;
+  background: $panel;
+  margin: 0 0;
+  padding: 0 1;
+}
+
+ConfirmationScreen {
+    align: center middle;
+}
+
+.confirm-dialog {
+    width: 40;
+    height: auto;
+    border: thick $primary;
+    background: $surface;
+}
+
+.confirm-prompt {
+    width: 100%;
+    text-align: center;
+}
+
+.confirm-buttons {
+    width: 100%;
+    align-horizontal: center;
+    padding-top: 1;
+}
