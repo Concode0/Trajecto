@@ -1,0 +1,9 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=4.1.0'
+  espp/bmi270: ^1.0.31
+  espp/i2c: ^1.0.31
+  espp/task: ^1.0.31
+  
