@@ -1,4 +1,4 @@
-# 🖊️ Trajecto: 3D Pen Trajectory Reconstruction
+# Trajecto: 3D Pen Trajectory Reconstruction
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
@@ -8,7 +8,7 @@
 
 Trajecto is a comprehensive system for robust 3D pen trajectory reconstruction from a single IMU sensor. It combines classic state estimation techniques with deep learning to overcome the inherent drift problem in inertial sensors, enabling accurate tracking of movement in 3D space.
 
-## ✨ Features
+## Features
 
 - **Hybrid Models**: Implements hybrid architectures combining Kalman Filters (ESKF, AEKF) with a Temporal Convolutional Network (TCN) for state-of-the-art drift correction.
 - **Standalone Model**: Includes a pure TCN model (`OnlyTCN`) for a direct deep learning-based approach.
@@ -16,7 +16,7 @@ Trajecto is a comprehensive system for robust 3D pen trajectory reconstruction f
 - **Embedded Firmware**: Contains the firmware for the ESP32-based data acquisition hardware.
 - **Pressure-based ZUPT**: Utilizes a pressure sensor for robust Zero-Velocity Updates, significantly improving tracking accuracy during pauses.
 
-## 🏛️ System Architecture
+## System Architecture
 
 The core of this project lies in its hybrid modeling approach to trajectory reconstruction. By combining physical models (Kalman Filters) with data-driven deep learning models (TCN), Trajecto achieves high-precision 3D trajectories.
 
@@ -25,7 +25,7 @@ The core of this project lies in its hybrid modeling approach to trajectory reco
 - **AEKF-TCN**: An Adaptive Extended Kalman Filter-based hybrid model.
 - **OnlyTCN**: A standalone TCN that directly predicts the 3D trajectory from IMU data.
 
-## 📂 Repository Structure
+## Repository Structure
 
 ```
 Trajecto/
@@ -41,7 +41,7 @@ Trajecto/
 └── pyproject.toml      # Project dependencies
 ```
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 - Python 3.9+
@@ -106,7 +106,7 @@ After training, you can visualize the performance of your model on test data.
 
 The `TrajectoFW/` directory contains the C++ firmware for the ESP32-C3 based custom hardware. It uses the ESP-IDF framework. For more details on building and flashing the firmware, see the `README.md` inside the `TrajectoFW` directory.
 
-## 📄 License
+## License
 
 This work is licensed under a **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License**.
 
@@ -114,7 +114,7 @@ This work is licensed under a **Creative Commons Attribution-NonCommercial-Share
     <img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-sa/4.0/88x31.png" />
 </a>
 
-## 📚 References & Acknowledgements
+## References & Acknowledgements
 
 * **Code Implementation:**
   * Based on [h5viewer](https://github.com/kszenes/h5tui)
