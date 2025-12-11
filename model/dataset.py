@@ -80,7 +80,7 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         Returns:
             The total number of samples.
         """
-_
+
         return self.num_original_samples * self.augment_multiplier
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
