@@ -15,12 +15,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+# Add parent directory to sys.path for relative imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from AEKF import ExtendedKalmanFilter
 from base_hybrid_model import BaseFilterTCNModel
 from rotation_utils import quaternion_from_two_vectors
-
-# Add parent directory to sys.path for relative imports
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 
 class AEKFTCN_model(BaseFilterTCNModel):

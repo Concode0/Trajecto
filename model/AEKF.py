@@ -478,11 +478,13 @@ class ExtendedKalmanFilter(nn.Module):
         # Q: Process noise covariance matrix. It models the uncertainty introduced
         # by the system model itself and any unmodeled disturbances (e.g., random walk).
         # We ensure Q_diag elements are positive using torch.abs().
-        Q_diag = torch.abs(self.Q_diag)
+        Q_diag_base = torch.abs(self.Q_diag)
         # Add random walk noise contributions for gyro and accel biases.
         # Bias random walk is typically proportional to dt.
-        Q_diag[:, 10:13] += torch.square(self.gyro_bias_rw_std) * self.dt
-        Q_diag[:, 13:16] += torch.square(self.accel_bias_rw_std) * self.dt
+        noise_to_add = torch.zeros_like(Q_diag_base)
+        noise_to_add[10:13] = torch.square(self.gyro_bias_rw_std) * self.dt
+        noise_to_add[13:16] = torch.square(self.accel_bias_rw_std) * self.dt
+        Q_diag = Q_diag_base + noise_to_add
         Q_matrix = torch.diag_embed(Q_diag)  # Create a diagonal matrix from Q_diag
 
         # Standard covariance prediction formula
@@ -720,6 +722,10 @@ class ExtendedKalmanFilter(nn.Module):
             state_predicted, P_predicted, measurement, accel_body_raw, tcn_output
         )
 
+        final_state = state_updated
+        final_P = P_updated
+        final_innovation = innovation
+
         # 3. ZUPT (Zero-Velocity Update) Correction:
         # Detect if the device is currently static.
         is_zupt = (
@@ -735,15 +741,17 @@ class ExtendedKalmanFilter(nn.Module):
             state_zupt_corr, P_zupt_corr = self._calculate_zupt_update(
                 state_updated[is_zupt], P_updated[is_zupt]
             )
-            state_updated[is_zupt] = state_zupt_corr
-            P_updated[is_zupt] = P_zupt_corr
+            
+            # Use clone to avoid in-place modification of tensors that require gradients
+            final_state = state_updated.clone()
+            final_P = P_updated.clone()
+            final_innovation = innovation.clone()
+
+            final_state[is_zupt] = state_zupt_corr
+            final_P[is_zupt] = P_zupt_corr
             # For ZUPT events, the innovation is effectively forced to zero,
             # as the filter is explicitly commanded to reduce velocity to zero.
-            innovation[is_zupt] = 0
-
-        # The final state and covariance after all updates.
-        final_state = state_updated
-        final_P = P_updated
+            final_innovation[is_zupt] = 0
 
         # --- Assemble Features for TCN ---
         # These features are typically derived from the filter's current estimate
@@ -758,7 +766,7 @@ class ExtendedKalmanFilter(nn.Module):
 
         tcn_features: Dict[str, torch.Tensor] = {
             "body_velocity": vel_body,
-            "innovation": innovation,
+            "innovation": final_innovation,
             "zupt_flag": is_zupt.float().unsqueeze(-1),  # Convert boolean to float tensor
         }
 
