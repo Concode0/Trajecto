@@ -11,7 +11,7 @@ resuming data collection by tracking global and iPad-specific sample counters.
 import asyncio
 import os
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -149,14 +149,14 @@ class DataAcquisition:
                 # next new sample will have `max_index + 1`.
                 self.global_sample_counter = max(existing_sample_indices)
                 print(
-                    f"✅ [Resume] Last saved sample index in HDF5: {self.global_sample_counter}"
+                    f"[Resume] Last saved sample index in HDF5: {self.global_sample_counter}"
                 )
             else:
                 print(
-                    f"ℹ️ [Init] HDF5 exists but no valid samples found. Starting Global ID from 0."
+                    f"[Init] HDF5 exists but no valid samples found. Starting Global ID from 0."
                 )
         else:
-            print(f"ℹ️ [Init] New HDF5 file. Starting Global ID from 0.")
+            print(f"[Init] New HDF5 file. Starting Global ID from 0.")
 
     async def setup_ipad_counter(self) -> None:
         """Asks the user for the current starting number displayed on the iPad app.
@@ -171,7 +171,7 @@ class DataAcquisition:
         print("-" * 50)
 
         user_input: str = await ainput(
-            f"📱 What is the STARTING number displayed on the iPad? (Default 1): "
+            f"What is the STARTING number displayed on the iPad? (Default 1): "
         )
         if user_input.strip().isdigit():
             self.ipad_sample_counter = int(user_input)
@@ -179,7 +179,7 @@ class DataAcquisition:
             self.ipad_sample_counter = 1  # Default to 1 if input is invalid.
 
         print(
-            f"✅ OK. Mapping logic: iPad 'Sample_{self.ipad_sample_counter}.csv' -> HDF5 'sample_{self.global_sample_counter + 1:03d}'\n"
+            f"OK. Mapping logic: iPad 'Sample_{self.ipad_sample_counter}.csv' -> HDF5 'sample_{self.global_sample_counter + 1:03d}'\n"
         )
 
     def _pen_data_callback(self, data: Dict[str, Any]) -> None:
@@ -245,7 +245,7 @@ class DataAcquisition:
         self.pen_data_buffer.clear()  # Clear buffer for new sample data.
         await self.driver.start_data_collection()  # Start receiving data from device.
 
-        print("\n✋ STOP! Hold still on the paper for 2 seconds... (Calibrating)")
+        print("\nSTOP! Hold still on the paper for 2 seconds... (Calibrating)")
         await asyncio.sleep(2.0)  # Pause for a brief calibration period.
         print("GO! Start writing now.")
         await ainput("\n>>> Press Enter AFTER you finish writing.")  # Wait for user to finish task.
@@ -253,7 +253,7 @@ class DataAcquisition:
 
         verification: str = await ainput("Was the recording successful? (Y/n): ")
         if verification.lower() == "n":
-            print(f"❌ Label '{label}' marked as failed. Discarding pen data.")
+            print(f"Label '{label}' marked as failed. Discarding pen data.")
             # Ask user if iPad still saved a file, to keep counters in sync.
             ipad_sync: str = await ainput(
                 f"Did the iPad save 'Sample_{current_ipad_idx}.csv'? (y/N): "
@@ -275,7 +275,7 @@ class DataAcquisition:
                 }
             )
             print(
-                f"✅ Sample captured. (Map: iPad {current_ipad_idx} -> Global {current_global_idx})"
+                f"Sample captured. (Map: iPad {current_ipad_idx} -> Global {current_global_idx})"
             )
 
     async def process_and_save_session(self) -> None:
