@@ -72,11 +72,33 @@ def load_model(
     else:
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
+def align_trajectories(gt, pred):
+    """Align Pred and GT Trajectory using SVD"""
+
+    gt_centered = gt - np.mean(gt, axis=0)
+    pred_centered = pred - np.mean(pred, axis=0)
+
+    H = np.dot(pred_centered.T, gt_centered)
+
+    U, S, Vt = np.linalg.svd(H)
+
+    R = np.dot(Vt.T, U.T)
+
+    if np.linalg.det(R) < 0:
+        Vt[2, :] *= -1
+        R = np.dot(Vt.T, U.T)
+
+    pred_aligned = np.dot(pred_centered, R.T)
+
+    return gt_centered, pred_aligned
 
 def plot_trajectory(
     sample_idx: int,
     gt_pos: np.ndarray,
     pred_pos: np.ndarray,
+    gt_vel: np.ndarray,
+    pred_vel: np.ndarray,
+    pred_zupt: np.ndarray,
     dt: float,
     save_dir: str = "results",
 ) -> None:
@@ -96,63 +118,63 @@ def plot_trajectory(
         save_dir: The directory where the plots will be saved.
     """
     os.makedirs(save_dir, exist_ok=True)
-
-    # 1. 2D Plot (XY Plane - Top Down View)
-    plt.figure(figsize=(10, 8))
-    plt.plot(
-        gt_pos[:, 0], gt_pos[:, 1], "k--", label="Ground Truth", linewidth=2
-    )
-    plt.plot(
-        pred_pos[:, 0],
-        pred_pos[:, 1],
-        "r-",
-        label="Predicted",
-        linewidth=1.5,
-    )
-    plt.title(f"Sample {sample_idx}: XY Plane Trajectory")
-    plt.xlabel("X (m)")
-    plt.ylabel("Y (m)")
-    plt.legend()
-    plt.grid(True)
-    plt.axis("equal")
-    plt.savefig(os.path.join(save_dir, f"sample_{sample_idx}_2d.png"))
-    plt.show()
-
-    # 2. 3D Plot
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.plot(gt_pos[:, 0], gt_pos[:, 1], gt_pos[:, 2], "k--", label="Ground Truth")
-    ax.plot(pred_pos[:, 0], pred_pos[:, 1], pred_pos[:, 2], "r-", label="Predicted")
-    ax.set_title(f"Sample {sample_idx}: 3D Trajectory")
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_zlabel("Z (m)")
-    ax.legend()
-    plt.savefig(os.path.join(save_dir, f"sample_{sample_idx}_3d.png"))
-    plt.show()
-
-    # 3. Axis-wise Comparison (Time-series)
-    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
     time = np.arange(len(gt_pos)) * dt
 
-    axes[0].plot(time, gt_pos[:, 0], "k--", label="GT X")
-    axes[0].plot(time, pred_pos[:, 0], "r-", label="Pred X")
-    axes[0].set_ylabel("X (m)")
-    axes[0].legend(loc="upper right")
-    axes[0].grid(True)
+    # 1. 2D Trajectory ( Aligned )
+    gt_align, pred_align = align_trajectories(gt_pos, pred_pos)
 
-    axes[1].plot(time, gt_pos[:, 1], "k--", label="GT Y")
-    axes[1].plot(time, pred_pos[:, 1], "r-", label="Pred Y")
-    axes[1].set_ylabel("Y (m)")
-    axes[1].legend(loc="upper right")
-    axes[1].grid(True)
+    plt.figure(figsize=(12, 6))
 
-    axes[2].plot(time, gt_pos[:, 2], "k--", label="GT Z")
-    axes[2].plot(time, pred_pos[:, 2], "r-", label="Pred Z")
-    axes[2].set_ylabel("Z (m)")
-    axes[2].set_xlabel("Time (s)")
-    axes[2].legend(loc="upper right")
-    axes[2].grid(True)
+    # Left: Raw Output
+    plt.subplot(1, 2, 1)
+    plt.plot(gt_pos[:, 0], gt_pos[:, 1], 'k--', label='GT', alpha=0.7)
+    plt.plot(pred_pos[:, 0], pred_pos[:, 1], 'r-', label='Pred (Raw)')
+    plt.title("Before Alignment (Raw Output)")
+    plt.legend(); plt.axis('equal'); plt.grid(True)
+
+    # Right: Shape Check
+    plt.subplot(1, 2, 2)
+    plt.plot(gt_align[:, 0], gt_align[:, 1], 'k--', label='GT', linewidth=2)
+    plt.plot(pred_align[:, 0], pred_align[:, 1], 'b-', label='Pred (Aligned)', linewidth=2)
+    plt.title("After Alignment (Shape Check)")
+    plt.legend(); plt.axis('equal'); plt.grid(True)
+
+    plt.suptitle(f"Sample {sample_idx}: Trajectory Reconstruction")
+    plt.savefig(f"{save_dir}/sample_{sample_idx}_trajectory.png")
+    plt.close()
+
+    # 2. Velocity & ZUPT Analysis
+    fig, ax = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+    gt_speed = np.linalg.norm(gt_vel, axis=1)
+    pred_speed = np.linalg.norm(pred_vel, axis=1)
+
+    ax[0].plot(time, gt_speed, 'k--', label='GT Speed')
+    ax[0].plot(time, pred_speed, 'g-', label='Pred Speed')
+    ax[0].set_ylabel('Speed (m/s)')
+    ax[0].set_title('Velocity Tracking')
+    ax[0].legend(); ax[0].grid(True)
+
+    if pred_zupt is not None:
+        ax[1].plot(time, pred_zupt, 'm-', label='ZUPT Prob', linewidth=1.5)
+        ax[1].axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+        ax[1].set_ylabel('Probability')
+        ax[1].set_title('Zero-Velocity Detection (Model Output)')
+        ax[1].legend(); ax[1].grid(True)
+
+    # 3. Position Error over Time (Drift Analysis)
+    error = np.linalg.norm(gt_pos - pred_pos, axis=1)
+    ax[2].plot(time, error, 'r-', label='Pos Error')
+    ax[2].set_ylabel('Error (m)')
+    ax[2].set_xlabel('Time (s)')
+    ax[2].set_title('Drift Accumulation over Time')
+    ax[2].legend(); ax[2].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/sample_{sample_idx}_physics.png")
+    plt.close()
+
+    print(f"Saved plots to {save_dir}/")
 
     plt.suptitle(f"Sample {sample_idx}: Axis-wise Drift Check")
     plt.savefig(os.path.join(save_dir, f"sample_{sample_idx}_axis.png"))
@@ -161,46 +183,13 @@ def plot_trajectory(
 
 def main() -> None:
     """Main function to run the visualization script."""
-    parser = argparse.ArgumentParser(
-        description="Visualize model trajectory predictions."
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="eskf_tcn",
-        choices=["eskf_tcn", "aekf_tcn", "only_tcn"],
-        help="The name of the model to evaluate.",
-    )
-    parser.add_argument(
-        "--data",
-        type=str,
-        default="data/dataset.h5",
-        help="Path to the preprocessed HDF5 dataset.",
-    )
-    parser.add_argument(
-        "--scaler",
-        type=str,
-        default="data/scaler_stats.h5",
-        help="Path to the HDF5 file with scaler statistics (mean/std).",
-    )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="eskf_tcn_model.pth",
-        help="Path to the trained model file.",
-    )
-    parser.add_argument(
-        "--sample_idx",
-        type=int,
-        default=0,
-        help="Index of the sample to visualize.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help="Device to run inference on (e.g., 'cpu', 'cuda').",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="eskf_tcn")
+    parser.add_argument("--data", type=str, default="data/dataset.h5")
+    parser.add_argument("--scaler", type=str, default="data/scaler_stats.h5")
+    parser.add_argument("--model_path", type=str, default="eskf_tcn_model.pth")
+    parser.add_argument("--sample_idx", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     # Define dt, as it's a fixed property of the dataset after preprocessing.
@@ -209,17 +198,12 @@ def main() -> None:
 
     # 1. Load Dataset
     dataset = TrajectoryDataset(args.data)
-    if args.sample_idx >= len(dataset):
-        print(
-            f"Error: Sample index {args.sample_idx} is out of range. "
-            f"The dataset has {len(dataset)} samples."
-        )
-        return
+    data = dataset[args.sample_idx]
 
     # 2. Get Data Sample
-    data = dataset[args.sample_idx]
     imu_raw = data["imu_seq_raw"].unsqueeze(0).to(args.device)
     gt_pos = data["gt_pos_w"].numpy()
+    gt_vel = data["gt_vel_w"].numpy()
 
     # 3. Load Scaler and Normalize Data
     with h5py.File(args.scaler, "r") as f:
@@ -228,34 +212,28 @@ def main() -> None:
     imu_norm = (imu_raw - mean) / (std + 1e-9)
 
     # 4. Load Model & Run Inference
-    model = load_model(args.model, args.model_path, args.device, dt=dt)
+    model = load_model(args.model, args.model_path, args.device, dt)
 
-    print(f"Running inference on sample {args.sample_idx}...")
+    print(f"Visualizing Sample {args.sample_idx}...")
     with torch.no_grad():
         if args.model == "only_tcn":
-            # The 'OnlyTCN' model directly outputs the position tensor.
             pred_pos = model(imu_raw, imu_norm)
+            pred_vel = torch.zeros_like(pred_pos)
+            pred_zupt = None
         else:
-            # Hybrid models return a dictionary; we need the 'pred_pos_w' key.
             outputs = model(imu_raw, imu_norm)
             pred_pos = outputs["pred_pos_w"]
+            pred_vel = outputs["filter_vel_w"] + outputs.get("pred_vel_resid_b", 0)
+            pred_zupt = torch.sigmoid(outputs["pred_zupt_prob"])
 
+    # Convert to Numpy
     pred_pos = pred_pos.squeeze(0).cpu().numpy()
+    pred_vel = pred_vel.squeeze(0).cpu().numpy()
+    if pred_zupt is not None:
+        pred_zupt = pred_zupt.squeeze(0).cpu().numpy()
 
-    # 5. Calculate Error Metrics
-    # Note: For a more accurate error, one might exclude padded sections.
-    # Here, we calculate over the entire sequence for simplicity.
-    mse = np.mean((gt_pos - pred_pos) ** 2)
-    rmse = np.sqrt(mse)
-    end_error = np.linalg.norm(gt_pos[-1, :2] - pred_pos[-1, :2])
-
-    print(f"\n--- Metrics for Sample {args.sample_idx} ---")
-    print(f"RMSE (All axes): {rmse:.4f} m")
-    print(f"2D End-point Error: {end_error*100:.2f} cm")
-
-    # 6. Plotting
-    plot_trajectory(args.sample_idx, gt_pos, pred_pos, dt)
-
+    # Plot
+    plot_trajectory(args.sample_idx, gt_pos, pred_pos, gt_vel, pred_vel, pred_zupt, dt, "results")
 
 if __name__ == "__main__":
     main()
