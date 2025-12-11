@@ -13,7 +13,7 @@ import argparse
 import os
 import random
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import h5py
 import matplotlib.pyplot as plt
@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add parent directory to sys.path for relative imports to models
@@ -552,6 +552,11 @@ def main() -> None:
         dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
     )
 
+    # Load scaler statistics (mean and std) for sensor data normalization.
+    with h5py.File("./data/scaler_stats.h5", "r") as f:
+        mean: torch.Tensor = torch.from_numpy(f["mean"][:]).float()
+        std: torch.Tensor = torch.from_numpy(f["std"][:]).float()
+
     # Model Initialization.
     model_class_map: Dict[str, Any] = {
         "eskf_tcn": ESKFTCN_model,
@@ -563,11 +568,6 @@ def main() -> None:
 
     model_path: str = f"{args.model}_model.pth"
 
-    # Load scaler statistics (mean and std) for sensor data normalization.
-    with h5py.File("./data/scaler_stats.h5", "r") as f:
-        mean: torch.Tensor = torch.from_numpy(f["mean"][:]).float()
-        std: torch.Tensor = torch.from_numpy(f["std"][:]).float()
-
     # Start Training.
     train(args.model, model, dataloader, args.epochs, args.lr, args.device, model_path, mean, std, **loss_weights)
 
@@ -576,7 +576,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Exiting gracefully.")
+        print("\nTraining interrupted by user.")
     except Exception as e:
         print(f"An unexpected error occurred during training: {e}")
         sys.exit(1)  # Exit with a non-zero code to indicate an error.
