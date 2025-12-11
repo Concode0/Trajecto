@@ -8,12 +8,13 @@ comparison over time.
 
 import argparse
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.patches import Ellipse
 from torch.utils.data import DataLoader
 
 from model.AEKF_TCN import AEKFTCN_model
@@ -92,6 +93,39 @@ def align_trajectories(gt, pred):
 
     return gt_centered, pred_aligned
 
+def plot_uncertainty_ellipse(
+    ax: plt.Axes,
+    last_pos: np.ndarray,
+    last_cov: np.ndarray,
+    n_std: float = 2.0,
+    facecolor: str = "blue",
+    edgecolor: str = "blue",
+    alpha: float = 0.2,
+    **kwargs,
+) -> None:
+    """Plots a 2D uncertainty ellipse for a given position and covariance."""
+    cov_xy = last_cov[0:2, 0:2]
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_xy)
+    
+    # Get the angle of the major axis
+    angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+    
+    # Eigenvalues are variance, so sqrt gives std dev
+    width, height = 2 * n_std * np.sqrt(eigenvalues)
+    
+    # Create the ellipse patch
+    ellipse = Ellipse(
+        xy=last_pos[0:2],
+        width=width,
+        height=height,
+        angle=np.degrees(angle),
+        facecolor=facecolor,
+        edgecolor=edgecolor,
+        alpha=alpha,
+        **kwargs,
+    )
+    ax.add_patch(ellipse)
+
 def plot_trajectory(
     sample_idx: int,
     gt_pos: np.ndarray,
@@ -101,6 +135,7 @@ def plot_trajectory(
     pred_zupt: np.ndarray,
     dt: float,
     save_dir: str = "results",
+    pred_cov: Optional[np.ndarray] = None,
 ) -> None:
     """Visualizes the ground truth and predicted trajectories.
 
@@ -126,18 +161,24 @@ def plot_trajectory(
     plt.figure(figsize=(12, 6))
 
     # Left: Raw Output
-    plt.subplot(1, 2, 1)
-    plt.plot(gt_pos[:, 0], gt_pos[:, 1], 'k--', label='GT', alpha=0.7)
-    plt.plot(pred_pos[:, 0], pred_pos[:, 1], 'r-', label='Pred (Raw)')
-    plt.title("Before Alignment (Raw Output)")
-    plt.legend(); plt.axis('equal'); plt.grid(True)
+    ax1 = plt.subplot(1, 2, 1)
+    ax1.plot(gt_pos[:, 0], gt_pos[:, 1], 'k--', label='GT', alpha=0.7)
+    ax1.plot(pred_pos[:, 0], pred_pos[:, 1], 'r-', label='Pred (Raw)')
+    
+    if pred_cov is not None:
+        # Plot every 50th covariance ellipse to avoid clutter
+        for i in range(0, len(pred_pos), 50):
+            plot_uncertainty_ellipse(ax1, pred_pos[i], pred_cov[i], facecolor='r', alpha=0.1)
+
+    ax1.set_title("Before Alignment (Raw Output)")
+    ax1.legend(); ax1.axis('equal'); ax1.grid(True)
 
     # Right: Shape Check
-    plt.subplot(1, 2, 2)
-    plt.plot(gt_align[:, 0], gt_align[:, 1], 'k--', label='GT', linewidth=2)
-    plt.plot(pred_align[:, 0], pred_align[:, 1], 'b-', label='Pred (Aligned)', linewidth=2)
-    plt.title("After Alignment (Shape Check)")
-    plt.legend(); plt.axis('equal'); plt.grid(True)
+    ax2 = plt.subplot(1, 2, 2)
+    ax2.plot(gt_align[:, 0], gt_align[:, 1], 'k--', label='GT', linewidth=2)
+    ax2.plot(pred_align[:, 0], pred_align[:, 1], 'b-', label='Pred (Aligned)', linewidth=2)
+    ax2.set_title("After Alignment (Shape Check)")
+    ax2.legend(); ax2.axis('equal'); ax2.grid(True)
 
     plt.suptitle(f"Sample {sample_idx}: Trajectory Reconstruction")
     plt.savefig(f"{save_dir}/sample_{sample_idx}_trajectory.png")
@@ -220,20 +261,26 @@ def main() -> None:
             pred_pos = model(imu_raw, imu_norm)
             pred_vel = torch.zeros_like(pred_pos)
             pred_zupt = None
+            pred_cov = None
         else:
             outputs = model(imu_raw, imu_norm)
             pred_pos = outputs["pred_pos_w"]
             pred_vel = outputs["filter_vel_w"] + outputs.get("pred_vel_resid_b", 0)
             pred_zupt = torch.sigmoid(outputs["pred_zupt_prob"])
+            pred_cov = outputs.get("pred_covariance_p")
 
     # Convert to Numpy
     pred_pos = pred_pos.squeeze(0).cpu().numpy()
     pred_vel = pred_vel.squeeze(0).cpu().numpy()
     if pred_zupt is not None:
         pred_zupt = pred_zupt.squeeze(0).cpu().numpy()
+    if pred_cov is not None:
+        pred_cov = pred_cov.squeeze(0).cpu().numpy()
 
     # Plot
-    plot_trajectory(args.sample_idx, gt_pos, pred_pos, gt_vel, pred_vel, pred_zupt, dt, "results")
+    plot_trajectory(
+        args.sample_idx, gt_pos, pred_pos, gt_vel, pred_vel, pred_zupt, dt, "results", pred_cov
+    )
 
 if __name__ == "__main__":
     main()
