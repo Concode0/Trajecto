@@ -243,6 +243,7 @@ class BaseFilterTCNModel(nn.Module):
         # Buffers for storing sequences of filter outputs and TCN predictions.
         positions_w_seq: List[torch.Tensor] = []
         quaternions_b_to_w_seq: List[torch.Tensor] = []
+        P_error_seq: List[torch.Tensor] = []
         pred_vel_resid_b_seq: List[torch.Tensor] = []
         pred_zupt_prob_seq: List[torch.Tensor] = []
         pred_covariance_R_seq: List[torch.Tensor] = []
