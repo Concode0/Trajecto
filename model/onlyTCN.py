@@ -90,8 +90,8 @@ class OnlyTCN(nn.Module):
         
         # Calculate receptive field for informational purposes.
         self.receptive_field = 1
-        for i, dilation in enumerate(tcn_dilation_factors):
-            self.receptive_field += 2 * (kernel_size - 1) * dilation
+        for dilation in tcn_dilation_factors:
+            self.receptive_field += (kernel_size - 1) * dilation
 
 
     def forward(
@@ -100,31 +100,16 @@ class OnlyTCN(nn.Module):
         """Forward pass for the OnlyTCN model to predict a corrected trajectory.
 
         Args:
-            imu_sequence_raw: Raw IMU data for physics-based integration
-                [batch_size, sequence_length, input_size].
-                Expected to contain accelerometer data in the first 3 channels.
+            imu_sequence_raw: Raw IMU data. No longer used in this direct-prediction
+                approach but kept for API consistency.
             imu_sequence_norm: Normalized IMU data for TCN feature extraction
                 [batch_size, sequence_length, input_size].
 
         Returns:
-            corrected_trajectory: The predicted 3D position trajectory
+            predicted_trajectory: The predicted 3D position trajectory
                 [batch_size, sequence_length, output_size].
         """
-        # 1. Compute a naive base trajectory by double-integrating RAW acceleration.
-        # This provides a baseline trajectory estimate through dead-reckoning.
-        accel_data = imu_sequence_raw[:, :, :3]  # Extract 3-axis accelerometer data.
-
-        # First integration (acceleration to velocity)
-        # Numerical integration using cumulative sum (Euler method).
-        # v = ∫ a dt
-        velocity = torch.cumsum(accel_data * self.dt, dim=1)
-
-        # Second integration (velocity to position)
-        # p = ∫ v dt
-        base_trajectory = torch.cumsum(velocity * self.dt, dim=1)
-
-        # 2. Use TCN on NORMALIZED data to predict the correction.
-        # Normalized data is generally preferred for neural network inputs.
+        # Use TCN on NORMALIZED data to predict the position directly.
         # Transpose for Conv1d: [batch, sequence_length, features] -> [batch, features, sequence_length]
         tcn_input = imu_sequence_norm.transpose(1, 2)
 
@@ -132,17 +117,11 @@ class OnlyTCN(nn.Module):
         for layer in self.tcn_layers:
             tcn_input = layer(tcn_input)
 
-        # Transpose back to original shape: [batch, features, sequence_length] -> [batch, sequence_length, features]
-        tcn_output = tcn_input.transpose(1, 2)
-        # The output layer maps the TCN's final feature map to a 3D correction vector.
-        correction = self.output_layer(tcn_output)
+        # Transpose back and crop to match input sequence length
+        tcn_output = tcn_input.transpose(1, 2)[:, : imu_sequence_norm.shape[1], :]
+        predicted_trajectory = self.output_layer(tcn_output)
 
-        # 3. Add the correction to the base trajectory.
-        # The TCN learns to predict the residual error or deviation from the
-        # naive dead-reckoned trajectory.
-        corrected_trajectory = base_trajectory + correction
-
-        return corrected_trajectory
+        return predicted_trajectory
 
 
 if __name__ == "__main__":
