@@ -1,6 +1,10 @@
 # 🖊️ Trajecto: 3D Pen Trajectory Reconstruction
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)
+![ESP32](https://img.shields.io/badge/ESP32-C3-green)
+![Embedded](https://img.shields.io/badge/Embedded-Firmware-red)
 
 Trajecto is a comprehensive system for robust 3D pen trajectory reconstruction from a single IMU sensor. It combines classic state estimation techniques with deep learning to overcome the inherent drift problem in inertial sensors, enabling accurate tracking of movement in 3D space.
 
