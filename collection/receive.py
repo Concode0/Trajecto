@@ -269,6 +269,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nProgram interrupted by user on startup. Exiting gracefully.")
+        print("\nProgram interrupted by user on startup.")
     except Exception as e:
         print(f"An error occurred during startup: {e}")
