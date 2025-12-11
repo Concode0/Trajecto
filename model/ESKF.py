@@ -22,12 +22,12 @@ import torch.nn.functional as F
 # Adjust sys.path for relative imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from model.rotation_utils import (
+from rotation_utils import (
     quaternion_multiply,
     quaternion_to_rotation_matrix,
     small_angle_to_quaternion,
 )
-from model.zupt_detector import ZuptDetector
+from zupt_detector import ZuptDetector
 
 
 class ErrorStateKalmanFilter(nn.Module):
