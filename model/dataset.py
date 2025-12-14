@@ -36,6 +36,10 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         preprocessed_file: str,
         augment_multiplier: int = 1,
         subsample_step: int = 4,
+        do_augment: bool = False,
+        noise_std: float = 0.01,
+        scale_range: tuple = (0.9, 1.1),
+        yaw_range: tuple = (-3.14, 3.14),
     ) -> None:
         """Initializes the TrajectoryDataset.
 
@@ -47,9 +51,17 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                 Defaults to 1.
             subsample_step: The step size for subsampling the data to reduce
                 sequence length. Defaults to 4.
+            do_augment: Whether to perform data augmentation. Defaults to False.
+            noise_std: The standard deviation of the noise to add to the sensor data.
+            scale_range: A tuple representing the range of the random scaling factor.
+            yaw_range: A tuple representing the range of the random yaw angle in radians.
         """
         self.augment_multiplier = augment_multiplier
         self.cached_data: List[Dict[str, torch.Tensor]] = []
+        self.do_augment = do_augment
+        self.noise_std = noise_std
+        self.scale_range = scale_range
+        self.yaw_range = yaw_range
 
         print("Loading dataset into RAM for high-speed training...")
         with h5py.File(preprocessed_file, "r") as f:
@@ -59,6 +71,17 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                 sensor = f[key]["sensor_data"][:]
                 pos = f[key]["gt_pos_data"][:]
                 vel = f[key]["gt_vel_data"][:]
+                try:
+                    seq_len = f[key].attrs["sequence_length"]
+                except KeyError:
+                    # Fallback for older datasets
+                    import numpy as np
+                    diff = np.diff(sensor, axis=0)
+                    try:
+                        seq_len = np.where(np.any(diff != 0, axis=1))[0][-1] + 2
+                    except IndexError:
+                        seq_len = sensor.shape[0]
+
 
                 # Subsample to reduce sequence length and convert to PyTorch tensors.
                 # This is a crucial step for managing memory and computational load
@@ -68,6 +91,7 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                         "sensor": torch.from_numpy(sensor[::subsample_step]).float(),
                         "pos": torch.from_numpy(pos[::subsample_step]).float(),
                         "vel": torch.from_numpy(vel[::subsample_step]).float(),
+                        "len": seq_len // subsample_step,
                     }
                 )
 
@@ -95,19 +119,50 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
 
         Returns:
             A dictionary containing the sensor data ('imu_seq_raw'),
-            ground truth position ('gt_pos_w'), and ground truth
-            velocity ('gt_vel_w') as PyTorch tensors.
+            ground truth position ('gt_pos_w'), ground truth
+            velocity ('gt_vel_w'), and true sequence length ('len')
+            as PyTorch tensors.
         """
         # The modulo operator allows for augmenting the dataset by wrapping around
         # the original number of samples.
         real_idx = idx % self.num_original_samples
         data = self.cached_data[real_idx]
 
-        # Cloning the tensors ensures that any modifications to the returned data
-        # will not affect the cached data, which is important during training
-        # when data augmentations or other transformations might be applied.
+        sensor_data = data["sensor"].clone()
+        pos_data = data["pos"].clone()
+        vel_data = data["vel"].clone()
+
+        if self.do_augment and idx >= self.num_original_samples:
+            # Apply scaling
+            scale = torch.rand(1) * (self.scale_range[1] - self.scale_range[0]) + self.scale_range[0]
+            sensor_data[:, :6] *= scale
+
+            # Apply random yaw rotation
+            yaw = torch.rand(1) * (self.yaw_range[1] - self.yaw_range[0]) + self.yaw_range[0]
+            cos_yaw = torch.cos(yaw)
+            sin_yaw = torch.sin(yaw)
+            # Yaw rotation matrix
+            rot_mat = torch.tensor([
+                [cos_yaw, -sin_yaw, 0],
+                [sin_yaw, cos_yaw, 0],
+                [0, 0, 1]
+            ]).float()
+
+            # Rotate position and velocity
+            pos_data = (rot_mat @ pos_data.T).T
+            vel_data = (rot_mat @ vel_data.T).T
+
+            # Rotate accelerometer and gyroscope data
+            sensor_data[:, :3] = (rot_mat @ sensor_data[:, :3].T).T
+            sensor_data[:, 3:6] = (rot_mat @ sensor_data[:, 3:6].T).T
+
+            # Add noise
+            noise = torch.randn_like(sensor_data[:, :6]) * self.noise_std
+            sensor_data[:, :6] += noise
+
         return {
-            "imu_seq_raw": data["sensor"].clone(),
-            "gt_pos_w": data["pos"].clone(),
-            "gt_vel_w": data["vel"].clone(),
+            "imu_seq_raw": sensor_data,
+            "gt_pos_w": pos_data,
+            "gt_vel_w": vel_data,
+            "len": data["len"],
         }
