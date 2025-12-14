@@ -7,7 +7,7 @@ comparison over time.
 """
 
 import argparse
-import os
+import os, sys
 from typing import Any, Dict, Optional, Tuple
 
 import h5py
@@ -17,9 +17,12 @@ import torch
 from matplotlib.patches import Ellipse
 from torch.utils.data import DataLoader
 
+# Add parent directory to sys.path for relative imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from model.AEKF_TCN import AEKFTCN_model
 from model.ESKF_TCN import ESKFTCN_model
-from model.onlyTCN import TCN as OnlyTCN
+from model.onlyTCN import OnlyTCN
 from model.dataset import TrajectoryDataset
 
 
@@ -74,22 +77,29 @@ def load_model(
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
 def align_trajectories(gt, pred):
-    """Align Pred and GT Trajectory using SVD"""
+    """Align Pred and GT Trajectory using SVD with Scaling (Umeyama Algorithm)"""
 
-    gt_centered = gt - np.mean(gt, axis=0)
-    pred_centered = pred - np.mean(pred, axis=0)
+    gt_mean = np.mean(gt, axis=0)
+    pred_mean = np.mean(pred, axis=0)
+    gt_centered = gt - gt_mean
+    pred_centered = pred - pred_mean
 
-    H = np.dot(pred_centered.T, gt_centered)
+    gt_std = np.linalg.norm(gt_centered)
+    pred_std = np.linalg.norm(pred_centered)
+    scale = gt_std / pred_std if pred_std > 1e-6 else 1.0
 
+    print(f"[Info] Auto-Scaling Factor: {scale:.4f} (Pred를 GT 크기에 맞춤)")
+
+    pred_scaled = pred_centered * scale
+    H = np.dot(pred_scaled.T, gt_centered)
     U, S, Vt = np.linalg.svd(H)
-
     R = np.dot(Vt.T, U.T)
 
     if np.linalg.det(R) < 0:
         Vt[2, :] *= -1
         R = np.dot(Vt.T, U.T)
 
-    pred_aligned = np.dot(pred_centered, R.T)
+    pred_aligned = np.dot(pred_scaled, R.T)
 
     return gt_centered, pred_aligned
 
@@ -106,13 +116,13 @@ def plot_uncertainty_ellipse(
     """Plots a 2D uncertainty ellipse for a given position and covariance."""
     cov_xy = last_cov[0:2, 0:2]
     eigenvalues, eigenvectors = np.linalg.eigh(cov_xy)
-    
+
     # Get the angle of the major axis
     angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
-    
+
     # Eigenvalues are variance, so sqrt gives std dev
     width, height = 2 * n_std * np.sqrt(eigenvalues)
-    
+
     # Create the ellipse patch
     ellipse = Ellipse(
         xy=last_pos[0:2],
@@ -138,12 +148,10 @@ def plot_trajectory(
     pred_cov: Optional[np.ndarray] = None,
 ) -> None:
     """Visualizes the ground truth and predicted trajectories.
-
     This function generates and saves three plots:
     1. A 2D top-down view of the XY plane.
     2. A 3D plot of the trajectory.
     3. An axis-wise comparison of X, Y, and Z positions over time.
-
     Args:
         sample_idx: The index of the sample being plotted, used for titles
             and filenames.
@@ -154,71 +162,80 @@ def plot_trajectory(
     """
     os.makedirs(save_dir, exist_ok=True)
     time = np.arange(len(gt_pos)) * dt
-
     # 1. 2D Trajectory ( Aligned )
     gt_align, pred_align = align_trajectories(gt_pos, pred_pos)
-
-    plt.figure(figsize=(12, 6))
-
-    # Left: Raw Output
-    ax1 = plt.subplot(1, 2, 1)
-    ax1.plot(gt_pos[:, 0], gt_pos[:, 1], 'k--', label='GT', alpha=0.7)
-    ax1.plot(pred_pos[:, 0], pred_pos[:, 1], 'r-', label='Pred (Raw)')
-    
+    plt.figure(figsize=(8, 8))
+    ax1 = plt.subplot(1, 1, 1)
+    ax1.plot(gt_align[:, 0], gt_align[:, 1], "k--", label="GT", alpha=0.7)
+    ax1.plot(pred_align[:, 0], pred_align[:, 1], "r-", label="Pred (Aligned)")
     if pred_cov is not None:
         # Plot every 50th covariance ellipse to avoid clutter
         for i in range(0, len(pred_pos), 50):
-            plot_uncertainty_ellipse(ax1, pred_pos[i], pred_cov[i], facecolor='r', alpha=0.1)
-
-    ax1.set_title("Before Alignment (Raw Output)")
-    ax1.legend(); ax1.axis('equal'); ax1.grid(True)
-
-    # Right: Shape Check
-    ax2 = plt.subplot(1, 2, 2)
-    ax2.plot(gt_align[:, 0], gt_align[:, 1], 'k--', label='GT', linewidth=2)
-    ax2.plot(pred_align[:, 0], pred_align[:, 1], 'b-', label='Pred (Aligned)', linewidth=2)
-    ax2.set_title("After Alignment (Shape Check)")
-    ax2.legend(); ax2.axis('equal'); ax2.grid(True)
-
-    plt.suptitle(f"Sample {sample_idx}: Trajectory Reconstruction")
-    plt.savefig(f"{save_dir}/sample_{sample_idx}_trajectory.png")
+            # We need to rotate the covariance as well
+            # This is a bit tricky, so we'll skip it for now
+            pass
+    ax1.set_title("Aligned Trajectory")
+    ax1.legend()
+    ax1.axis("equal")
+    ax1.grid(True)
+    plt.suptitle(f"Sample {sample_idx}: 2D Trajectory")
+    plt.savefig(f"{save_dir}/sample_{sample_idx}_2d_trajectory.png")
     plt.close()
-
     # 2. Velocity & ZUPT Analysis
     fig, ax = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-
     gt_speed = np.linalg.norm(gt_vel, axis=1)
     pred_speed = np.linalg.norm(pred_vel, axis=1)
-
-    ax[0].plot(time, gt_speed, 'k--', label='GT Speed')
-    ax[0].plot(time, pred_speed, 'g-', label='Pred Speed')
-    ax[0].set_ylabel('Speed (m/s)')
-    ax[0].set_title('Velocity Tracking')
-    ax[0].legend(); ax[0].grid(True)
-
+    ax[0].plot(time, gt_speed, "k--", label="GT Speed")
+    ax[0].plot(time, pred_speed, "g-", label="Pred Speed")
+    ax[0].set_ylabel("Speed (m/s)")
+    ax[0].set_title("Velocity Tracking")
+    ax[0].legend()
+    ax[0].grid(True)
     if pred_zupt is not None:
-        ax[1].plot(time, pred_zupt, 'm-', label='ZUPT Prob', linewidth=1.5)
-        ax[1].axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
-        ax[1].set_ylabel('Probability')
-        ax[1].set_title('Zero-Velocity Detection (Model Output)')
-        ax[1].legend(); ax[1].grid(True)
-
+        ax[1].plot(time, pred_zupt, "m-", label="ZUPT Prob", linewidth=1.5)
+        ax[1].axhline(y=0.5, color="gray", linestyle=":", alpha=0.5)
+        ax[1].set_ylabel("Probability")
+        ax[1].set_title("Zero-Velocity Detection (Model Output)")
+        ax[1].legend()
+        ax[1].grid(True)
     # 3. Position Error over Time (Drift Analysis)
     error = np.linalg.norm(gt_pos - pred_pos, axis=1)
-    ax[2].plot(time, error, 'r-', label='Pos Error')
-    ax[2].set_ylabel('Error (m)')
-    ax[2].set_xlabel('Time (s)')
-    ax[2].set_title('Drift Accumulation over Time')
-    ax[2].legend(); ax[2].grid(True)
-
+    ax[2].plot(time, error, "r-", label="Pos Error")
+    ax[2].set_ylabel("Error (m)")
+    ax[2].set_xlabel("Time (s)")
+    ax[2].set_title("Drift Accumulation over Time")
+    ax[2].legend()
+    ax[2].grid(True)
     plt.tight_layout()
     plt.savefig(f"{save_dir}/sample_{sample_idx}_physics.png")
     plt.close()
-
+    # 4. 3D Trajectory
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(gt_align[:, 0], gt_align[:, 1], gt_align[:, 2], "k--", label="GT")
+    ax.plot(pred_align[:, 0], pred_align[:, 1], pred_align[:, 2], "r-", label="Pred")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    ax.legend()
+    ax.set_title(f"Sample {sample_idx}: 3D Trajectory (Aligned)")
+    plt.savefig(f"{save_dir}/sample_{sample_idx}_3d_trajectory.png")
+    plt.close()
+    # 5. Axis-wise plot
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    labels = ["X", "Y", "Z"]
+    for i in range(3):
+        axes[i].plot(time, gt_align[:, i], "k--", label="GT")
+        axes[i].plot(time, pred_align[:, i], "r-", label="Pred")
+        axes[i].set_ylabel(f"{labels[i]} (m)")
+        axes[i].legend()
+        axes[i].grid(True)
+    axes[2].set_xlabel("Time (s)")
+    fig.suptitle(f"Sample {sample_idx}: Axis-wise Position (Aligned)")
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/sample_{sample_idx}_axis_wise.png")
+    plt.close()
     print(f"Saved plots to {save_dir}/")
-
-    plt.suptitle(f"Sample {sample_idx}: Axis-wise Drift Check")
-    plt.savefig(os.path.join(save_dir, f"sample_{sample_idx}_axis.png"))
     plt.show()
 
 
@@ -235,7 +252,7 @@ def main() -> None:
 
     # Define dt, as it's a fixed property of the dataset after preprocessing.
     # Note: If this changes, it should be loaded from metadata.
-    dt = 0.0025 * 4  # 0.0025s original, subsampled by 4
+    dt = 0.0025 * 8  # 0.0025s original, subsampled by 4
 
     # 1. Load Dataset
     dataset = TrajectoryDataset(args.data)
