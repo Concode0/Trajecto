@@ -20,11 +20,17 @@ def _quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """Multiplies two quaternions.
 
     Args:
-        q1: The first quaternion (w, x, y, z).
-        q2: The second quaternion (w, x, y, z).
+        q1 (np.ndarray): The first quaternion (w, x, y, z).
+            - Shape: (4,)
+            - Frame: Body/World (depends on usage)
+        q2 (np.ndarray): The second quaternion (w, x, y, z).
+            - Shape: (4,)
+            - Frame: Body/World (depends on usage)
 
     Returns:
-        The resulting quaternion from the multiplication.
+        np.ndarray: The resulting quaternion from the multiplication.
+            - Shape: (4,)
+            - Frame: Body/World (depends on usage)
     """
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
@@ -39,10 +45,14 @@ def _quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
     """Converts a quaternion to a 3x3 rotation matrix.
 
     Args:
-        q: The quaternion (w, x, y, z).
+        q (np.ndarray): The quaternion (w, x, y, z).
+            - Shape: (4,)
+            - Frame: Body-to-World (typically)
 
     Returns:
-        A 3x3 rotation matrix.
+        np.ndarray: A 3x3 rotation matrix.
+            - Shape: (3, 3)
+            - Frame: Body-to-World (typically)
     """
     q_norm = q / (np.linalg.norm(q) + 1e-8)  # Normalize quaternion to prevent NaNs
     w, x, y, z = q_norm

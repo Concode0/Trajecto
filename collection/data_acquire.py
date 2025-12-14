@@ -194,7 +194,10 @@ class DataAcquisition:
         """Callback function to receive and buffer pen data from the device driver.
 
         Args:
-            data: A dictionary containing a single timestamped sensor reading.
+            data (Dict[str, Any]): A dictionary containing a single timestamped sensor reading.
+                - Keys: 'time', 'accel_x', 'accel_y', 'accel_z', 'gyro_x', 'gyro_y', 'gyro_z', 'fsr'
+                - Values Unit: s, m/s^2, rad/s, N (or raw count)
+                - Frame: Body
         """
         self.pen_data_buffer.append(data)
 

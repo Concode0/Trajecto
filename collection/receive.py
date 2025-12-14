@@ -110,8 +110,11 @@ class TrajectoDriver:
         Total size: 7 floats (4 bytes each) + 1 uint32_t (4 bytes) = 28 + 4 = 32 bytes.
 
         Args:
-            sender: The handle of the characteristic that sent the notification.
-            data: The raw bytearray received from the device.
+            sender (int): The handle of the characteristic that sent the notification.
+            data (bytearray): The raw bytearray received from the device.
+                - Shape: (Batch_Size * 32,) bytes
+                - Content: Packed C-structs of sensor data
+                - Frame: Body (once unpacked)
         """
         # Define the size and format of the C++ struct being sent by the device.
         struct_size: int = 32
