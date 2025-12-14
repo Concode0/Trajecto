@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS
-        "main.cpp"
+        "allan_variance_main.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         bmi270
