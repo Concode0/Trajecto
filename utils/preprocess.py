@@ -12,11 +12,9 @@ The preprocessing pipeline includes the following steps:
 6.  **Segmentation:** Identify and segment the data into meaningful chunks based on
     force sensor readings.
 7.  **Filtering:** Apply a low-pass filter to the sensor data.
-8.  **Yaw Alignment:** Align the coordinate systems of the sensor and ground
-    truth data.
-9.  **Normalization:** Calculate and save global mean and standard deviation for
+8.  **Normalization:** Calculate and save global mean and standard deviation for
     sensor data.
-10. **Saving:** Save the preprocessed data to an HDF5 file.
+9.  **Saving:** Save the preprocessed data to an HDF5 file.
 """
 
 import os
@@ -329,7 +327,7 @@ def load_h5_samples(h5_path: str) -> List[Dict[str, Any]]:
 
 def main() -> None:
     """Main function to preprocess the data."""
-    print("--- Unified Preprocessing: Unit Conv + Yaw Alignment + Force Segmentation ---")
+    print("--- Unified Preprocessing: Unit Conv + Force Segmentation ---")
     os.makedirs(os.path.dirname(FINAL_DATASET_PATH), exist_ok=True)
 
     raw_samples = load_h5_samples(HDF5_RAW_DATA_PATH)
@@ -364,7 +362,7 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     2.  Synchronization
     3.  Segmentation
     4.  Filtering
-    5.  GT Final Processing & Yaw Alignment
+    5.  GT Final Processing
 
     Args:
         sample: A dictionary containing the raw sample data.
@@ -385,17 +383,6 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     df_sensor_orig = pd.DataFrame(sensor_data_dict)
     df_gt_proc = preprocess_gt_data(gt_data_dict, TARGET_SAMPLING_RATE_HZ)
 
-    # New: Trim data to area of interest before correlation
-    if "force" in df_gt_proc.columns:
-        activity_start_indices = np.where(df_gt_proc["force"] > SEGMENTATION_THRESHOLD)[0]
-        if len(activity_start_indices) > 0:
-            trim_margin = int(0.5 * TARGET_SAMPLING_RATE_HZ)  # 0.5s margin
-            trim_start = max(0, activity_start_indices[0] - trim_margin)
-            if trim_start > 0:
-                df_sensor_orig = df_sensor_orig.iloc[trim_start:].reset_index(drop=True)
-                df_gt_proc = df_gt_proc.iloc[trim_start:].reset_index(drop=True)
-                print(f"  [Info] Pre-correlation trim applied at index {trim_start}.")
-
     if bias:
         for axis in ["x", "y", "z"]:
             df_sensor_orig[f"gyro_{axis}"] -= bias[f"gyro_{axis}"]
@@ -405,7 +392,7 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         print("  [Warning] Bias calculation failed. Converting units anyway.")
         for axis in ["x", "y", "z"]:
             df_sensor_orig[f"accel_{axis}"] *= GRAVITY
-        static_acc_ref = 9.8
+        static_acc_ref = GRAVITY
 
     # 2. Synchronization
     acc_norm = np.sqrt(
@@ -413,13 +400,16 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         + df_sensor_orig["accel_y"] ** 2
         + df_sensor_orig["accel_z"] ** 2
     )
+    # Center the sensor signal by removing the gravity component
     sig_sensor = (acc_norm - static_acc_ref) / (acc_norm.std() + 1e-6)
+
     gt_sync = (
         df_gt_proc["force"]
         if "force" in df_gt_proc.columns
         else np.zeros(len(df_gt_proc))
     )
-    sig_gt = gt_sync / (gt_sync.std() + 1e-6)
+    # Center the ground truth signal by removing the mean
+    sig_gt = (gt_sync - gt_sync.mean()) / (gt_sync.std() + 1e-6)
 
     correlation = correlate(sig_sensor, sig_gt, mode="full")
     lag = (
@@ -446,12 +436,22 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
 
     # --- Merge all segments into one to keep rest areas ---
     if segments:
-        min_start = segments[0][0]
+        tap_start_idx = segments[0][0]
         max_end = segments[-1][1]
-        # Override segments with a single merged one
-        segments = [(min_start, max_end)]
+
+        skip_tap_duration = int(0.5 * TARGET_SAMPLING_RATE_HZ)
+
+        new_start = tap_start_idx + skip_tap_duration
+
+        if new_start >= max_end:
+            print("  [Warning] Tap and Write are too close. Using original start.")
+            new_start = max(0, tap_start_idx - int(1.5 * TARGET_SAMPLING_RATE_HZ)) # 차라리 앞으로(이전 로직)
+
+        segments = [(new_start, max_end)]
+
         print(
-            f"  [Info] Merged all active segments into one large segment from {min_start} to {max_end}."
+            f"  [Info] Cut out the Tap spike. "
+            f"Start moved from {tap_start_idx} to {new_start} (skipped 0.5s)."
         )
 
     processed_segments: List[Dict[str, Any]] = []
@@ -477,7 +477,7 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
                     FILTER_ORDER,
                 )
 
-        # 5. GT Final Processing & Yaw Alignment
+        # 5. GT Final Processing
         if not all(c in df_gt_segment.columns for c in ["x", "y", "z"]):
             print(
                 f"  [Warning] Missing position columns in GT data for {segment_name}. Skipping segment."
@@ -488,34 +488,12 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         gt_pos_final = np.zeros_like(gt_pos)
         gt_pos_final[:, 0] = gt_pos[:, 0] * PIXEL_TO_METER
         gt_pos_final[:, 1] = gt_pos[:, 1] * PIXEL_TO_METER
-        gt_pos_final[:, 2] = gt_pos[:, 2] * 0.001
+        gt_pos_final[:, 2] = np.maximum(gt_pos[:, 2] * 0.001, 1e-7)
 
-        # Calculate GT Velocity from gt_pos_final before yaw alignment
+        # Calculate GT Velocity from gt_pos_final
         gt_vel_final = np.gradient(
             gt_pos_final, (1.0 / TARGET_SAMPLING_RATE_HZ), axis=0
         )  # Use dt directly
-
-        deltas = np.diff(gt_pos_final, axis=0)
-        if len(deltas) > 1:
-            speeds = np.linalg.norm(deltas[:, :2], axis=1)
-            move_idx = np.where(speeds > 0.001)[0]
-
-            if len(move_idx) > 10:
-                start_idx, end_idx = move_idx[0], min(move_idx[0] + 20, len(deltas))
-                avg_vec = np.mean(deltas[start_idx:end_idx], axis=0)
-                angle = np.arctan2(avg_vec[1], avg_vec[0])
-                c, s = np.cos(-angle), np.sin(-angle)
-                R_yaw = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-                gt_pos_final = gt_pos_final @ R_yaw.T
-                gt_vel_final = gt_vel_final @ R_yaw.T  # Apply same rotation to velocity
-
-                acc_vecs = df_sensor_filt[["accel_x", "accel_y", "accel_z"]].to_numpy()
-                df_sensor_filt[["accel_x", "accel_y", "accel_z"]] = acc_vecs @ R_yaw.T
-                gyro_vecs = df_sensor_filt[["gyro_x", "gyro_y", "gyro_z"]].to_numpy()
-                df_sensor_filt[["gyro_x", "gyro_y", "gyro_z"]] = gyro_vecs @ R_yaw.T
-                print(f"  [Alignment] Rotated by {-np.degrees(angle):.2f} deg")
-            else:
-                print("  [Alignment] Warning: Insufficient movement for alignment.")
 
         fsr_data = (
             df_sensor_filt[["fsr"]].to_numpy()
@@ -584,6 +562,7 @@ def save_processed_data(processed_samples_list: List[Dict[str, Any]]) -> None:
             g.create_dataset("gt_pos_data", data=gt_pos_padded)
             g.create_dataset("gt_vel_data", data=gt_vel_padded)
             g.attrs["original_label"] = sample["original_label"]
+            g.attrs["sequence_length"] = len(sample["sensor"])  # Store true length before padding
             print(f"  Saved {sample['name']} to dataset.")
 
 
