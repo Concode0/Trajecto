@@ -18,6 +18,7 @@ import torch.nn as nn
 # Adjust sys.path for relative imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from config import Config
 
 class OnlyTCN(nn.Module):
     """A standalone Temporal Convolutional Network (TCN) for direct trajectory correction.
@@ -31,12 +32,12 @@ class OnlyTCN(nn.Module):
     def __init__(
         self,
         device: str = "cpu",
-        input_size: int = 7,
-        output_size: int = 3,
-        tcn_channels: List[int] = [64, 64, 64, 64],
-        kernel_size: int = 3,
-        dropout: float = 0.1,
-        dt: float = 0.01,
+        input_size: int = Config.OnlyTCN.INPUT_SIZE,
+        output_size: int = Config.OnlyTCN.OUTPUT_SIZE,
+        tcn_channels: List[int] = Config.OnlyTCN.TCN_CHANNELS,
+        kernel_size: int = Config.OnlyTCN.KERNEL_SIZE,
+        dropout: float = Config.OnlyTCN.DROPOUT,
+        dt: float = Config.DT,
         tcn_dilation_factors: Optional[List[int]] = None, # Add tcn_dilation_factors to __init__ for consistency
     ):
         """Initializes the OnlyTCN model.
@@ -87,7 +88,7 @@ class OnlyTCN(nn.Module):
         # The output layer maps the TCN's final feature representation to the
         # desired correction dimensions (e.g., 3D position correction).
         self.output_layer = nn.Linear(tcn_channels[-1], output_size)
-        
+
         # Calculate receptive field for informational purposes.
         self.receptive_field = 1
         for dilation in tcn_dilation_factors:
@@ -95,7 +96,9 @@ class OnlyTCN(nn.Module):
 
 
     def forward(
-        self, imu_sequence_raw: torch.Tensor, imu_sequence_norm: torch.Tensor
+        self,
+        imu_sequence_raw: torch.Tensor,
+        imu_sequence_norm: torch.Tensor
     ) -> torch.Tensor:
         """Forward pass for the OnlyTCN model to predict a corrected trajectory.
 
@@ -129,12 +132,12 @@ if __name__ == "__main__":
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Model parameters.
-    input_size = 7  # accel(3), gyro(3), force(1)
-    output_size = 3  # position(3)
+    # Model parameters from Config.
+    input_size = Config.OnlyTCN.INPUT_SIZE
+    output_size = Config.OnlyTCN.OUTPUT_SIZE
     sequence_length = 100
     batch_size = 32
-    dt_val = 0.01
+    dt_val = Config.DT
 
     # Create a model instance.
     model = OnlyTCN(
@@ -151,7 +154,8 @@ if __name__ == "__main__":
         device
     )
     # Simple normalization for demonstration.
-    dummy_imu_data_norm = (dummy_imu_data_raw - dummy_imu_data_raw.mean(dim=(0, 1))) / (
+    dummy_imu_data_norm = (dummy_imu_data_raw - dummy_imu_data_raw.mean(dim=(0, 1)))
+    (
         dummy_imu_data_raw.std(dim=(0, 1)) + 1e-6
     )
 
