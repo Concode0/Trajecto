@@ -20,6 +20,7 @@ import torch.nn as nn
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from TCN import TCN
+from config import Config
 from rotation_utils import quaternion_to_rotation_matrix
 
 
@@ -105,10 +106,14 @@ class BaseFilterTCNModel(nn.Module):
         # --- Physical Constants ---
         # Pen tip offset from the IMU's origin, expressed in the IMU's body frame.
         self.register_buffer(
-            "pen_tip_offset_b", torch.tensor([0.145, 0.002, -0.02], device=device)
+            "pen_tip_offset_b",
+            torch.tensor(Config.INITIAL_PEN_TIP_OFFSET, device=device)
         )
         # Gravity vector in the world frame (assuming +Z is up).
-        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, 9.81], device=device))
+        self.register_buffer(
+            "gravity_w",
+            torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device)
+        )
 
     def _initialize_state(
         self,
