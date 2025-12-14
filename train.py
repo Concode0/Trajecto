@@ -138,21 +138,6 @@ class UncertaintyLoss(nn.Module):
             total_loss += reg_weight * loss_reg
             losses["reg"] = loss_reg.item()
 
-            # --- Pen Tip Offset Regularization ---
-            # If the model has a learnable pen tip offset, add its regularization loss.
-            # We need to access the model instance. Ideally, this should be passed or handled outside,
-            # but currently loss function doesn't see the model instance directly.
-            # However, train loop has access.
-            # For now, let's keep it simple. If we want to add it to UncertaintyLoss,
-            # we'd need to pass the model or the loss value.
-            # Given the current structure, let's assume pen tip reg is handled
-            # via `reg_weight` or similar if needed, but the prompt specifically asked
-            # to implement `get_pen_tip_regularization_loss` in the model.
-            # So, we should add it in the training loop, NOT here, OR pass it here.
-            # The prompt for *this* step was just about Cosine Similarity.
-            # The previous step handled Pen Tip implementation.
-            # I will calculate pen tip loss in the train loop and add it to `loss_reg` or a new key.
-
         # --- Probabilistic Model Loss (ESKF-TCN) ---
         if model_name == "eskf_tcn":
             innovation = model_out["filter_innovation"]
