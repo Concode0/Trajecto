@@ -487,8 +487,13 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         )
 
         # 4. Filtering
+        # We ONLY filter FSR data. We do NOT filter Accel/Gyro data because:
+        # 1. The Kalman Filter (ESKF/AEKF) assumes white noise. Low-pass filtering
+        #    colors the noise, violating this assumption.
+        # 2. The Q matrix is tuned based on the raw Allan Variance parameters
+        #    (ARW, VRW). Altering the noise profile ruins this tuning.
         df_sensor_filt = df_sensor_segment.copy()
-        for col in ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z", "fsr"]:
+        for col in ["fsr"]:
             if col in df_sensor_filt.columns:
                 df_sensor_filt[col] = butter_lowpass_filter(
                     df_sensor_filt[col],
