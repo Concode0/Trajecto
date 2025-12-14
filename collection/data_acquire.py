@@ -30,23 +30,24 @@ CONTINUOUS_SHAPES: List[str] = [
     "Random Scribble (Fast) - Keep drawing",
     "Random Scribble (Slow) - Keep drawing",
 ]
-# Labels for discrete writing/drawing tasks (e.g., text sentences).
-LOREM_SENTENCES: List[str] = [
-    "lorem ipsum dolor sit amet",
-    "consectetur adipiscing elit",
-    "sed do eiusmod tempor incididunt",
-    "ut labore et dolore magna aliqua",
-    "ut enim ad minim veniam",
-    "quis nostrud exercitation ullamco",
-    "laboris nisi ut aliquip ex ea commodo",
-    "duis aute irure dolor in reprehenderit",
-    "voluptate velit esse cillum dolore",
-    "eu fugiat nulla pariatur",
-    "excepteur sint occaecat cupidatat",
-    "sunt in culpa qui officia deserunt",
-    "mollit anim id est laborum",
-    "the quick brown fox jumps over the lazy dog",
-    "pack my box with five dozen liquor jugs",
+# Word list for generating random sentences.
+WORD_LIST: List[str] = [
+    "apple", "banana", "cat", "dog", "elephant", "fish", "grape", "house",
+    "ice", "juice", "kite", "lion", "moon", "nest", "orange", "pen", "queen",
+    "robot", "sun", "tree", "umbrella", "violet", "water", "xylophone",
+    "yellow", "zebra", "a", "about", "all", "also", "an", "and", "as",
+    "at", "be", "because", "but", "by", "can", "come", "could", "day", "do",
+    "even", "find", "first", "for", "from", "get", "give", "go", "have",
+    "he", "her", "here", "him", "his", "how", "I", "if", "in", "into", "it",
+    "its", "just", "know", "like", "look", "make", "man", "many", "me",
+    "more", "my", "new", "no", "not", "now", "of", "on", "one", "only",
+    "or", "other", "our", "out", "people", "say", "see", "she", "so",
+    "some", "take", "tell", "than", "that", "the", "their", "them",
+    "then", "there", "these", "they", "thing", "think", "this", "those",
+    "time", "to", "two", "up", "use", "very", "want", "way", "we", "well",
+    "what", "when", "which", "who", "will", "with", "would", "year", "you",
+    "your", "writing", "draw", "circle", "square", "line", "point",
+    "number", "equation", "formula", "graph", "design", "sketch"
 ]
 NUM_SESSIONS: int = 1  # Total number of data collection sessions to run.
 DATA_DIR: str = "acquired_data"  # Directory to store raw CSVs and the HDF5 file.
@@ -68,9 +69,14 @@ async def ainput(prompt: str = "") -> str:
     return await asyncio.get_event_loop().run_in_executor(None, lambda: input(prompt))
 
 
+def generate_random_sentence(word_list: List[str], num_words: int) -> str:
+    """Generates a random sentence from a word list."""
+    return " ".join(random.choices(word_list, k=num_words))
+
+
 def generate_mixed_labels(num_labels: int) -> List[str]:
     """Generates a shuffled list of labels for data acquisition, mixing continuous
-    shapes and Lorem Ipsum sentences.
+    shapes and randomly generated sentences.
 
     Args:
         num_labels: The total number of labels to generate.
@@ -81,8 +87,10 @@ def generate_mixed_labels(num_labels: int) -> List[str]:
     scenario: List[str] = list(CONTINUOUS_SHAPES)
     remaining: int = num_labels - len(scenario)
     if remaining > 0:
-        # Extend with random Lorem Ipsum sentences if more labels are needed.
-        scenario.extend([random.choice(LOREM_SENTENCES) for _ in range(remaining)])
+        # Extend with randomly generated sentences.
+        for _ in range(remaining):
+            num_words = random.randint(4, 7)
+            scenario.append(generate_random_sentence(WORD_LIST, num_words))
     else:
         # Truncate if fewer labels are needed than available continuous shapes.
         scenario = scenario[:num_labels]
