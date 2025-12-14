@@ -200,19 +200,16 @@ class ESKFTCN_model(BaseFilterTCNModel):
         error state prediction and update, and error injection) for one time step.
 
         Args:
-            state_tuple: A tuple containing the current nominal state components
-                (pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b) and the
-                error covariance matrix (P_error).
-            imu_data: A tuple containing raw gyroscope data, raw accelerometer
-                data, and raw force sensor data for the current time step.
-            tcn_output: Optional. A dictionary of outputs from the TCN that
-                can be used to influence the filter's current step (e.g.,
-                `vel_corr`, `covariance_R`, `zupt_prob`).
+            state_tuple (Tuple[torch.Tensor, ...]): Current nominal state and covariance.
+                - Components: (pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error)
+            imu_data (Tuple[torch.Tensor, torch.Tensor, torch.Tensor]): Sensor data for current step.
+                - Components: (gyro_b_raw, accel_b_raw, force_raw)
+            tcn_output (Optional[Dict[str, torch.Tensor]]): TCN predictions.
+                - Keys: "vel_corr", "covariance_R", "zupt_prob"
 
         Returns:
-            A tuple containing the updated nominal state components, updated
-            error covariance matrix, and other relevant filter outputs
-            (e.g., tcn_features dict).
+            Tuple[torch.Tensor, ...]: Updated state tuple and features.
+                - Components: (pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new, accel_bias_b_new, P_error_final, tcn_features)
         """
         gyro_b_raw, accel_b_raw, force_raw = imu_data
         pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error = state_tuple

@@ -213,24 +213,36 @@ class BaseFilterTCNModel(nn.Module):
         features to the TCN, and applying TCN corrections.
 
         Args:
-            imu_data_raw: Raw IMU data sequence [batch_size, seq_len, imu_features].
-                Typically includes accel (3), gyro (3), and force (1).
-            imu_data_norm: Normalized IMU data sequence [batch_size, seq_len, imu_features].
-                Used for feature engineering for the TCN.
-            initial_state: Optional. A tuple containing the initial state vector
-                and its covariance matrix. If None, `_initialize_state` is called.
+            imu_data_raw (torch.Tensor): Raw IMU data sequence.
+                - Shape: (Batch, Seq_Len, Features)
+                - Channels: [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, force]
+                - Unit: m/s^2 (Accel), rad/s (Gyro), N (Force)
+                - Frame: Body Frame
+            imu_data_norm (torch.Tensor): Normalized IMU data sequence.
+                - Shape: (Batch, Seq_Len, Features)
+                - Unit: Normalized
+                - Frame: Body Frame
+            initial_state (Optional[Tuple[torch.Tensor, ...]]): Optional. A tuple containing
+                the initial state vector and its covariance matrix.
 
         Returns:
-            A dictionary containing various predicted and intermediate outputs,
-            such as:
-                - "pred_pos_w": Final corrected trajectory in world frame.
-                - "pred_vel_resid_b": TCN-predicted residual velocity in body frame.
+            Dict[str, torch.Tensor]: A dictionary containing predicted outputs:
+                - "pred_pos_w": Final corrected trajectory.
+                    - Shape: (Batch, Seq_Len, 3) | Unit: Meter | Frame: World
+                - "pred_vel_resid_b": TCN-predicted residual velocity.
+                    - Shape: (Batch, Seq_Len, 3) | Unit: m/s | Frame: Body
                 - "pred_zupt_prob": TCN-predicted ZUPT probability.
-                - "pred_covariance_R": TCN-predicted measurement noise covariance.
-                - "filter_vel_w": Velocity from the filter in world frame.
+                    - Shape: (Batch, Seq_Len, 1) | Range: [0, 1]
+                - "pred_covariance_R": TCN-predicted measurement noise covariance parameters.
+                    - Shape: (Batch, Seq_Len, 6) | Unit: varies
+                - "filter_vel_w": Velocity from the filter.
+                    - Shape: (Batch, Seq_Len, 3) | Unit: m/s | Frame: World
                 - "filter_quat": Orientation quaternions from the filter.
+                    - Shape: (Batch, Seq_Len, 4) | Frame: Body-to-World
                 - "filter_innovation": Raw innovation from the filter.
-                - "tcn_output_mask": Mask indicating when TCN outputs were used.
+                    - Shape: (Batch, Seq_Len, 6) | Unit: m/s^2, rad/s
+                - "tcn_output_mask": Mask indicating valid TCN outputs.
+                    - Shape: (Batch, Seq_Len) | Type: Bool
         """
         batch_size, seq_len, _ = imu_data_raw.shape
 

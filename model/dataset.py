@@ -115,13 +115,20 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         samples.
 
         Args:
-            idx: The index of the sample to retrieve.
+            idx (int): The index of the sample to retrieve.
 
         Returns:
-            A dictionary containing the sensor data ('imu_seq_raw'),
-            ground truth position ('gt_pos_w'), ground truth
-            velocity ('gt_vel_w'), and true sequence length ('len')
-            as PyTorch tensors.
+            Dict[str, torch.Tensor]: A dictionary containing sample data:
+                - "imu_seq_raw": Raw IMU sequence.
+                    - Shape: (Seq_Len, 6) | [accel(3), gyro(3)]
+                    - Unit: m/s^2, rad/s
+                    - Frame: Body
+                - "gt_pos_w": Ground truth position.
+                    - Shape: (Seq_Len, 3) | Unit: m | Frame: World
+                - "gt_vel_w": Ground truth velocity.
+                    - Shape: (Seq_Len, 3) | Unit: m/s | Frame: World
+                - "len": Sequence length.
+                    - Shape: Scalar | Type: Int
         """
         # The modulo operator allows for augmenting the dataset by wrapping around
         # the original number of samples.

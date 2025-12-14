@@ -103,14 +103,18 @@ class OnlyTCN(nn.Module):
         """Forward pass for the OnlyTCN model to predict a corrected trajectory.
 
         Args:
-            imu_sequence_raw: Raw IMU data. No longer used in this direct-prediction
-                approach but kept for API consistency.
-            imu_sequence_norm: Normalized IMU data for TCN feature extraction
-                [batch_size, sequence_length, input_size].
+            imu_sequence_raw (torch.Tensor): Raw IMU data (unused).
+                - Shape: (Batch, Seq_Len, Features)
+            imu_sequence_norm (torch.Tensor): Normalized IMU data.
+                - Shape: (Batch, Seq_Len, Features)
+                - Unit: Normalized
+                - Frame: Body Frame
 
         Returns:
-            predicted_trajectory: The predicted 3D position trajectory
-                [batch_size, sequence_length, output_size].
+            torch.Tensor: The predicted 3D position trajectory.
+                - Shape: (Batch, Seq_Len, 3)
+                - Unit: Meter
+                - Frame: World
         """
         # Use TCN on NORMALIZED data to predict the position directly.
         # Transpose for Conv1d: [batch, sequence_length, features] -> [batch, features, sequence_length]

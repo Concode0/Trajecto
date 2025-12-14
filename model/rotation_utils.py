@@ -23,11 +23,19 @@ def quaternion_from_two_vectors(v1: torch.Tensor, v2: torch.Tensor) -> torch.Ten
     IMU-measured gravity vector and `v2` the world-frame gravity vector.
 
     Args:
-        v1: A batch of 3D vectors (source vectors) of shape `[B, 3]`.
-        v2: A batch of 3D vectors (target vectors) of shape `[B, 3]`.
+        v1 (torch.Tensor): A batch of 3D vectors (source vectors).
+            - Shape: (Batch, 3)
+            - Unit: Arbitrary (normalized internally)
+            - Frame: Source Frame
+        v2 (torch.Tensor): A batch of 3D vectors (target vectors).
+            - Shape: (Batch, 3)
+            - Unit: Arbitrary (normalized internally)
+            - Frame: Target Frame
 
     Returns:
-        A batch of quaternions of shape `[B, 4]` (w, x, y, z) that rotate `v1` to `v2`.
+        torch.Tensor: A batch of quaternions (w, x, y, z).
+            - Shape: (Batch, 4)
+            - Frame: Rotation from Source to Target
     """
     # Normalize input vectors to unit length. This is crucial for geometric
     # calculations and for `torch.cross` and `torch.sum` to yield correct angles.
@@ -117,11 +125,14 @@ def quaternion_multiply(quat_1: torch.Tensor, quat_2: torch.Tensor) -> torch.Ten
     by the rotation `q1`.
 
     Args:
-        quat_1: A tensor of shape `[B, 4]` representing the first quaternion (w, x, y, z).
-        quat_2: A tensor of shape `[B, 4]` representing the second quaternion (w, x, y, z).
+        quat_1 (torch.Tensor): The first quaternion (w, x, y, z).
+            - Shape: (Batch, 4)
+        quat_2 (torch.Tensor): The second quaternion (w, x, y, z).
+            - Shape: (Batch, 4)
 
     Returns:
-        The resulting quaternion of shape `[B, 4]`.
+        torch.Tensor: The resulting quaternion (w, x, y, z).
+            - Shape: (Batch, 4)
     """
     # Decompose quaternions into scalar (w) and vector (x,y,z) parts.
     w1, x1, y1, z1 = quat_1.unbind(-1)
@@ -146,11 +157,14 @@ def quaternion_to_rotation_matrix(quat_b_to_w: torch.Tensor) -> torch.Tensor:
     to the world frame (`w`). `v_w = R_bw * v_b`.
 
     Args:
-        quat_b_to_w: A tensor of shape `[B, 4]` representing the body-to-world
-            quaternion (w, x, y, z).
+        quat_b_to_w (torch.Tensor): Body-to-world quaternion (w, x, y, z).
+            - Shape: (Batch, 4)
+            - Frame: Body-to-World
 
     Returns:
-        The corresponding batch of 3x3 rotation matrices of shape `[B, 3, 3]`.
+        torch.Tensor: Batch of 3x3 rotation matrices.
+            - Shape: (Batch, 3, 3)
+            - Frame: Body-to-World
     """
     # Normalize the quaternion to ensure it's a unit quaternion.
     # This is essential for the conversion formula to produce a valid rotation matrix.
@@ -191,11 +205,15 @@ def small_angle_to_quaternion(small_angle_vec: torch.Tensor) -> torch.Tensor:
     quaternion to correct the orientation.
 
     Args:
-        small_angle_vec: A tensor of shape `[B, 3]` representing the small
-            rotation vector (e.g., `d_theta` from ESKF error state).
+        small_angle_vec (torch.Tensor): Small rotation vector.
+            - Shape: (Batch, 3)
+            - Unit: rad
+            - Frame: Body
 
     Returns:
-        The corresponding correction quaternion of shape `[B, 4]` (w, x, y, z).
+        torch.Tensor: Correction quaternion (w, x, y, z).
+            - Shape: (Batch, 4)
+            - Frame: Body
     """
     # Calculate the magnitude of the rotation vector, which represents the angle of rotation.
     angle_sq_norm = torch.sum(small_angle_vec * small_angle_vec, dim=-1, keepdim=True)

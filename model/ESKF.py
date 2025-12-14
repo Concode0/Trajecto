@@ -603,20 +603,37 @@ class ErrorStateKalmanFilter(nn.Module):
         """Executes one full predict-update-inject cycle of the ESKF.
 
         Args:
-            pos_w: Current nominal position.
-            vel_w: Current nominal velocity.
-            quat_b_to_w: Current nominal quaternion.
-            gyro_bias_b: Current nominal gyroscope bias.
-            accel_bias_b: Current nominal accelerometer bias.
-            P_error: Current 15x15 error covariance matrix.
-            gyro_b_raw: Raw gyroscope measurements.
-            accel_b_raw: Raw accelerometer measurements.
-            force_raw: Raw force sensor measurement for ZUPT.
-            measurement: The 6D sensor measurement vector (accel, gyro).
-            tcn_output: Optional dictionary of TCN predictions.
+            pos_w (torch.Tensor): Current nominal position.
+                - Shape: (Batch, 3) | Unit: m | Frame: World
+            vel_w (torch.Tensor): Current nominal velocity.
+                - Shape: (Batch, 3) | Unit: m/s | Frame: World
+            quat_b_to_w (torch.Tensor): Current nominal quaternion.
+                - Shape: (Batch, 4) | Frame: Body-to-World
+            gyro_bias_b (torch.Tensor): Current nominal gyroscope bias.
+                - Shape: (Batch, 3) | Unit: rad/s | Frame: Body
+            accel_bias_b (torch.Tensor): Current nominal accelerometer bias.
+                - Shape: (Batch, 3) | Unit: m/s^2 | Frame: Body
+            P_error (torch.Tensor): Current error covariance matrix.
+                - Shape: (Batch, 15, 15)
+            gyro_b_raw (torch.Tensor): Raw gyroscope measurements.
+                - Shape: (Batch, 3) | Unit: rad/s | Frame: Body
+            accel_b_raw (torch.Tensor): Raw accelerometer measurements.
+                - Shape: (Batch, 3) | Unit: m/s^2 | Frame: Body
+            force_raw (torch.Tensor): Raw force sensor measurement.
+                - Shape: (Batch, 1) | Unit: N
+            measurement (torch.Tensor): The 6D sensor measurement vector.
+                - Shape: (Batch, 6) | [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
+            tcn_output (Optional[Dict[str, torch.Tensor]]): Optional TCN predictions.
 
         Returns:
-            A tuple containing the updated state, covariance, and TCN features.
+            Tuple[...]: Updated state components and features:
+                - pos_w_new: (Batch, 3)
+                - vel_w_new: (Batch, 3)
+                - quat_b_to_w_new: (Batch, 4)
+                - gyro_bias_b_new: (Batch, 3)
+                - accel_bias_b_new: (Batch, 3)
+                - P_error_final: (Batch, 15, 15)
+                - tcn_features: Dict with keys "body_velocity" (Batch, 3), "zupt_flag" (Batch, 1), "innovation" (Batch, 6)
         """
         # --- 1. Prediction Step ---
         pos_w_pred, vel_w_pred, quat_b_to_w_pred, gyro_bias_b_pred, accel_bias_b_pred = (

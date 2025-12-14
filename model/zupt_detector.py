@@ -97,9 +97,13 @@ class ZuptDetector(nn.Module):
         """Updates the internal ring buffers with new IMU data for each batch element.
 
         Args:
-            accel_body_raw: A tensor of raw accelerometer readings in the
-                body frame, with shape `[B, 3]`.
-            force_raw: A tensor of raw force readings, with shape `[B, 1]`.
+            accel_body_raw (torch.Tensor): Raw accelerometer readings.
+                - Shape: (Batch, 3)
+                - Unit: m/s^2
+                - Frame: Body
+            force_raw (torch.Tensor): Raw force readings.
+                - Shape: (Batch, 1)
+                - Unit: N
         """
         # Initialize buffers if they haven't been or if batch size changes.
         if (
@@ -133,8 +137,9 @@ class ZuptDetector(nn.Module):
             and maximum delta of force sensor readings.
 
         Returns:
-            A boolean tensor of shape `[B]` indicating `True` if a ZUPT is
-            detected for each item in the batch, `False` otherwise.
+            torch.Tensor: A boolean tensor indicating if ZUPT is detected.
+                - Shape: (Batch,)
+                - Type: Bool
         """
         # ZUPT cannot be detected if the detector is disabled or the buffer
         # has not yet been filled with enough data for a full window.
@@ -186,13 +191,18 @@ class ZuptDetector(nn.Module):
         """A convenience method that combines updating the buffer and running detection.
 
         Args:
-            accel_body_raw: A tensor of raw accelerometer readings in the
-                body frame, with shape `[B, 3]`.
-            force_raw: A tensor of raw force readings, with shape `[B, 1]`.
+            accel_body_raw (torch.Tensor): Raw accelerometer readings.
+                - Shape: (Batch, 3)
+                - Unit: m/s^2
+                - Frame: Body
+            force_raw (torch.Tensor): Raw force readings.
+                - Shape: (Batch, 1)
+                - Unit: N
 
         Returns:
-            A boolean tensor of shape `[B]` indicating `True` if a ZUPT is
-            detected for each item in the batch, `False` otherwise.
+            torch.Tensor: A boolean tensor indicating if ZUPT is detected.
+                - Shape: (Batch,)
+                - Type: Bool
         """
         self.update(accel_body_raw, force_raw)
         return self.detect()

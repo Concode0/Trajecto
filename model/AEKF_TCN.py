@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import sys, os
 
 import torch
@@ -58,8 +58,25 @@ class AEKFTCN_model(BaseFilterTCNModel):
 
         return (state, P_cov)
 
-    def _filter_step(self, state_tuple, imu_data, tcn_output=None):
-        """Performs one step of AEKF prediction and update."""
+    def _filter_step(
+        self,
+        state_tuple: Tuple[torch.Tensor, ...],
+        imu_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tcn_output: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Performs a single predict-update step of the AEKF.
+
+        Args:
+            state_tuple (Tuple[torch.Tensor, ...]): Current state and covariance.
+                - Components: (state_vector, P_covariance)
+            imu_data (Tuple[torch.Tensor, torch.Tensor, torch.Tensor]): Sensor data for current step.
+                - Components: (gyro_b_raw, accel_b_raw, force_raw)
+            tcn_output (Optional[Dict[str, torch.Tensor]]): TCN predictions (unused in Open-Loop AEKF-TCN).
+
+        Returns:
+            Tuple[torch.Tensor, ...]: Updated state tuple and features.
+                - Components: (state_updated, P_updated, tcn_features)
+        """
         # Unpack inputs
         state, P_cov = state_tuple
         gyro_b_raw, accel_b_raw, force_raw = imu_data

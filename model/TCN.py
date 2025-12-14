@@ -122,15 +122,19 @@ class TCN(nn.Module):
         """Processes the sequence of input features to produce multi-head outputs.
 
         Args:
-            feature_sequence: An input tensor of shape `[B, T, D]`, where B is
-                batch size, T is sequence length, and D is the number of features.
+            feature_sequence (torch.Tensor): Input feature sequence.
+                - Shape: (Batch, Seq_Len, Input_Size)
+                - Unit: Normalized/Feature-Specific
+                - Frame: N/A (Abstract features)
 
         Returns:
-            A dictionary of output tensors, where each key corresponds to an
-            output head:
-                - 'vel_corr': `[B, T, 3]`
-                - 'covariance_R': `[B, T, 6]`
-                - 'zupt_prob': `[B, T, 1]`
+            Dict[str, torch.Tensor]: A dictionary of output tensors:
+                - "vel_corr": Velocity correction.
+                    - Shape: (Batch, Seq_Len, 3) | Unit: m/s | Frame: Body
+                - "covariance_R": Covariance parameters.
+                    - Shape: (Batch, Seq_Len, 6) | Unit: Log-Variance or similar
+                - "zupt_prob": Zero-velocity probability.
+                    - Shape: (Batch, Seq_Len, 1) | Range: [0, 1]
         """
         # Conv1d layers in PyTorch expect input of shape `[B, D, T]`.
         # Therefore, we transpose the last two dimensions of the input `feature_sequence`

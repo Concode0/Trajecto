@@ -459,16 +459,27 @@ class ExtendedKalmanFilter(nn.Module):
         """Executes one full predict-update cycle of the EKF.
 
         Args:
-            state: Current state vector (x_k-1).
-            P_covariance: Current error covariance matrix (P_k-1).
-            gyro_body_raw: Raw gyroscope measurements.
-            accel_body_raw: Raw accelerometer measurements.
-            force_raw: Raw force sensor measurement for ZUPT.
-            measurement: The 6D sensor measurement vector (accel, gyro).
-            tcn_output: Optional dictionary from TCN.
+            state (torch.Tensor): Current state vector.
+                - Shape: (Batch, 16) | [pos(3), vel(3), quat(4), bg(3), ba(3)]
+            P_covariance (torch.Tensor): Current error covariance matrix.
+                - Shape: (Batch, 16, 16)
+            gyro_body_raw (torch.Tensor): Raw gyroscope measurements.
+                - Shape: (Batch, 3) | Unit: rad/s | Frame: Body
+            accel_body_raw (torch.Tensor): Raw accelerometer measurements.
+                - Shape: (Batch, 3) | Unit: m/s^2 | Frame: Body
+            force_raw (torch.Tensor): Raw force sensor measurement.
+                - Shape: (Batch, 1) | Unit: N
+            measurement (torch.Tensor): The 6D sensor measurement vector.
+                - Shape: (Batch, 6) | [accel, gyro]
+            tcn_output (Optional[Dict[str, torch.Tensor]]): Optional dictionary from TCN.
 
         Returns:
-            A tuple with the final state, covariance, and features for the TCN.
+            Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+                - final_state: Updated state vector.
+                    - Shape: (Batch, 16)
+                - final_P: Updated covariance matrix.
+                    - Shape: (Batch, 16, 16)
+                - tcn_features: Dict containing "body_velocity" (Batch, 3), "innovation" (Batch, 6), "zupt_flag" (Batch, 1)
         """
         # 1. Prediction Step
         state_predicted, P_predicted = self.predict(state, P_covariance, gyro_body_raw, accel_body_raw)
