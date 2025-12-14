@@ -45,7 +45,8 @@ class BaseFilterTCNModel(nn.Module):
             implementation (e.g., ESKF, AEKF), to be instantiated by subclasses.
         tcn (TCN): The Temporal Convolutional Network used for feature processing.
         input_norm_layer (nn.LayerNorm): Layer normalization applied to TCN inputs.
-        pen_tip_offset_b (torch.Tensor): Constant offset from IMU to pen tip in body frame.
+        pen_tip_offset_b (nn.Parameter): Learnable offset from IMU to pen tip in body frame.
+        initial_pen_tip_offset_b (torch.Tensor): Initial constant offset for regularization.
         gravity_w (torch.Tensor): Constant gravity vector in world frame.
     """
 
@@ -105,15 +106,34 @@ class BaseFilterTCNModel(nn.Module):
 
         # --- Physical Constants ---
         # Pen tip offset from the IMU's origin, expressed in the IMU's body frame.
-        self.register_buffer(
-            "pen_tip_offset_b",
-            torch.tensor(Config.INITIAL_PEN_TIP_OFFSET, device=device)
+        # Made learnable to fine-tune the lever arm effect.
+        self.pen_tip_offset_b = nn.Parameter(
+            torch.tensor(Config.INITIAL_PEN_TIP_OFFSET, device=device, dtype=torch.float32)
         )
+        
+        # Store initial value for regularization (keep it close to physical measurement)
+        self.register_buffer(
+            "initial_pen_tip_offset_b",
+            torch.tensor(Config.INITIAL_PEN_TIP_OFFSET, device=device, dtype=torch.float32)
+        )
+
         # Gravity vector in the world frame (assuming +Z is up).
         self.register_buffer(
             "gravity_w",
             torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device)
         )
+
+    def get_pen_tip_regularization_loss(self) -> torch.Tensor:
+        """Calculates regularization loss for the learnable pen tip offset.
+        
+        Penalizes deviation from the initial physical measurement to ensure
+        the learned offset remains physically plausible.
+        
+        Returns:
+            torch.Tensor: The L2 norm of the difference between the current
+            learned offset and the initial configuration.
+        """
+        return torch.norm(self.pen_tip_offset_b - self.initial_pen_tip_offset_b)
 
     def _initialize_state(
         self,

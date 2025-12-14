@@ -14,6 +14,43 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class CausalConv1d(nn.Module):
+    """A causal 1D convolution layer.
+
+    It pads the input on the left (past) side to ensure that the output
+    at time t depends only on inputs up to time t.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int = 1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=0,  # We handle padding manually
+            dilation=dilation,
+        )
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pad only on the left side
+        x = F.pad(x, (self.padding, 0))
+        x = self.conv(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return x
 
 
 class TCN(nn.Module):
@@ -66,27 +103,19 @@ class TCN(nn.Module):
         in_channels = input_size
         self._receptive_field = 1  # Tracks the effective receptive field of the network.
 
-        # Construct the TCN layers. Each layer consists of a dilated convolution,
-        # followed by ReLU activation and Dropout.
+        # Construct the TCN layers using CausalConv1d blocks.
         for i, out_channels in enumerate(tcn_channels):
             dilation = tcn_dilation_factors[i]
-            # Padding is calculated to ensure the output sequence length after
-            # convolution (and before cropping) is sufficient to match the input.
-            # For a standard Conv1d with symmetric padding, (kernel_size - 1) * dilation
-            # ensures that for a 'valid' part of the convolution over the receptive field,
-            # the output length can be matched to the input length.
-            padding = (kernel_size - 1) * dilation
+            
             self.tcn_layers.append(
-                nn.Conv1d(
+                CausalConv1d(
                     in_channels,
                     out_channels,
                     kernel_size,
-                    padding=padding,
                     dilation=dilation,
+                    dropout=dropout,
                 )
             )
-            self.tcn_layers.append(nn.ReLU())
-            self.tcn_layers.append(nn.Dropout(dropout))
             in_channels = out_channels
 
             # The receptive field grows with each dilated convolutional layer.
@@ -142,16 +171,13 @@ class TCN(nn.Module):
         tcn_input = feature_sequence.transpose(1, 2)
 
         # Pass the input through all TCN layers.
+        # Since we use CausalConv1d, the output sequence length is naturally preserved
+        # and causality is maintained.
         for layer in self.tcn_layers:
             tcn_input = layer(tcn_input)
 
         # After convolutions, transpose back to `[B, T, D']` for the linear output heads.
-        # The padding strategy used in `nn.Conv1d` with `padding=(kernel_size - 1) * dilation`
-        # results in an output sequence that is typically longer than the input.
-        # To ensure the output `tcn_output` matches the original `feature_sequence` length,
-        # we crop the output to `feature_sequence.shape[1]`. This effectively mimics
-        # 'same' padding for the valid convolution region.
-        tcn_output = tcn_input.transpose(1, 2)[:, : feature_sequence.shape[1], :]
+        tcn_output = tcn_input.transpose(1, 2)
 
         # Apply each output head (linear layer) to the TCN's final feature map.
         outputs = {

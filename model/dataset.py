@@ -140,30 +140,27 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         vel_data = data["vel"].clone()
 
         if self.do_augment and idx >= self.num_original_samples:
-            # Apply scaling
-            scale = torch.rand(1) * (self.scale_range[1] - self.scale_range[0]) + self.scale_range[0]
-            sensor_data[:, :6] *= scale
-
-            # Apply random yaw rotation
+            # Apply random yaw rotation to Ground Truth (World Frame) ONLY.
+            # We do NOT rotate sensor_data because that would simulate a different
+            # sensor mounting/grip (Body Frame), which doesn't correlate 1:1 with
+            # World Frame trajectory rotation.
+            # We do NOT scale data because scaling accelerometer scales gravity (9.81),
+            # violating the physics model.
             yaw = torch.rand(1) * (self.yaw_range[1] - self.yaw_range[0]) + self.yaw_range[0]
             cos_yaw = torch.cos(yaw)
             sin_yaw = torch.sin(yaw)
-            # Yaw rotation matrix
+            # Yaw rotation matrix (World Frame rotation around Z-axis)
             rot_mat = torch.tensor([
                 [cos_yaw, -sin_yaw, 0],
                 [sin_yaw, cos_yaw, 0],
                 [0, 0, 1]
             ]).float()
 
-            # Rotate position and velocity
+            # Rotate position and velocity (World Frame)
             pos_data = (rot_mat @ pos_data.T).T
             vel_data = (rot_mat @ vel_data.T).T
 
-            # Rotate accelerometer and gyroscope data
-            sensor_data[:, :3] = (rot_mat @ sensor_data[:, :3].T).T
-            sensor_data[:, 3:6] = (rot_mat @ sensor_data[:, 3:6].T).T
-
-            # Add noise
+            # Add noise to sensor data
             noise = torch.randn_like(sensor_data[:, :6]) * self.noise_std
             sensor_data[:, :6] += noise
 

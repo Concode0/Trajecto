@@ -14,6 +14,7 @@ class Config:
 
     # --- Dataset Parameters ---
     DATASET_H5_PATH = "./data/dataset.h5"
+    VALIDATION_DATASET_H5_PATH = "./data/validation_dataset.h5"
     AUGMENT_MULTIPLIER = 10
     SUBSAMPLE_STEP = 8
     DO_AUGMENT = True
