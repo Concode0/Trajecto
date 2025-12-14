@@ -58,14 +58,18 @@ def find_initial_static_bias(
     stable period, which is then used to calculate the gyroscope bias.
 
     Args:
-        sensor_data_dict: A dictionary of numpy arrays
-            for 'accel_x', 'accel_y', 'accel_z', 'gyro_x', etc.
-        fs: The sampling frequency of the sensor data.
+        sensor_data_dict (Dict[str, np.ndarray]): Dictionary of raw sensor data.
+            - Keys: 'accel_x', 'accel_y', 'accel_z', 'gyro_x', 'gyro_y', 'gyro_z'
+            - Values Shape: (N,)
+            - Values Unit: g (Accel), rad/s (Gyro)
+            - Values Frame: Body
+        fs (float): The sampling frequency of the sensor data in Hz.
 
     Returns:
-        A dictionary containing the mean gyro bias
-            for each axis and the mean accelerometer norm during the static
-            period. Returns None if 'accel_x' is not in the sensor data.
+        Optional[Dict[str, float]]: A dictionary containing:
+            - 'gyro_x', 'gyro_y', 'gyro_z': Mean bias (rad/s)
+            - 'accel_norm_static': Mean accelerometer norm (g)
+            Returns None if 'accel_x' is not present.
     """
     if "accel_x" not in sensor_data_dict:
         print(
@@ -126,15 +130,17 @@ def find_force_segments(
     threshold and adds a margin to the start and end of each segment.
 
     Args:
-        df_gt: The ground truth DataFrame containing a 'force'
-            column.
-        threshold: The force threshold to determine active segments.
-        margin: The number of samples to add to the beginning and end of
+        df_gt (pd.DataFrame): Ground truth DataFrame.
+            - Column 'force': Ground truth force data.
+                - Shape: (N,)
+                - Unit: Normalized/Arbitrary
+                - Frame: N/A
+        threshold (int): The force threshold to determine active segments.
+        margin (int): The number of samples to add to the beginning and end of
             each segment.
 
     Returns:
-        A list of tuples, where each tuple contains the
-            start and end index of a segment.
+        List[Tuple[int, int]]: A list of (start_idx, end_idx) tuples.
     """
     if "force" not in df_gt.columns:
         print(
@@ -179,13 +185,15 @@ def preprocess_gt_data(
     the conversion of 'hoverDistance' to a 'z' coordinate.
 
     Args:
-        gt_data_dict: A dictionary of numpy arrays for
-            ground truth data.
-        target_fs: The target sampling frequency.
+        gt_data_dict (Dict[str, np.ndarray]): Dictionary of raw ground truth data.
+            - Keys: 'timestamp', 'x', 'y', 'hoverDistance' (optional), 'force' (optional)
+            - Values Shape: (M,)
+            - Values Unit: s (timestamp), points (x, y), unitless (force)
+            - Frame: World (Screen)
+        target_fs (float): The target sampling frequency in Hz.
 
     Returns:
-        A DataFrame containing the preprocessed ground truth
-            data.
+        pd.DataFrame: A DataFrame containing resampled and interpolated GT data.
     """
     if "timestamp" not in gt_data_dict:
         print(
@@ -228,13 +236,19 @@ def butter_lowpass_filter(
     """Applies a Butterworth low-pass filter to the data.
 
     Args:
-        data: The input data to filter.
-        cutoff: The cutoff frequency of the filter.
-        fs: The sampling frequency of the data.
-        order: The order of the filter.
+        data (np.ndarray): The input data to filter.
+            - Shape: (N,)
+            - Unit: Any
+            - Frame: Any
+        cutoff (float): The cutoff frequency of the filter in Hz.
+        fs (float): The sampling frequency of the data in Hz.
+        order (int): The order of the filter.
 
     Returns:
-        The filtered data.
+        np.ndarray: The filtered data.
+            - Shape: (N,)
+            - Unit: Same as input
+            - Frame: Same as input
     """
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
@@ -249,11 +263,17 @@ def pad_sequence(data: np.ndarray, max_len: int) -> np.ndarray:
     replicating the last value.
 
     Args:
-        data: The input sequence to pad.
-        max_len: The maximum length to pad to.
+        data (np.ndarray): The input sequence to pad.
+            - Shape: (Seq_Len, Features)
+            - Unit: Any
+            - Frame: Any
+        max_len (int): The maximum length to pad to.
 
     Returns:
-        The padded sequence.
+        np.ndarray: The padded sequence.
+            - Shape: (max_len, Features)
+            - Unit: Same as input
+            - Frame: Same as input
     """
     seq_len = min(len(data), max_len)
     padded = np.zeros((max_len, data.shape[1]))

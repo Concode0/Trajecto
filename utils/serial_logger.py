@@ -9,6 +9,7 @@ import os
 import sys
 
 def main():
+    """Main function to run the serial logger."""
     parser = argparse.ArgumentParser(description="Serial Port Data Logger.")
     parser.add_argument("--port", required=True, help="Serial port to connect to (e.g., /dev/ttyUSB0, COM1).")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate for serial communication.")

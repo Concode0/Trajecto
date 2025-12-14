@@ -76,8 +76,26 @@ def load_model(
     else:
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
-def align_trajectories(gt, pred):
-    """Align Pred and GT Trajectory using SVD with Scaling (Umeyama Algorithm)"""
+def align_trajectories(gt: np.ndarray, pred: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Align Pred and GT Trajectory using SVD with Scaling (Umeyama Algorithm).
+
+    Args:
+        gt (np.ndarray): Ground truth trajectory.
+            - Shape: (N, 3)
+            - Unit: Meter
+            - Frame: World
+        pred (np.ndarray): Predicted trajectory.
+            - Shape: (N, 3)
+            - Unit: Meter
+            - Frame: Arbitrary (aligned to World in output)
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            - gt_centered: Centered ground truth trajectory.
+                - Shape: (N, 3) | Unit: Meter | Frame: World (Centered)
+            - pred_aligned: Aligned predicted trajectory.
+                - Shape: (N, 3) | Unit: Meter | Frame: World (Centered)
+    """
 
     gt_mean = np.mean(gt, axis=0)
     pred_mean = np.mean(pred, axis=0)
@@ -142,23 +160,43 @@ def plot_trajectory(
     pred_pos: np.ndarray,
     gt_vel: np.ndarray,
     pred_vel: np.ndarray,
-    pred_zupt: np.ndarray,
+    pred_zupt: Optional[np.ndarray],
     dt: float,
     save_dir: str = "results",
     pred_cov: Optional[np.ndarray] = None,
 ) -> None:
     """Visualizes the ground truth and predicted trajectories.
+
     This function generates and saves three plots:
     1. A 2D top-down view of the XY plane.
     2. A 3D plot of the trajectory.
     3. An axis-wise comparison of X, Y, and Z positions over time.
+
     Args:
-        sample_idx: The index of the sample being plotted, used for titles
-            and filenames.
-        gt_pos: The ground truth position data, shape (T, 3).
-        pred_pos: The predicted position data, shape (T, 3).
-        dt: The time step between data points, used for the time axis.
-        save_dir: The directory where the plots will be saved.
+        sample_idx (int): The index of the sample being plotted.
+        gt_pos (np.ndarray): The ground truth position data.
+            - Shape: (T, 3)
+            - Unit: Meter
+            - Frame: World
+        pred_pos (np.ndarray): The predicted position data.
+            - Shape: (T, 3)
+            - Unit: Meter
+            - Frame: World
+        gt_vel (np.ndarray): The ground truth velocity data.
+            - Shape: (T, 3)
+            - Unit: m/s
+            - Frame: World
+        pred_vel (np.ndarray): The predicted velocity data.
+            - Shape: (T, 3)
+            - Unit: m/s
+            - Frame: World
+        pred_zupt (Optional[np.ndarray]): Predicted ZUPT probabilities.
+            - Shape: (T,) or (T, 1)
+            - Range: [0, 1]
+        dt (float): The time step between data points (s).
+        save_dir (str): The directory where the plots will be saved.
+        pred_cov (Optional[np.ndarray]): Predicted Covariance diagonal elements.
+            - Shape: (T, 6)
     """
     os.makedirs(save_dir, exist_ok=True)
     time = np.arange(len(gt_pos)) * dt

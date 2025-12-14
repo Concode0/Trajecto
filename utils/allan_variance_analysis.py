@@ -27,10 +27,13 @@ def analyze_sensor(data: np.ndarray, rate: float, sensor_name: str, unit: str) -
     Performs and plots Allan Variance analysis for a single sensor axis.
 
     Args:
-        data: 1D array of sensor data.
-        rate: The sampling rate of the sensor in Hz.
-        sensor_name: The name of the sensor for plot titles (e.g., "Gyro X").
-        unit: The unit of the sensor data for plot labels.
+        data (np.ndarray): 1D array of sensor data.
+            - Shape: (N,) where N is the number of samples.
+            - Unit: Varies (e.g., rad/s for Gyro, m/s^2 for Accel).
+            - Frame: Body Frame (Sensor Frame).
+        rate (float): The sampling rate of the sensor in Hz.
+        sensor_name (str): The name of the sensor for plot titles (e.g., "Gyro X").
+        unit (str): The unit of the sensor data for plot labels.
     """
     # --- Perform Allan Variance Calculation ---
     # Compute taus, allan deviation, and confidence intervals
