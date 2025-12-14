@@ -22,6 +22,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from model.ESKF import ErrorStateKalmanFilter
 from model.base_hybrid_model import BaseFilterTCNModel
 from model.rotation_utils import quaternion_from_two_vectors
+from model.config import Config
 
 
 class ESKFTCN_model(BaseFilterTCNModel):
@@ -38,15 +39,15 @@ class ESKFTCN_model(BaseFilterTCNModel):
 
     def __init__(
         self,
-        tcn_input_size: int = 20,
-        tcn_channels: List[int] = [64, 64, 64, 64],
-        kernel_size: int = 3,
-        dropout: float = 0.1,
+        tcn_input_size: int = Config.ESKFTCN.TCN_INPUT_SIZE,
+        tcn_channels: List[int] = Config.ESKFTCN.TCN_CHANNELS,
+        kernel_size: int = Config.ESKFTCN.KERNEL_SIZE,
+        dropout: float = Config.ESKFTCN.DROPOUT,
         device: str = "cpu",
         tcn_dilation_factors: Optional[List[int]] = None,
-        dt: float = 0.01,
-        use_zupt: bool = True,
-        use_tcn_zupt: bool = True,
+        dt: float = Config.DT,
+        use_zupt: bool = Config.ESKFTCN.USE_ZUPT,
+        use_tcn_zupt: bool = Config.ESKFTCN.USE_TCN_ZUPT,
     ):
         """Initializes the ESKF-TCN hybrid model.
 
@@ -237,7 +238,8 @@ class ESKFTCN_model(BaseFilterTCNModel):
         )
 
     def _get_position_and_quaternion(
-        self, filter_output: Tuple[torch.Tensor, ...]
+        self,
+        filter_output: Tuple[torch.Tensor, ...],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extracts world frame position and body-to-world orientation quaternion
         from the ESKF's nominal state output.
@@ -257,7 +259,8 @@ class ESKFTCN_model(BaseFilterTCNModel):
         return pos_w, quat_b_to_w
 
     def _get_gyro_bias(
-        self, filter_output: Tuple[torch.Tensor, ...]
+        self,
+        filter_output: Tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
         """Extracts gyroscope bias (in body frame) from the ESKF's nominal state output.
 
@@ -279,7 +282,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Initialize the model with default parameters, enabling TCN-based ZUPT.
-    model = ESKFTCN_model(device=device, use_tcn_zupt=True).to(device)
+    model = ESKFTCN_model(device=device).to(device)
 
     # Create dummy IMU data for a batch of sequences.
     batch_size, sequence_length, imu_features = 4, 100, 7
@@ -290,7 +293,7 @@ if __name__ == "__main__":
     # This aids the `_initialize_state` method in performing effective leveling
     # by providing a clear gravity vector.
     dummy_imu_data_raw[0, 0, :3] = torch.tensor(
-        [0.5, 0.5, 9.8], device=device
+        [0.5, 0.5, Config.GRAVITY_MAGNITUDE], device=device
     )  # accel_x, accel_y, accel_z near gravity magnitude
 
     # For the `forward` pass of BaseFilterTCNModel, `imu_data_norm` is required.
