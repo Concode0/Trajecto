@@ -11,7 +11,7 @@ class Config:
     # --- Global Training Parameters ---
     DT = 0.02 # Time delta (s) for model integration
     INITIAL_PEN_TIP_OFFSET = [0.0, 0.0, 0.0] # [x, y, z] offset from IMU to pen tip (m)
-
+    
     # --- Dataset Parameters ---
     DATASET_H5_PATH = "./data/dataset.h5"
     VALIDATION_DATASET_H5_PATH = "./data/validation_dataset.h5"
@@ -49,6 +49,8 @@ class Config:
         ADAPTIVE_GAIN_ESKF = 0.5 # Specific to ESKF's R adaptivity
         # Initial standard deviation for ZUPT measurement noise in ESKF.
         ZUPT_NOISE_STD_ESKF = [0.01, 0.01, 0.01]
+        # Whether to use Depthwise Separable Convolutions in TCN for ESKFTCN.
+        USE_SEPARABLE_CONV = True
 
     class AEKFTCN:
         TCN_INPUT_SIZE = 20
@@ -60,6 +62,8 @@ class Config:
         ZUPT_R_FACTOR_AEKF = 1e-6 # Specific to AEKF's ZUPT R
         # Initial standard deviation for ZUPT measurement noise in AEKF.
         ZUPT_NOISE_STD_AEKF = [0.01, 0.01, 0.01]
+        # Whether to use Depthwise Separable Convolutions in TCN for AEKFTCN.
+        USE_SEPARABLE_CONV = False
 
 
     class OnlyTCN:

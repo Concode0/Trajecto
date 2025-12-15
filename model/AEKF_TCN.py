@@ -29,6 +29,7 @@ class AEKFTCN_model(BaseFilterTCNModel):
         tcn_kernel_size: int = Config.AEKFTCN.TCN_KERNEL_SIZE,
         tcn_dropout: float = Config.AEKFTCN.TCN_DROPOUT,
         dt: float = Config.DT,
+        separable: bool = Config.AEKFTCN.USE_SEPARABLE_CONV,
     ) -> None:
         super().__init__(
             tcn_input_size=tcn_input_size,
@@ -37,7 +38,8 @@ class AEKFTCN_model(BaseFilterTCNModel):
             dropout=tcn_dropout,
             device=device,
             dt=dt,
-            loop_type="open"
+            loop_type="open",
+            separable=separable,
         )
 
         self.filter = ExtendedKalmanFilter(device=device, dt=dt)

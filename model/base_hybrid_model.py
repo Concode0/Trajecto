@@ -60,6 +60,7 @@ class BaseFilterTCNModel(nn.Module):
         tcn_dilation_factors: Optional[List[int]] = None,
         dt: float = 0.01,
         loop_type: str = "closed",
+        separable: bool = False, # Added this line
     ):
         """Initializes the BaseFilterTCNModel.
 
@@ -77,6 +78,7 @@ class BaseFilterTCNModel(nn.Module):
             loop_type: Defines how TCN corrections are applied.
                 'closed': TCN outputs directly influence the filter's state/covariance updates.
                 'open': TCN outputs are used for post-correction of the filter's trajectory.
+            separable: Whether to use Depthwise Separable Convolutions in TCN. # Added this line
         """
         super().__init__()
         self.device = device
@@ -96,6 +98,7 @@ class BaseFilterTCNModel(nn.Module):
             kernel_size=kernel_size,
             dropout=dropout,
             tcn_dilation_factors=tcn_dilation_factors,
+            separable=separable, # Passed to TCN constructor
             # TCN in this context primarily predicts corrections, not state directly.
             # Its dt is often implicitly handled by feature sampling rate.
         )

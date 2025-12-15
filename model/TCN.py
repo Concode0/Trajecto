@@ -16,9 +16,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model.config import Config
+
 
 class CausalConv1d(nn.Module):
-    """A causal 1D convolution layer.
+    """A causal 1D convolution layer (supporting Depthwise Separable).
 
     It pads the input on the left (past) side to ensure that the output
     at time t depends only on inputs up to time t.
@@ -31,23 +33,55 @@ class CausalConv1d(nn.Module):
         kernel_size: int,
         dilation: int = 1,
         dropout: float = 0.0,
+        separable: bool = False, # Default to False, controlled by higher-level models
     ):
         super().__init__()
         self.padding = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            padding=0,  # We handle padding manually
-            dilation=dilation,
-        )
+        self.separable = separable
+
+        if separable and in_channels > 1:
+            # Depthwise Convolution: groups = in_channels
+            self.depthwise = nn.Conv1d(
+                in_channels,
+                in_channels,
+                kernel_size,
+                padding=0,
+                dilation=dilation,
+                groups=in_channels,
+            )
+            # Pointwise Convolution: kernel_size = 1
+            self.pointwise = nn.Conv1d(
+                in_channels,
+                out_channels,
+                1,
+                padding=0,
+                dilation=1, # Pointwise is typically not dilated
+            )
+            self.conv = None # Placeholder to indicate separable mode
+        else:
+            self.conv = nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=0,  # We handle padding manually
+                dilation=dilation,
+            )
+            self.depthwise = None
+            self.pointwise = None
+
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Pad only on the left side
         x = F.pad(x, (self.padding, 0))
-        x = self.conv(x)
+        
+        if self.separable and self.depthwise is not None:
+            x = self.depthwise(x)
+            x = self.pointwise(x)
+        else:
+            x = self.conv(x)
+            
         x = self.relu(x)
         x = self.dropout(x)
         return x
@@ -74,6 +108,7 @@ class TCN(nn.Module):
         kernel_size: int = 3,
         dropout: float = 0.1,
         tcn_dilation_factors: Optional[List[int]] = None,
+        separable: bool = False, # Default to False, controlled by higher-level models
     ):
         """Initializes the TCN model.
 
@@ -88,6 +123,7 @@ class TCN(nn.Module):
             tcn_dilation_factors: Optional list of dilation factors for each TCN layer.
                 If None, defaults to `[2**i for i in range(len(tcn_channels))]`,
                 which is a common strategy for increasing the receptive field exponentially.
+            separable: If True, uses Depthwise Separable Convolutions to reduce parameters.
         """
         super().__init__()
 
@@ -114,6 +150,7 @@ class TCN(nn.Module):
                     kernel_size,
                     dilation=dilation,
                     dropout=dropout,
+                    separable=separable,
                 )
             )
             in_channels = out_channels

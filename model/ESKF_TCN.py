@@ -48,6 +48,7 @@ class ESKFTCN_model(BaseFilterTCNModel):
         dt: float = Config.DT,
         use_zupt: bool = Config.ESKFTCN.USE_ZUPT,
         use_tcn_zupt: bool = Config.ESKFTCN.USE_TCN_ZUPT,
+        separable: bool = Config.ESKFTCN.USE_SEPARABLE_CONV,
     ):
         """Initializes the ESKF-TCN hybrid model.
 
@@ -67,6 +68,7 @@ class ESKFTCN_model(BaseFilterTCNModel):
             use_tcn_zupt: A boolean flag. If True, the ZUPT decision within the
                 ESKF's forward pass is made based on the TCN's output (`zupt_prob`).
                 If False, the classic ZUPT detector in `ESKF` is used if `use_zupt` is True.
+            separable: Whether to use Depthwise Separable Convolutions in TCN.
         """
         # Call the constructor of the base class (BaseFilterTCNModel)
         super().__init__(
@@ -78,6 +80,7 @@ class ESKFTCN_model(BaseFilterTCNModel):
             tcn_dilation_factors=tcn_dilation_factors,
             dt=dt,
             loop_type="closed",  # ESKF-TCN typically operates in a closed-loop fashion
+            separable=separable,
         )
         # Instantiate the core Error-State Kalman Filter.
         # This filter will manage the nominal state propagation, error state
