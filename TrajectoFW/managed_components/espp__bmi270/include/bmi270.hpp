@@ -85,6 +85,12 @@ public:
         nullptr;                                          ///< Read function
     ImuConfig imu_config;                                 ///< IMU configuration
     filter_fn orientation_filter = nullptr;               ///< Filter function for orientation
+    /**
+     * @brief Maximum number of bytes to write in a single burst during config upload. If 0 will use full config file size of 8192 bytes.
+     * Default is 0 (uses full config file size of 8192 bytes).
+     * Set this to a small non-zero value (e.g., 128) if you encounter stack overflow or want to decrease memory usage.
+     */
+    uint16_t burst_write_size = 0;
     bool auto_init{true};                                 ///< Automatically initialize the BMI270
     Logger::Verbosity log_level{Logger::Verbosity::WARN}; ///< Log level
   };
@@ -94,7 +100,8 @@ public:
   explicit Bmi270(const Config &config)
       : BasePeripheral<uint8_t, Interface == bmi270::Interface::I2C>({}, "Bmi270", config.log_level)
       , orientation_filter_(config.orientation_filter)
-      , imu_config_(config.imu_config) {
+      , imu_config_(config.imu_config)
+      , burst_write_size_(config.burst_write_size == 0 ? config_file_size : config.burst_write_size) {
     if constexpr (Interface == bmi270::Interface::I2C) {
       set_address(config.device_address);
     }
@@ -426,17 +433,28 @@ public:
   /// @param ec The error code to set if an error occurs
   /// @return True if interrupts were configured successfully, false otherwise
   bool configure_interrupts(const InterruptConfig &config, std::error_code &ec) {
-    // Configure interrupt pin behavior
-    uint8_t int_io_ctrl =
-        (static_cast<uint8_t>(config.active_level) << 1) | static_cast<uint8_t>(config.output_type);
+    // Configure interrupt pin electrical behavior (Output Enable | Output Type | Active Level)
+    // Bit 3 is Output Enable, which must be set to 1 for the pin to drive the line.
+    uint8_t int_io_ctrl = (1 << 3) | 
+                          (static_cast<uint8_t>(config.output_type) << 2) |
+                          (static_cast<uint8_t>(config.active_level) << 1);
 
-    if (config.pin == InterruptPin::INT1) {
-      write_u8_to_register(static_cast<uint8_t>(Register::INT1_IO_CTRL), int_io_ctrl, ec);
-    } else {
-      write_u8_to_register(static_cast<uint8_t>(Register::INT2_IO_CTRL), int_io_ctrl, ec);
+    auto pin_reg = (config.pin == InterruptPin::INT1) ? Register::INT1_IO_CTRL : Register::INT2_IO_CTRL;
+    write_u8_to_register(static_cast<uint8_t>(pin_reg), int_io_ctrl, ec);
+    if (ec) return false;
+
+    // Map interrupt features to pins
+    uint8_t int_map_data = 0;
+    if (config.enable_data_ready) {
+      // Map Data Ready interrupt to the selected pin
+      // Bit 2: Data Ready -> INT1, Bit 6: Data Ready -> INT2
+      int_map_data |= (config.pin == InterruptPin::INT1) ? (1 << 2) : (1 << 6);
     }
 
-    return !ec;
+    write_u8_to_register(static_cast<uint8_t>(Register::INT_MAP_DATA), int_map_data, ec);
+    if (ec) return false;
+
+    return true;
   }
 
 protected:
@@ -565,9 +583,9 @@ protected:
     }
 
     // upload config file:
-    // - burst write 8 kB init data to INIT_DATA, using 128-byte writes
+    // - burst write init data to INIT_DATA, using configurable chunk size (defaults to 8 kB)
     const uint8_t *config_data = config_file;
-    size_t burst_size = config_file_size;
+    size_t burst_size = burst_write_size_;
     size_t config_size = config_file_size;
     size_t offset = 0;
     while (offset < config_size) {
@@ -706,6 +724,7 @@ protected:
   // Member variables
   filter_fn orientation_filter_{nullptr};
   ImuConfig imu_config_{};
+  uint16_t burst_write_size_{0};
   Value accel_values_{};
   Value gyro_values_{};
   float temperature_{0.0f};

@@ -14,5 +14,5 @@ idf_component_register(
         bt
         nvs_flash
         eigen
-        espressif__esp-tflite-micro
+        esp-tflite-micro
 )
