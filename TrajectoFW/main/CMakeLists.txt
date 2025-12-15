@@ -1,13 +1,18 @@
 idf_component_register(
     SRCS
-        "allan_variance_main.cpp"
+        "main.cpp"
+        "eskf.cpp"
+        "tcn_wrapper.cpp"
+        "tcn_model.cc"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
-        bmi270
-        i2c
-        task
-        logger
+        espp__bmi270
+        espp__i2c
+        espp__task
+        espp__logger
         esp_adc
         bt
         nvs_flash
+        eigen
+        espressif__esp-tflite-micro
 )

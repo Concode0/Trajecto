@@ -18,10 +18,8 @@ template <> struct fmt::formatter<i2c_port_t> {
     switch (p) {
     case I2C_NUM_0:
       return fmt::format_to(ctx.out(), "I2C_NUM_0");
-    #ifdef I2C_NUM_1
-      case I2C_NUM_1:
-        return fmt::format_to(ctx.out(), "I2C_NUM_1");
-    #endif
+    case I2C_NUM_1:
+      return fmt::format_to(ctx.out(), "I2C_NUM_1");
     default:
       return fmt::format_to(ctx.out(), "Unknown");
     }

@@ -9,7 +9,7 @@ maintainers:
 - William Emfinger <waemfinger@gmail.com>
 repository: git://github.com/esp-cpp/espp.git
 repository_info:
-  commit_sha: ea6e470ea8253c912aebbe8c2fb7b101c889be32
+  commit_sha: c7e68b25183487da21ea1e8939a2a9fc8f6e436d
   path: components/base_peripheral
 tags:
 - cpp
@@ -18,4 +18,4 @@ tags:
 - I2C
 - SPI
 url: https://github.com/esp-cpp/espp/tree/main/components/base_peripheral
-version: 1.0.31
+version: 1.0.32

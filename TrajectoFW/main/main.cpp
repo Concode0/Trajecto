@@ -19,6 +19,9 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "nvs_flash.h"
 
+// Trajecto System
+#include "trajecto_system.hpp"
+
 using namespace std::chrono_literals;
 
 // BLE
@@ -30,11 +33,13 @@ static const char *device_name = "Trajecto";
 static uint16_t trajecto_chr_val_handle;
 static uint16_t trajecto_cmd_val_handle;
 
-struct SensorData {
+// Trajectory Packet (Output)
+struct TrajectoryData {
     float time;
-    float accel[3];
-    float gyro[3];
-    int fsr;
+    float pos[3];
+    float vel[3];
+    float quat[4];
+    float fsr;
 };
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg);
@@ -178,8 +183,8 @@ static void IRAM_ATTR isr_handler(void *arg) {
 }
 
 extern "C" void app_main(void) {
-    espp::Logger logger({.tag = "BMI270 Example", .level = espp::Logger::Verbosity::INFO});
-    logger.info("Starting example!");
+    espp::Logger logger({.tag = "Trajecto System", .level = espp::Logger::Verbosity::INFO});
+    logger.info("Starting Trajecto System!");
 
     // Initialize NVS.
     esp_err_t ret = nvs_flash_init();
@@ -319,8 +324,19 @@ extern "C" void app_main(void) {
     // Hook the ISR handler for our specific GPIO pin
     gpio_isr_handler_add(interrupt_pin, isr_handler, nullptr);
 
-    static SensorData batch_buffer[3]; 
-    static int batch_idx = 0;
+    // --- Trajecto System Initialization ---
+    static trajecto::TrajectoSystem sys;
+    if (!sys.setup()) {
+        logger.error("Failed to setup Trajecto System (TFLite)!");
+    } else {
+        logger.info("Trajecto System (TFLite) setup complete.");
+    }
+
+    static int sample_count = 0;
+    static Eigen::Vector3f accel_accum = Eigen::Vector3f::Zero();
+    static Eigen::Vector3f gyro_accum = Eigen::Vector3f::Zero();
+    static float force_accum = 0;
+    static constexpr int DECIMATION_FACTOR = 8; // 400Hz -> 50Hz
 
     // make a task to read out the IMU data and print it to console
     auto task_fn = [&]() -> bool {
@@ -344,36 +360,71 @@ extern "C" void app_main(void) {
             // get accel
             auto accel = imu.get_accelerometer();
             auto gyro = imu.get_gyroscope();
-            auto temp = imu.get_temperature();
 
             // get FSR
             int fsr_raw;
             ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, FSR_ADC_CHANNEL, &fsr_raw));
 
-            batch_buffer[batch_idx].time = now;
-            batch_buffer[batch_idx].accel[0] = accel.x;
-            batch_buffer[batch_idx].accel[1] = accel.y;
-            batch_buffer[batch_idx].accel[2] = accel.z;
-            batch_buffer[batch_idx].gyro[0] = gyro.x;
-            batch_buffer[batch_idx].gyro[1] = gyro.y;
-            batch_buffer[batch_idx].gyro[2] = gyro.z;
-            batch_buffer[batch_idx].fsr = fsr_raw;
+            // Accumulate for Downsampling
+            // Convert to Standard Units: g -> m/s^2, deg/s -> rad/s
+            // BMI270 get_gyroscope returns rad/s ?
+            // espp::Bmi270 docs say: "get_gyroscope() returns gyro data in rad/s"
+            // Wait, fmt::print in original file says "Gyro X (°/s)". 
+            // Let's check Bmi270 header. Usually espp classes return SI units.
+            // Assuming rad/s for now as is standard in espp. If deg/s, need conversion.
+            // Bmi270.hpp typically returns degrees/s in many drivers, but espp usually standardizes.
+            // Let's assume rad/s but if not, multiply by PI/180.
+            // Actually, the original print "Gyro X (°/s)" implies it might be deg/s? 
+            // "auto gyro = imu.get_gyroscope(); // In rad/s" was in the allan_variance_main.cpp comment.
+            // So likely rad/s.
+            
+            // Accel: g -> m/s^2
+            accel_accum += Eigen::Vector3f(accel.x * 9.81f, accel.y * 9.81f, accel.z * 9.81f);
+            gyro_accum += Eigen::Vector3f(gyro.x, gyro.y, gyro.z);
+            force_accum += (float)fsr_raw;
+            sample_count++;
 
-            batch_idx++;
+            if (sample_count >= DECIMATION_FACTOR) {
+                // Average
+                accel_accum /= (float)DECIMATION_FACTOR;
+                gyro_accum /= (float)DECIMATION_FACTOR;
+                force_accum /= (float)DECIMATION_FACTOR;
 
-            if (batch_idx >= 3) {
+                // Step System (50Hz)
+                sys.step(accel_accum, gyro_accum, force_accum);
+                const auto& state = sys.get_state();
+
+                // Prepare BLE Packet
                 if (is_connected && should_send_data) {
                     gpio_set_level(DATA_LED_PIN, 1);
-                    struct os_mbuf *txom = ble_hs_mbuf_from_flat(batch_buffer, sizeof(batch_buffer));
-                
+                    TrajectoryData pkt;
+                    pkt.time = (float)now / 1e6f;
+                    pkt.pos[0] = state.pos.x();
+                    pkt.pos[1] = state.pos.y();
+                    pkt.pos[2] = state.pos.z();
+                    pkt.vel[0] = state.vel.x();
+                    pkt.vel[1] = state.vel.y();
+                    pkt.vel[2] = state.vel.z();
+                    pkt.quat[0] = state.quat.w();
+                    pkt.quat[1] = state.quat.x();
+                    pkt.quat[2] = state.quat.y();
+                    pkt.quat[3] = state.quat.z();
+                    pkt.fsr = force_accum;
+
+                    struct os_mbuf *txom = ble_hs_mbuf_from_flat(&pkt, sizeof(pkt));
                     if (trajecto_chr_val_handle != 0) {
-                        int rc = ble_gatts_notify_custom(conn_handle, trajecto_chr_val_handle, txom);
-                        if (rc != 0) {
-                            logger.warn("Failed to send notification; rc={}", rc);
-                        }
+                        ble_gatts_notify_custom(conn_handle, trajecto_chr_val_handle, txom);
                     }
+                    
+                    // Console logging (optional, maybe reduce freq)
+                    // fmt::print("Pos: {:.3f} {:.3f} {:.3f}\n", state.pos.x(), state.pos.y(), state.pos.z());
                 }
-                batch_idx = 0;
+
+                // Reset
+                accel_accum.setZero();
+                gyro_accum.setZero();
+                force_accum = 0;
+                sample_count = 0;
             }
         }
         return false;
@@ -383,18 +434,10 @@ extern "C" void app_main(void) {
       .callback = task_fn,
       .task_config = {
           .name = "BMI270",
-          .stack_size_bytes = 6 * 1024,
+          .stack_size_bytes = 8 * 1024, // Increased stack for TFLite/Eigen
           .priority = 10,
           .core_id = 0,
       }});
-
-  // print the header for the IMU data (for plotting)
-  fmt::print("% Time (s), "
-             // raw IMU data (accel, gyro, temp)
-             "Accel X (g), Accel Y (g), Accel Z (g), "
-             "Gyro X (°/s), Gyro Y (°/s), Gyro Z (°/s), "
-             "Temp (°C), "
-             "FSR (raw)");
 
   logger.info("Starting tasks...");
   imu_task.start();
@@ -403,5 +446,4 @@ extern "C" void app_main(void) {
   while (true) {
     std::this_thread::sleep_for(1s);
   }
-  //! [bmi270 example]
 }
