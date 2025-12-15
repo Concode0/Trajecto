@@ -422,6 +422,7 @@ class ErrorStateKalmanFilter(nn.Module):
         self,
         vel_w_pred: torch.Tensor,
         P_error_pred: torch.Tensor,
+        tcn_zupt_prob: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculates the error-state correction from a Zero-Velocity Update (ZUPT) pseudo-measurement.
 
@@ -431,6 +432,9 @@ class ErrorStateKalmanFilter(nn.Module):
         Args:
             vel_w_pred: Predicted nominal velocity in world frame.
             P_error_pred: The predicted 15x15 error covariance matrix.
+            tcn_zupt_prob: Optional TCN-predicted zero-velocity probability (0 to 1).
+                           - Shape: (Batch, 1) or (Batch,)
+                           - Unit: Probability | Range: 0.0 to 1.0
 
         Returns:
             A tuple containing:
@@ -445,7 +449,27 @@ class ErrorStateKalmanFilter(nn.Module):
 
         # R_ZUPT: ZUPT measurement noise. A small value implies high confidence
         # in the zero-velocity measurement.
-        R_zupt_matrix = self.get_R_zupt().unsqueeze(0).expand(batch_size, -1, -1)
+        if tcn_zupt_prob is not None:
+            # Scale R_zupt based on TCN probability: higher prob -> smaller R (more confident)
+            # Ensure tcn_zupt_prob has shape (Batch, 1) for broadcasting
+            if tcn_zupt_prob.ndim == 1:
+                tcn_zupt_prob = tcn_zupt_prob.unsqueeze(-1)
+            # Use a linear interpolation between min_R and max_R based on probability
+            # R = R_min * prob + R_max * (1 - prob)
+            # Let R_min be self.zupt_noise_std**2, and R_max be a large value for uncertainty
+            min_R_val = self.zupt_noise_std**2
+            # A large value for R when ZUPT prob is low (e.g., 100 times min_R_val)
+            max_R_val = min_R_val * 100 
+            
+            # Clamp probability to avoid extreme values and numerical instability
+            # Epsilon ensures we don't divide by zero or have extremely small R
+            clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
+
+            # R_zupt_scaled = min_R_val / (clamped_prob + 1e-6)  # Alternative scaling
+            R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
+            R_zupt_matrix = torch.diag_embed(R_zupt_scaled_diag.repeat(1, 3)) # Repeat for 3 velocity components
+        else:
+            R_zupt_matrix = self.get_R_zupt().unsqueeze(0).expand(batch_size, -1, -1)
 
         # Innovation for ZUPT: y = z - h(x_nom) = 0 - v_w_pred
         innovation_zupt = -vel_w_pred
@@ -659,8 +683,12 @@ class ErrorStateKalmanFilter(nn.Module):
         # Apply ZUPT correction where applicable.
         if torch.any(is_zupt):
             zupt_mask = is_zupt
+            zupt_prob_to_pass = None
+            if self.use_tcn_zupt and tcn_output is not None:
+                zupt_prob_to_pass = tcn_output["zupt_prob"][zupt_mask]
+
             delta_x_zupt, P_after_zupt = self._calculate_zupt_update(
-                vel_w_pred[zupt_mask], P_error_pred[zupt_mask]
+                vel_w_pred[zupt_mask], P_error_pred[zupt_mask], tcn_zupt_prob=zupt_prob_to_pass
             )
             total_delta_x[zupt_mask] += delta_x_zupt
             P_error_final[zupt_mask] = P_after_zupt
