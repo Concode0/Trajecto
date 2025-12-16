@@ -368,11 +368,22 @@ def train(
             if k in epoch_val_losses:
                 val_history[k].append(epoch_val_losses[k] / val_batch_count)
 
+        # Calculate weights for logging
+        with torch.no_grad():
+            w_pos = torch.exp(-criterion.log_var_pos).item()
+            w_vel = torch.exp(-criterion.log_var_vel).item()
+            w_cos = torch.exp(-criterion.log_var_cos).item()
+            w_zupt = torch.exp(-criterion.log_var_zupt).item()
+            w_cov = torch.exp(-criterion.log_var_cov).item()
+
         log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | Val_Total={val_history['total'][-1]:.4f}"
         if model_name != "only_tcn":
             log_str += f" | Train_Pos={train_history['pos'][-1]:.4f} | Val_Pos={val_history['pos'][-1]:.4f}"
             log_str += f" | Train_Vel={train_history['vel'][-1]:.4f} | Val_Vel={val_history['vel'][-1]:.4f}"
             log_str += f" | Train_Cos={train_history['cos'][-1]:.4f} | Val_Cos={val_history['cos'][-1]:.4f}"
+            log_str += f"\n    Weights: Pos={w_pos:.3f} | Vel={w_vel:.3f} | Cos={w_cos:.3f} | ZUPT={w_zupt:.3f} | Cov={w_cov:.3f}"
+        else:
+            log_str += f" | Weight_Pos={w_pos:.3f}"
         print(log_str)
 
     torch.save(model.state_dict(), model_path)
