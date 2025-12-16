@@ -356,20 +356,44 @@ def main() -> None:
         return
 
     processed_samples_list: List[Dict[str, Any]] = []
+    failed_samples: List[str] = []
+
+    total_samples = len(raw_samples)
+
     for sample in raw_samples:
         try:
             processed_sample = process_sample(sample)
             if processed_sample:
                 processed_samples_list.extend(processed_sample)
+            else:
+                failed_samples.append(sample["name"])
         except Exception as e:
             print(f"  Error processing {sample['name']}: {e}")
             traceback.print_exc()
+            failed_samples.append(sample["name"])
 
     if not processed_samples_list:
         print("No samples processed successfully.")
-        return
+    else:
+        save_processed_data(processed_samples_list)
 
-    save_processed_data(processed_samples_list)
+    # Enhanced Summary
+    print("\n" + "=" * 50)
+    print("PREPROCESSING SUMMARY")
+    print("=" * 50)
+    print(f"Total Raw Samples : {total_samples}")
+    print(
+        f"Successfully Saved: {len(processed_samples_list)} segments (from"
+        f" {total_samples - len(failed_samples)} samples)"
+    )
+    print(f"Failed Samples    : {len(failed_samples)}")
+
+    if failed_samples:
+        print("-" * 20)
+        print("List of Failed Samples:")
+        for name in failed_samples:
+            print(f" - {name}")
+    print("=" * 50)
 
     print(f"\n--- Completed. Dataset saved to {FINAL_DATASET_PATH} ---")
 
@@ -431,9 +455,14 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     # Center the ground truth signal by removing the mean
     sig_gt = (gt_sync - gt_sync.mean()) / (gt_sync.std() + 1e-6)
 
-    correlation = correlate(sig_sensor, sig_gt, mode="full")
+    # Limit synchronization window to the first 5 seconds to focus on the Tap event
+    sync_limit = int(5.0 * TARGET_SAMPLING_RATE_HZ)
+    sig_sensor_sync = sig_sensor.iloc[:sync_limit] if len(sig_sensor) > sync_limit else sig_sensor
+    sig_gt_sync = sig_gt.iloc[:sync_limit] if len(sig_gt) > sync_limit else sig_gt
+
+    correlation = correlate(sig_sensor_sync, sig_gt_sync, mode="full")
     lag = (
-        correlation_lags(len(sig_sensor), len(sig_gt), mode="full")[
+        correlation_lags(len(sig_sensor_sync), len(sig_gt_sync), mode="full")[
             np.argmax(correlation)
         ]
         if len(correlation) > 0
@@ -450,29 +479,61 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     df_gt = df_gt_proc.iloc[:min_len]
 
     # 3. Segmentation (Performed AFTER synchronization)
-    segments = find_force_segments(
+    # Strategy: Find Tap (Accel Peak) -> Wait (Gap) -> Write (GT Force)
+
+    # A. Detect Tap Event (Max Acceleration) within first 2 seconds
+    acc_norm_aligned = np.sqrt(
+        df_sensor["accel_x"] ** 2
+        + df_sensor["accel_y"] ** 2
+        + df_sensor["accel_z"] ** 2
+    )
+    
+    # Limit search to the first 2 seconds (or full length if shorter)
+    search_limit = int(2.0 * TARGET_SAMPLING_RATE_HZ)
+    search_region = acc_norm_aligned.iloc[:search_limit] if len(acc_norm_aligned) > search_limit else acc_norm_aligned
+    
+    tap_idx = int(np.argmax(search_region))
+
+    # B. Detect Writing Segments (GT Force > 0)
+    # SEGMENTATION_MARGIN=15 ensures we include ~15 static samples before writing.
+    raw_segments = find_force_segments(
         df_gt, SEGMENTATION_THRESHOLD, SEGMENTATION_MARGIN
     )
 
-    # --- Merge all segments into one to keep rest areas ---
-    if segments:
-        tap_start_idx = segments[0][0]
-        max_end = segments[-1][1]
+    write_start_idx = None
+    min_gap_samples = int(0.3 * TARGET_SAMPLING_RATE_HZ)  # Min 0.3s gap after Tap
 
-        skip_tap_duration = int(0.5 * TARGET_SAMPLING_RATE_HZ)
+    # Find the first segment that starts cleanly after the Tap
+    for start, end in raw_segments:
+        if start > (tap_idx + min_gap_samples):
+            write_start_idx = start
+            break
 
-        new_start = tap_start_idx + skip_tap_duration
+    if write_start_idx is None:
+        print(f"  [Warning] Could not distinguish 'Write' from 'Tap' (Peak: {tap_idx}).")
+        
+        # Fallback 1: Use last segment if it starts after tap + 50 (existing)
+        if raw_segments and raw_segments[-1][0] > tap_idx + 50:
+            print("  [Info] Fallback: Using the last detected segment.")
+            write_start_idx = raw_segments[-1][0]
+        # Fallback 2: Force-start after tap if we have a valid tap
+        elif tap_idx + min_gap_samples < min_len:
+             print("  [Warning] Fallback: Forcing write start 0.3s after Tap.")
+             write_start_idx = tap_idx + min_gap_samples
+        else:
+            print("  [Error] No valid writing segment found. Skipping sample.")
+            return None
 
-        if new_start >= max_end:
-            print("  [Warning] Tap and Write are too close. Using original start.")
-            new_start = max(0, tap_start_idx - int(1.5 * TARGET_SAMPLING_RATE_HZ)) # 차라리 앞으로(이전 로직)
+    # Safety: Ensure we don't include the Tap or its ringing
+    # Even if valid_write_start is found, clamp it to be at least some distance from Tap
+    safe_start = max(write_start_idx, tap_idx + 100)  # 100 samples = 0.25s buffer min
 
-        segments = [(new_start, max_end)]
+    max_end = raw_segments[-1][1]
+    segments = [(safe_start, max_end)]
 
-        print(
-            f"  [Info] Cut out the Tap spike. "
-            f"Start moved from {tap_start_idx} to {new_start} (skipped 0.5s)."
-        )
+    print(
+        f"  [Info] Tap: {tap_idx}, Write Start: {write_start_idx} -> Final Start: {safe_start} (Gap: {safe_start - tap_idx})"
+    )
 
     processed_segments: List[Dict[str, Any]] = []
     for i, (start, end) in enumerate(segments):
