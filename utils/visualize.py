@@ -321,7 +321,7 @@ class TrajectoDebugger:
         time = np.arange(seq_len) * self.dt
 
         # Align trajectories
-        gt_aligned, pred_aligned = align_trajectories(gt_pos, pred_pos)
+        gt_aligned, pred_aligned = align_trajectories(gt_pos_np, pred_pos_np)
 
         # --- 1. 2D Trajectory with Color Gradient ---
         # Use a colormap to show progress over time
