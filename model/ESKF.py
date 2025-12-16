@@ -459,8 +459,8 @@ class ErrorStateKalmanFilter(nn.Module):
             # Let R_min be self.zupt_noise_std**2, and R_max be a large value for uncertainty
             min_R_val = self.zupt_noise_std**2
             # A large value for R when ZUPT prob is low (e.g., 100 times min_R_val)
-            max_R_val = min_R_val * 100 
-            
+            max_R_val = min_R_val * 100
+
             # Clamp probability to avoid extreme values and numerical instability
             # Epsilon ensures we don't divide by zero or have extremely small R
             clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
