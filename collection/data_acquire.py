@@ -256,6 +256,7 @@ class DataAcquisition:
         self.pen_data_buffer.clear()  # Clear buffer for new sample data.
         await self.driver.start_data_collection()  # Start receiving data from device.
 
+        print("\nTap the Screen (Synchronization)")
         print("\nSTOP! Hold still on the paper for 2 seconds... (Calibrating)")
         await asyncio.sleep(2.0)  # Pause for a brief calibration period.
         print("GO! Start writing now.")
