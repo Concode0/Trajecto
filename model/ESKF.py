@@ -712,10 +712,21 @@ class ErrorStateKalmanFilter(nn.Module):
             innovation_output = innovation
         else:
             # Standard Measurement Update (without TCN)
-            delta_x_up, P_after_up, innovation = self.update(P_error_final, quat_b_to_w_pred, accel_bias_b_pred, gyro_bias_b_pred, measurement, R_override=None)
-            total_delta_x += delta_x_up
-            P_error_final = P_after_up
-            innovation_output = innovation
+            # Logic Change: We DO NOT perform a standard update here because the
+            # assumption that accel=gravity and gyro=0 (static) is invalid during
+            # motion. Applying it indiscriminately fights the integration.
+            # We only compute the innovation for feature logging/TCN input.
+            
+            # Recompute necessary variables for innovation (normally done inside update)
+            rot_mat_world_to_body = quaternion_to_rotation_matrix(quat_b_to_w_pred).transpose(-2, -1)
+            gravity_body = (rot_mat_world_to_body @ self.gravity_w.unsqueeze(0).T).squeeze(-1)
+            
+            accel_pred = gravity_body + accel_bias_b_pred
+            gyro_pred = gyro_bias_b_pred
+            h_predicted = torch.cat([accel_pred, gyro_pred], dim=-1)
+            
+            innovation_output = measurement - h_predicted
+            # No delta_x update or P_error update in this branch.
 
         # --- 3. Error Injection ---
         if torch.any(total_delta_x != 0):
