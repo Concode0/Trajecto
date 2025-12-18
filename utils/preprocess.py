@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import h5py
 import numpy as np
 import pandas as pd
+import scipy
 from scipy.signal import iirfilter, lfilter, correlate, correlation_lags
 
 # --- Parameters ---
@@ -49,7 +50,7 @@ HDF5_RAW_DATA_PATH: str = os.path.join(DATA_DIR, "raw_acquired_data.h5")
 CUTOFF_FREQ_HZ: float = 20.0
 FILTER_ORDER: int = 4
 GRAVITY: float = 9.81
-MAX_SEQUENCE_LENGTH: int = int(TARGET_SAMPLING_RATE_HZ * 14.0)
+MAX_SEQUENCE_LENGTH: int = int(TARGET_SAMPLING_RATE_HZ * 32.0)
 
 
 # --- Helper Functions ---
@@ -227,7 +228,7 @@ def preprocess_gt_data(
     for col in df.columns:
         if pd.api.types.is_numeric_dtype(df[col]) and col != "timestamp":
             original_data = df[col].to_numpy()[sort_idx][unique_idx]
-            upsampled_df[col] = np.interp(
+            upsampled_df[col] = scipy.interpolate.CubicSpline(
                 new_time, original_time, original_data
             )
 
@@ -295,6 +296,94 @@ def pad_sequence(data: np.ndarray, max_len: int) -> np.ndarray:
         padded[seq_len:, :] = last_val
 
     return padded
+
+
+def estimate_time_alignment_two_taps(
+    sig_ref: np.ndarray,
+    sig_target: np.ndarray,
+    fs: float,
+    search_window_s: float = 5.0
+) -> Tuple[float, float, bool]:
+    """Estimates linear time alignment using start and end taps.
+
+    Finds the correlation peak at the beginning and end of the signal to
+    calculate clock drift and offset. Uses parabolic fitting for sub-sample
+    precision.
+
+    Args:
+        sig_ref (np.ndarray): Reference signal (e.g., Sensor Accel Norm).
+        sig_target (np.ndarray): Target signal (e.g., GT Force).
+        fs (float): Sampling frequency in Hz.
+        search_window_s (float): Duration in seconds to search for taps at start/end.
+
+    Returns:
+        Tuple[float, float, bool]: (slope, intercept, success)
+            - slope: Drift rate.
+            - intercept: Initial offset.
+            - success: True if both taps found reliable.
+    """
+    n_samples = min(len(sig_ref), len(sig_target))
+    window_len = int(search_window_s * fs)
+    
+    if n_samples < 2 * window_len:
+        return 0.0, 0.0, False
+
+    def get_subsample_lag(corr, lags):
+        """Helper to refine lag using parabolic interpolation."""
+        idx = np.argmax(corr)
+        lag_int = lags[idx]
+        
+        # Parabolic interpolation
+        if 0 < idx < len(corr) - 1:
+            alpha = corr[idx - 1]
+            beta = corr[idx]
+            gamma = corr[idx + 1]
+            denom = alpha - 2 * beta + gamma
+            if denom != 0:
+                delta = (alpha - gamma) / (2 * denom)
+                return lag_int + delta
+        return float(lag_int)
+
+    # 1. Start Tap Search
+    ref_start = sig_ref[:window_len]
+    tgt_start = sig_target[:window_len]
+    
+    corr_start = correlate(ref_start - np.mean(ref_start), tgt_start - np.mean(tgt_start), mode='full')
+    lags_start = correlation_lags(len(ref_start), len(tgt_start), mode='full')
+    best_lag_start = get_subsample_lag(corr_start, lags_start)
+    
+    # 2. End Tap Search
+    ref_end = sig_ref[-window_len:]
+    tgt_end = sig_target[-window_len:]
+    
+    corr_end = correlate(ref_end - np.mean(ref_end), tgt_end - np.mean(tgt_end), mode='full')
+    lags_end = correlation_lags(len(ref_end), len(tgt_end), mode='full')
+    best_lag_end = get_subsample_lag(corr_end, lags_end)
+    
+    # Distance in Target samples
+    dist_target = (n_samples - window_len) - 0 # rough distance between windows
+    
+    # Distance in Ref samples
+    # (n_samples - window_len - best_lag_end) - (0 - best_lag_start)
+    dist_ref = dist_target - best_lag_end + best_lag_start
+    
+    if dist_ref == 0:
+        return 0.0, 0.0, False
+
+    # Drift ratio: How much faster is Ref compared to Target?
+    m = dist_ref / dist_target
+    slope = m - 1.0
+    
+    # Intercept calculation with sub-sample precision
+    intercept = best_lag_start
+    slope = (best_lag_end - best_lag_start) / dist_target
+    
+    # Sanity check: Clock drift shouldn't exceed ~5000 ppm (0.5%)
+    if abs(slope) > 0.005:
+        print(f"  [Warning] Estimated drift too high ({slope*1e6:.0f} ppm). Rejecting.")
+        return 0.0, 0.0, False
+        
+    return slope, intercept, True
 
 
 def load_h5_samples(h5_path: str) -> List[Dict[str, Any]]:
@@ -414,7 +503,7 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
 
     This function takes a single raw sample and performs the following steps:
     1.  Bias Correction, Unit Conversion, and GT Upsampling
-    2.  Synchronization
+    2.  Synchronization (Linear Drift Estimation)
     3.  Segmentation
     4.  Filtering
     5.  GT Final Processing
@@ -423,22 +512,7 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         sample: A dictionary containing the raw sample data.
 
     Returns:
-        A list of dictionaries, where each dictionary represents a processed segment,
-        containing:
-            - "name": Name of the segment.
-            - "sensor": Processed sensor data.
-                - Shape: (Seq_Len, 7)
-                - Unit: m/s^2 (accel), rad/s (gyro), unitless (fsr)
-                - Frame: Body Frame
-            - "gt_pos": Ground truth position.
-                - Shape: (Seq_Len, 3)
-                - Unit: Meter
-                - Frame: World Frame (NED-like, gravity-aligned)
-            - "gt_vel": Ground truth velocity.
-                - Shape: (Seq_Len, 3)
-                - Unit: m/s
-                - Frame: World Frame (NED-like, gravity-aligned)
-            - "original_label": Original label of the sample.
+        A list of dictionaries, where each dictionary represents a processed segment.
     """
     sample_name = sample["name"]
     original_label = sample["original_label"]
@@ -464,12 +538,12 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         static_acc_ref = GRAVITY
 
     # 2. Synchronization
+    # Prep signals for correlation
     acc_norm = np.sqrt(
         df_sensor_orig["accel_x"] ** 2
         + df_sensor_orig["accel_y"] ** 2
         + df_sensor_orig["accel_z"] ** 2
     )
-    # Center the sensor signal by removing the gravity component
     sig_sensor = (acc_norm - static_acc_ref) / (acc_norm.std() + 1e-6)
 
     gt_sync = (
@@ -477,31 +551,79 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         if "force" in df_gt_proc.columns
         else np.zeros(len(df_gt_proc))
     )
-    # Center the ground truth signal by removing the mean
     sig_gt = (gt_sync - gt_sync.mean()) / (gt_sync.std() + 1e-6)
 
-    # Limit synchronization window to the first 5 seconds to focus on the Tap event
-    sync_limit = int(5.0 * TARGET_SAMPLING_RATE_HZ)
-    sig_sensor_sync = sig_sensor.iloc[:sync_limit] if len(sig_sensor) > sync_limit else sig_sensor
-    sig_gt_sync = sig_gt.iloc[:sync_limit] if len(sig_gt) > sync_limit else sig_gt
-
-    correlation = correlate(sig_sensor_sync, sig_gt_sync, mode="full")
-    lag = (
-        correlation_lags(len(sig_sensor_sync), len(sig_gt_sync), mode="full")[
-            np.argmax(correlation)
-        ]
-        if len(correlation) > 0
-        else 0
+    # A. Robust Linear Drift Estimation (Two-Tap)
+    slope, intercept, success = estimate_time_alignment_two_taps(
+        sig_sensor.to_numpy(), sig_gt.to_numpy(), TARGET_SAMPLING_RATE_HZ
     )
 
-    if lag > 0:
-        df_sensor_orig = df_sensor_orig.iloc[lag:].reset_index(drop=True)
-    elif lag < 0:
-        df_gt_proc = df_gt_proc.iloc[abs(lag) :].reset_index(drop=True)
+    if success:
+        print(f"  [Sync] Two-Tap alignment successful. Drift Slope: {slope:.6f}, Offset: {intercept:.2f}")
+        
+        # Resample Sensor Data to align with GT
+        # Lag[t] = slope * t + intercept
+        # Ref[t] = t - Lag[t] = t - (slope*t + intercept) = t(1-slope) - intercept
+        
+        target_indices = np.arange(len(df_gt_proc))
+        # Map Target Index -> Source Index
+        source_indices = target_indices * (1.0 - slope) - intercept
+        
+        # Interpolate all sensor columns
+        new_sensor_data = {}
+        for col in df_sensor_orig.columns:
+            new_sensor_data[col] = np.interp(
+                source_indices, 
+                np.arange(len(df_sensor_orig)), 
+                df_sensor_orig[col],
+                left=np.nan, right=np.nan # Fill out-of-bounds with NaN
+            )
+        
+        df_sensor = pd.DataFrame(new_sensor_data)
+        df_gt = df_gt_proc
+        
+        # Clean up NaNs from shifting/scaling
+        valid_mask = ~df_sensor.isna().any(axis=1)
+        # Also trim to common valid overlap
+        if valid_mask.sum() > 0:
+            first_valid = valid_mask.idxmax()
+            last_valid = valid_mask[::-1].idxmax()
+            df_sensor = df_sensor.iloc[first_valid:last_valid+1].reset_index(drop=True)
+            df_gt = df_gt.iloc[first_valid:last_valid+1].reset_index(drop=True)
+        else:
+             print("  [Error] Resampling resulted in empty dataframe.")
+             return None
 
-    min_len = min(len(df_sensor_orig), len(df_gt_proc))
-    df_sensor = df_sensor_orig.iloc[:min_len]
-    df_gt = df_gt_proc.iloc[:min_len]
+    else:
+        # Fallback: Simple initial cross-correlation (original logic)
+        print("  [Sync] Two-Tap alignment failed/unavailable. Fallback to single-start correlation.")
+        sync_limit = int(5.0 * TARGET_SAMPLING_RATE_HZ)
+        sig_sensor_sync = sig_sensor.iloc[:sync_limit] if len(sig_sensor) > sync_limit else sig_sensor
+        sig_gt_sync = sig_gt.iloc[:sync_limit] if len(sig_gt) > sync_limit else sig_gt
+
+        correlation = correlate(sig_sensor_sync, sig_gt_sync, mode="full")
+        lag = (
+            correlation_lags(len(sig_sensor_sync), len(sig_gt_sync), mode="full")[
+                np.argmax(correlation)
+            ]
+            if len(correlation) > 0
+            else 0
+        )
+        print(f"  [Sync] Simple Lag: {lag}")
+
+        if lag > 0:
+            df_sensor = df_sensor_orig.iloc[lag:].reset_index(drop=True)
+            df_gt = df_gt_proc
+        elif lag < 0:
+            df_sensor = df_sensor_orig
+            df_gt = df_gt_proc.iloc[abs(lag) :].reset_index(drop=True)
+        else:
+            df_sensor = df_sensor_orig
+            df_gt = df_gt_proc
+
+        min_len = min(len(df_sensor), len(df_gt))
+        df_sensor = df_sensor.iloc[:min_len]
+        df_gt = df_gt.iloc[:min_len]
 
     # 3. Segmentation (Performed AFTER synchronization)
     # Strategy: Find Tap (Accel Peak) -> Wait (Gap) -> Write (GT Force)
@@ -542,7 +664,7 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
             print("  [Info] Fallback: Using the last detected segment.")
             write_start_idx = raw_segments[-1][0]
         # Fallback 2: Force-start after tap if we have a valid tap
-        elif tap_idx + min_gap_samples < min_len:
+        elif tap_idx + min_gap_samples < len(df_sensor):
              print("  [Warning] Fallback: Forcing write start 0.3s after Tap.")
              write_start_idx = tap_idx + min_gap_samples
         else:
@@ -554,6 +676,17 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     safe_start = max(write_start_idx, tap_idx + 100)  # 100 samples = 0.25s buffer min
 
     max_end = raw_segments[-1][1]
+    
+    # If Two-Tap sync was successful, we expect a Tap at the very end.
+    # We should exclude the last few seconds to avoid catching the End Tap in the writing segment.
+    # The End Tap search window was 5.0s. Let's be safe and exclude the last 3.0s.
+    if success:
+        cutoff_margin = int(3.0 * TARGET_SAMPLING_RATE_HZ)
+        limit_idx = len(df_gt) - cutoff_margin
+        if max_end > limit_idx:
+            print(f"  [Info] Clamping segment end from {max_end} to {limit_idx} to exclude End Tap.")
+            max_end = limit_idx
+
     segments = [(safe_start, max_end)]
 
     print(
