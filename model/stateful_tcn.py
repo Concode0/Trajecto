@@ -18,6 +18,9 @@ class StatefulTCNExport(nn.Module):
         self.layers = tcn_model.tcn_layers
         self.output_heads = tcn_model.output_heads
         
+        # Capture the BatchNorm layer from the trained model
+        self.input_bn = tcn_model.input_bn
+        
         # Precompute buffer sizes for each layer
         self.buffer_sizes = []
         for layer in self.layers:
@@ -46,9 +49,18 @@ class StatefulTCNExport(nn.Module):
             outputs (tuple): (vel_corr, covariance_R, zupt_prob) each [Batch, 1, OutDim]
             new_states (tuple): Updated state tensors.
         """
+        # Ensure BatchNorm is in eval mode for stateful inference
+        if self.input_bn.training:
+             raise RuntimeError("StatefulTCNExport must be in eval mode (self.eval()) for BatchNorm to work correctly with single-step inputs.")
+
         # Input x_t is [Batch, 1, C] (NLC) from external world.
         # Transpose to [Batch, C, 1] (NCL)
         current_input = x_t.transpose(1, 2)
+        
+        # Apply Batch Normalization
+        # BN expects [Batch, C, L]. Here L=1, which is valid.
+        # It applies (x - running_mean) / sqrt(running_var + eps) * weight + bias
+        current_input = self.input_bn(current_input)
         
         new_states = []
         

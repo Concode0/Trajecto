@@ -135,6 +135,11 @@ class TCN(nn.Module):
                 "Length of tcn_dilation_factors must match length of tcn_channels."
             )
 
+        # Batch Normalization applied to the input features across the time dimension.
+        # This replaces the LayerNorm that was previously in the wrapper class.
+        # BatchNorm is more efficient for inference (can be fused) and treats features independently.
+        self.input_bn = nn.BatchNorm1d(input_size)
+
         self.tcn_layers = nn.ModuleList()  # Stores the sequential TCN blocks.
         in_channels = input_size
         self._receptive_field = 1  # Tracks the effective receptive field of the network.
