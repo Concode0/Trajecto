@@ -1,4 +1,5 @@
-"""This script preprocesses raw trajectory data into a clean, segmented, and
+"""
+This script preprocesses raw trajectory data into a clean, segmented, and
 normalized dataset.
 
 The preprocessing pipeline includes the following steps:
@@ -19,25 +20,28 @@ The preprocessing pipeline includes the following steps:
 
 import os
 import traceback
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, filtfilt, correlate, correlation_lags
+from scipy.signal import iirfilter, lfilter, correlate, correlation_lags
 
 # --- Parameters ---
 DATA_DIR: str = "acquired_data"
-TARGET_SAMPLING_RATE_HZ: float = 400.0
+TARGET_SAMPLING_RATE_HZ: float = 50.0
 BIAS_SEARCH_DURATION_S: float = 1.5
 STATIC_VARIANCE_THRESHOLD: float = 0.005
 SEGMENTATION_THRESHOLD: int = 0
 SEGMENTATION_MARGIN: int = 15
+TRAIN_VAL_SPLIT: float = 0.8
 
 PIXEL_TO_METER: float = 0.0254 / 264  # iPad PPI
 
 # Output paths
 FINAL_DATASET_PATH: str = "data/dataset.h5"
+VALIDATION_DATASET_PATH: str = "data/validation_dataset.h5"
 SCALER_STATS_PATH: str = "data/scaler_stats.h5"
 HDF5_RAW_DATA_PATH: str = os.path.join(DATA_DIR, "raw_acquired_data.h5")
 
@@ -186,9 +190,9 @@ def preprocess_gt_data(
 
     Args:
         gt_data_dict (Dict[str, np.ndarray]): Dictionary of raw ground truth data.
-            - Keys: 'timestamp', 'x', 'y', 'hoverDistance' (optional), 'force' (optional)
+            - Keys: 'timestamp', 'x', 'y', 'z', 'hoverDistance' (optional), 'force' (optional)
             - Values Shape: (M,)
-            - Values Unit: s (timestamp), points (x, y), unitless (force)
+            - Values Unit: s (timestamp), points (x, y), mm (z), unitless (force)
             - Frame: World (Screen)
         target_fs (float): The target sampling frequency in Hz.
 
@@ -233,7 +237,12 @@ def preprocess_gt_data(
 def butter_lowpass_filter(
     data: np.ndarray, cutoff: float, fs: float, order: int
 ) -> np.ndarray:
-    """Applies a Butterworth low-pass filter to the data.
+    """Applies a Butterworth IIR low-pass filter to the data.
+
+    This implementation uses `iirfilter` to design the filter and `lfilter`
+    to apply it. Using `lfilter` ensures the filtering is causal (only depends
+    on past and present inputs), which matches the behavior of real-time
+    firmware implementations.
 
     Args:
         data (np.ndarray): The input data to filter.
@@ -252,8 +261,10 @@ def butter_lowpass_filter(
     """
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
-    b, a = butter(order, normal_cutoff, btype="low", analog=False)
-    return filtfilt(b, a, data)
+    # Design an IIR Butterworth filter
+    b, a = iirfilter(order, normal_cutoff, btype='low', ftype='butter', analog=False)
+    # Apply the filter causally using lfilter
+    return lfilter(b, a, data)
 
 
 def pad_sequence(data: np.ndarray, max_len: int) -> np.ndarray:
@@ -412,8 +423,22 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         sample: A dictionary containing the raw sample data.
 
     Returns:
-        A list of dictionaries, where each
-            dictionary represents a processed segment.
+        A list of dictionaries, where each dictionary represents a processed segment,
+        containing:
+            - "name": Name of the segment.
+            - "sensor": Processed sensor data.
+                - Shape: (Seq_Len, 7)
+                - Unit: m/s^2 (accel), rad/s (gyro), unitless (fsr)
+                - Frame: Body Frame
+            - "gt_pos": Ground truth position.
+                - Shape: (Seq_Len, 3)
+                - Unit: Meter
+                - Frame: World Frame (NED-like, gravity-aligned)
+            - "gt_vel": Ground truth velocity.
+                - Shape: (Seq_Len, 3)
+                - Unit: m/s
+                - Frame: World Frame (NED-like, gravity-aligned)
+            - "original_label": Original label of the sample.
     """
     sample_name = sample["name"]
     original_label = sample["original_label"]
@@ -487,11 +512,11 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         + df_sensor["accel_y"] ** 2
         + df_sensor["accel_z"] ** 2
     )
-    
+
     # Limit search to the first 2 seconds (or full length if shorter)
     search_limit = int(2.0 * TARGET_SAMPLING_RATE_HZ)
     search_region = acc_norm_aligned.iloc[:search_limit] if len(acc_norm_aligned) > search_limit else acc_norm_aligned
-    
+
     tap_idx = int(np.argmax(search_region))
 
     # B. Detect Writing Segments (GT Force > 0)
@@ -511,7 +536,7 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
 
     if write_start_idx is None:
         print(f"  [Warning] Could not distinguish 'Write' from 'Tap' (Peak: {tap_idx}).")
-        
+
         # Fallback 1: Use last segment if it starts after tap + 50 (existing)
         if raw_segments and raw_segments[-1][0] > tap_idx + 50:
             print("  [Info] Fallback: Using the last detected segment.")
@@ -572,8 +597,11 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
 
         gt_pos = df_gt_segment[["x", "y", "z"]].to_numpy()
         gt_pos_final = np.zeros_like(gt_pos)
+        # Convert GT position from pixels (x, y) and millimeters (z) to meters in World Frame
         gt_pos_final[:, 0] = gt_pos[:, 0] * PIXEL_TO_METER
         gt_pos_final[:, 1] = gt_pos[:, 1] * PIXEL_TO_METER
+        # The empirical formula '12.49 * zOffset.pow(0.78)' is assumed to output
+        # 'z' in millimeters. Convert to meters.
         gt_pos_final[:, 2] = np.maximum(gt_pos[:, 2] * 0.001, 1e-7)
 
         # Calculate GT Velocity from gt_pos_final
@@ -617,13 +645,51 @@ def process_sample(sample: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
 def save_processed_data(processed_samples_list: List[Dict[str, Any]]) -> None:
     """Saves the processed data and scaler statistics.
 
+    Splits the data into training and validation sets based on unique source samples
+    (not segments) to prevent data leakage from the same recording session appearing
+    in both sets.
+    Calculates normalization statistics ONLY on the training set.
+    Saves training data to dataset.h5 and validation data to validation_dataset.h5.
+
     Args:
-        processed_samples_list: A list of
-            dictionaries, where each dictionary represents a processed
-            segment.
+        processed_samples_list: A list of dictionaries, where each dictionary
+            represents a processed segment.
     """
-    print("\nCalculating Global Statistics...")
-    all_sensor_data = np.vstack([s["sensor"] for s in processed_samples_list])
+    # 1. Group segments by Source Sample to prevent leakage
+    sample_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for sample in processed_samples_list:
+        source_name = sample["name"].rsplit("_seg", 1)[0]
+        if source_name not in sample_groups:
+            sample_groups[source_name] = []
+        sample_groups[source_name].append(sample)
+
+    unique_samples = list(sample_groups.keys())
+    random.shuffle(unique_samples)
+
+    split_idx = int(len(unique_samples) * TRAIN_VAL_SPLIT)
+    train_source_names = unique_samples[:split_idx]
+    val_source_names = unique_samples[split_idx:]
+
+    train_samples = []
+    for name in train_source_names:
+        train_samples.extend(sample_groups[name])
+
+    val_samples = []
+    for name in val_source_names:
+        val_samples.extend(sample_groups[name])
+
+    print(f"\nSplitting data by Source Sample ({TRAIN_VAL_SPLIT*100}%) Train / ({(1-TRAIN_VAL_SPLIT)*100}%) Val...")
+    print(f"  Total Source Samples: {len(unique_samples)}")
+    print(f"  Training Source Samples: {len(train_source_names)} -> {len(train_samples)} segments")
+    print(f"  Validation Source Samples: {len(val_source_names)} -> {len(val_samples)} segments")
+
+    if not train_samples:
+        print("Error: No training samples after split!")
+        return
+
+    # 2. Calculate Statistics (Train Set Only)
+    print("\nCalculating Global Statistics (Train Set Only)...")
+    all_sensor_data = np.vstack([s["sensor"] for s in train_samples])
     if np.isnan(all_sensor_data).any():
         all_sensor_data = np.nan_to_num(all_sensor_data)
     sensor_mean, sensor_std = np.mean(all_sensor_data, axis=0), np.std(
@@ -636,8 +702,10 @@ def save_processed_data(processed_samples_list: List[Dict[str, Any]]) -> None:
         f.create_dataset("std", data=sensor_std)
     print(f"  Global Scaler stats saved to {SCALER_STATS_PATH}")
 
+    # 3. Save Training Data
+    print(f"\nSaving Training Data to {FINAL_DATASET_PATH}...")
     with h5py.File(FINAL_DATASET_PATH, "w") as hf_out:
-        for sample in processed_samples_list:
+        for sample in train_samples:
             if len(sample["sensor"]) == 0:
                 continue
             sensor_padded = pad_sequence(sample["sensor"], MAX_SEQUENCE_LENGTH)
@@ -648,8 +716,25 @@ def save_processed_data(processed_samples_list: List[Dict[str, Any]]) -> None:
             g.create_dataset("gt_pos_data", data=gt_pos_padded)
             g.create_dataset("gt_vel_data", data=gt_vel_padded)
             g.attrs["original_label"] = sample["original_label"]
-            g.attrs["sequence_length"] = len(sample["sensor"])  # Store true length before padding
-            print(f"  Saved {sample['name']} to dataset.")
+            g.attrs["sequence_length"] = len(sample["sensor"])
+    print("  Training dataset saved.")
+
+    # 4. Save Validation Data
+    print(f"\nSaving Validation Data to {VALIDATION_DATASET_PATH}...")
+    with h5py.File(VALIDATION_DATASET_PATH, "w") as hf_out:
+        for sample in val_samples:
+            if len(sample["sensor"]) == 0:
+                continue
+            sensor_padded = pad_sequence(sample["sensor"], MAX_SEQUENCE_LENGTH)
+            gt_pos_padded = pad_sequence(sample["gt_pos"], MAX_SEQUENCE_LENGTH)
+            gt_vel_padded = pad_sequence(sample["gt_vel"], MAX_SEQUENCE_LENGTH)
+            g = hf_out.create_group(sample["name"])
+            g.create_dataset("sensor_data", data=sensor_padded)
+            g.create_dataset("gt_pos_data", data=gt_pos_padded)
+            g.create_dataset("gt_vel_data", data=gt_vel_padded)
+            g.attrs["original_label"] = sample["original_label"]
+            g.attrs["sequence_length"] = len(sample["sensor"])
+    print("  Validation dataset saved.")
 
 
 if __name__ == "__main__":
