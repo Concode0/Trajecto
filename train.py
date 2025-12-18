@@ -11,9 +11,10 @@ of training history, ultimately saving the trained model and loss plots.
 
 
 import argparse
+import math
 import os
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import h5py
 import matplotlib.pyplot as plt
@@ -56,11 +57,12 @@ class UncertaintyLoss(nn.Module):
 
         # Create learnable parameters for the log variance of each task.
         # Initializing with zeros is a common starting point.
-        self.log_var_pos = nn.Parameter(torch.tensor(0.0, device=device))
+        self.log_var_pos = nn.Parameter(torch.tensor(0.0, device=device)) # Position Loss weight
         self.log_var_vel = nn.Parameter(torch.tensor(0.0, device=device))
         self.log_var_cos = nn.Parameter(torch.tensor(0.0, device=device)) # Cosine Similarity Loss weight
         self.log_var_zupt = nn.Parameter(torch.tensor(0.0, device=device))
         self.log_var_cov = nn.Parameter(torch.tensor(0.0, device=device))
+        # self.log_var_phy = nn.Parameter(torch.tensor(0.0, device=device)) # Physics Consistency Loss weight (commented out)
 
     def forward(
         self,
@@ -69,6 +71,7 @@ class UncertaintyLoss(nn.Module):
         mask: torch.Tensor,
         reg_weight: float,
         model_name: str,
+        target_phy_weight: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Computes the total loss as a sum of uncertainty-weighted task losses.
@@ -80,20 +83,19 @@ class UncertaintyLoss(nn.Module):
         losses = {}
         total_loss = torch.tensor(0.0, device=mask.device)
 
-        # --- Position Loss (for all models) ---
+        # --- Position Loss ---
+        # Only applied for 'only_tcn' as it predicts position directly.
+        # For hybrid models, position drift makes this loss counter-productive.
         if model_name == "only_tcn":
              pred_pos_w = model_out
-        else:
-             pred_pos_w = model_out["pred_pos_w"]
+             per_element_pos_loss = self.pos_criterion(pred_pos_w, batch["gt_pos_w"])
+             mse_pos = (per_element_pos_loss * mask_3d).sum() / valid_element_count
 
-        per_element_pos_loss = self.pos_criterion(pred_pos_w, batch["gt_pos_w"])
-        mse_pos = (per_element_pos_loss * mask_3d).sum() / valid_element_count
-
-        # Apply uncertainty weighting
-        precision_pos = torch.exp(-self.log_var_pos)
-        loss_pos = precision_pos * mse_pos + self.log_var_pos
-        total_loss += loss_pos
-        losses["pos"] = mse_pos.item() # Log the unweighted MSE for monitoring
+             # Apply uncertainty weighting
+             precision_pos = torch.exp(-self.log_var_pos)
+             loss_pos = precision_pos * mse_pos + self.log_var_pos
+             total_loss += loss_pos
+             losses["pos"] = mse_pos.item()
 
         # --- Hybrid Model Losses (ESKF-TCN, AEKF-TCN) ---
         if model_name != "only_tcn":
@@ -122,6 +124,55 @@ class UncertaintyLoss(nn.Module):
             loss_cos = precision_cos * mean_cos_loss + self.log_var_cos
             total_loss += loss_cos
             losses["cos"] = mean_cos_loss.item()
+
+            # --- Kinematic Consistency Loss (Physics Loss) ---
+            # This loss term was found to be detrimental, as it penalizes acceleration
+            # which is critical for handwriting strokes. It also effectively fights
+            # the ESKF's corrections.
+            # The kinematic consistency is already implicitly handled by the ESKF's
+            # integration step.
+            # dt = Config.DT
+            # Calculate numerical derivative of position (batch, seq-1, 3)
+            # pred_vel_from_pos = (pred_pos_w[:, 1:] - pred_pos_w[:, :-1]) / dt
+
+            # Clip the numerical derivative to prevent massive spikes/exploding gradients
+            # from 1/dt scaling on noisy predictions, especially early in training.
+            # +/- 20.0 m/s is a safe upper bound for handwriting.
+            # pred_vel_from_pos = torch.clamp(pred_vel_from_pos, -20.0, 20.0)
+
+            # Align predicted velocity (batch, seq-1, 3)
+            # Euler: p_{t+1} = p_t + v_t * dt. So v_t ~ (p_{t+1}-p_t)/dt.
+            # We take 0..L-2 to match the diff length.
+            # pred_vel_ref = pred_total_vel_w[:, :-1]
+
+            # Adjust mask for the shortened sequence
+            # mask_phy = mask_3d[:, :-1]
+            # valid_phy_count = mask_phy.sum() + 1e-8
+
+            # per_element_phy_loss = self.vel_criterion(pred_vel_from_pos, pred_vel_ref)
+            # mse_phy = (per_element_phy_loss * mask_phy).sum() / valid_phy_count
+
+            # --- Warm-up / Forced Schedule Logic ---
+            # if target_phy_weight is not None:
+            #     # Force the weight (precision) to the target value.
+            #     # Update the learnable parameter so the optimizer picks up from here.
+            #     # precision = exp(-log_var)  =>  log_var = -log(precision)
+            #     forced_log_var = -math.log(target_phy_weight + 1e-8)
+            #     self.log_var_phy.data.fill_(forced_log_var)
+
+            #     # Use the forced values for calculation
+            #     precision_phy = torch.tensor(target_phy_weight, device=self.log_var_phy.device)
+            #     log_var_phy_val = torch.tensor(forced_log_var, device=self.log_var_phy.device)
+
+            #     loss_phy = precision_phy * mse_phy + log_var_phy_val
+            # else:
+            #     # Standard learned uncertainty weighting
+            #     precision_phy = torch.exp(-self.log_var_phy)
+            #     loss_phy = precision_phy * mse_phy + self.log_var_phy
+
+            # total_loss += loss_phy
+            # losses["phy"] = mse_phy.item() # Keep for logging historical values if desired, otherwise comment out.
+
 
             # --- ZUPT Loss (Conditional) ---
             if "pred_zupt_prob" in model_out and model_out["pred_zupt_prob"] is not None:
@@ -216,6 +267,7 @@ def train(
     mean: torch.Tensor,
     std: torch.Tensor,
     reg_weight: float = 0.0,
+    warmup_epochs: int = 10, # Added warmup_epochs argument
 ) -> None:
     """Runs the training loop for the specified model."""
 
@@ -223,7 +275,7 @@ def train(
 
     # Ensure the learnable loss parameters are included in the optimizer
     optimizer = torch.optim.Adam(list(model.parameters()) + list(criterion.parameters()), lr=lr)
-    # Scheduler now monitors validation loss
+    # Scheduler now monitors training loss
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
 
     if os.path.exists(model_path):
@@ -234,7 +286,7 @@ def train(
 
     # Initialize history dictionaries for both training and validation
     train_history: Dict[str, List[float]] = {"total": [], "pos": [], "vel": [], "cos": [], "zupt": [], "reg": [], "cov": []}
-    val_history: Dict[str, List[float]] = {"total": [], "pos": [], "vel": [], "cos": [], "zupt": [], "reg": [], "cov": []}
+
 
     print(f"Start Training for {model_name} on {device}...")
 
@@ -242,6 +294,17 @@ def train(
     std_gpu = std.to(device)
 
     for epoch in range(epochs):
+        # --- Calculate Physics Warm-up Weight ---
+        target_phy_weight: Optional[float] = None
+        if epoch < warmup_epochs:
+            # Linear ramp from 1e-4 to 1.0
+            # Start small to avoid shock, end at 1.0 (strong enforcement)
+            progress = epoch / float(warmup_epochs)
+            target_phy_weight = 1e-4 + (1.0 - 1e-4) * progress
+        else:
+            # Let the model learn the weight via uncertainty
+            target_phy_weight = None
+
         # --- Training Loop ---
         model.train() # Set model to training mode
         epoch_train_losses: Dict[str, float] = {k: 0.0 for k in train_history.keys()}
@@ -276,7 +339,8 @@ def train(
                 batch=batch_gpu,
                 mask=mask,
                 reg_weight=reg_weight,
-                model_name=model_name
+                model_name=model_name,
+                target_phy_weight=target_phy_weight # Pass target weight
             )
 
             # Add Pen Tip Regularization Loss if available
@@ -308,80 +372,25 @@ def train(
             if k in epoch_train_losses:
                 train_history[k].append(epoch_train_losses[k] / len(train_dataloader))
 
-        # --- Validation Loop ---
-        model.eval() # Set model to evaluation mode
-        epoch_val_losses: Dict[str, float] = {k: 0.0 for k in val_history.keys()}
-        val_total_loss_sum = 0.0
-        val_batch_count = 0
-
-        with torch.no_grad(): # Disable gradient calculations for validation
-            pbar_val = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Valid]")
-            for batch in pbar_val:
-                sensor_raw = batch["imu_seq_raw"].to(device)
-                gt_pos_w = batch["gt_pos_w"].to(device)
-                gt_vel_w = batch["gt_vel_w"].to(device)
-                seq_lens = batch["len"].to(device)
-
-                max_len = sensor_raw.shape[1]
-                mask = torch.arange(max_len, device=device)[None, :] < seq_lens[:, None]
-
-                gt_vel_norm = torch.norm(gt_vel_w, dim=-1, keepdim=True)
-                gt_zupt = (gt_vel_norm < 0.01).float()
-
-                sensor_norm = (sensor_raw - mean_gpu) / (std_gpu + 1e-6)
-
-                model_output = model(sensor_raw, sensor_norm)
-
-                batch_gpu = {
-                    "gt_pos_w": gt_pos_w,
-                    "gt_vel_w": gt_vel_w,
-                    "gt_zupt": gt_zupt,
-                }
-
-                loss, sub_losses = criterion(
-                    model_out=model_output,
-                    batch=batch_gpu,
-                    mask=mask,
-                    reg_weight=reg_weight,
-                    model_name=model_name
-                )
-
-                # Add Pen Tip Regularization Loss if available (for tracking)
-                if hasattr(model, "get_pen_tip_regularization_loss"):
-                    pen_tip_loss = model.get_pen_tip_regularization_loss()
-                    loss += reg_weight * pen_tip_loss
-                    sub_losses["reg"] = sub_losses.get("reg", 0.0) + pen_tip_loss.item()
-
-                if not torch.isnan(loss):
-                    val_total_loss_sum += loss.item()
-                    epoch_val_losses["total"] += loss.item()
-                    for k, v in sub_losses.items():
-                        if k in epoch_val_losses:
-                            epoch_val_losses[k] += v if not np.isnan(v) else 0
-                val_batch_count += 1
-                pbar_val.set_postfix({"L_val": loss.item()})
-
-        avg_val_loss = val_total_loss_sum / val_batch_count
-        scheduler.step(avg_val_loss) # Step scheduler with validation loss
-
-        for k in val_history.keys():
-            if k in epoch_val_losses:
-                val_history[k].append(epoch_val_losses[k] / val_batch_count)
+        # Adjust learning rate based on training total loss
+        scheduler.step(train_history["total"][-1])
 
         # Calculate weights for logging
         with torch.no_grad():
             w_pos = torch.exp(-criterion.log_var_pos).item()
             w_vel = torch.exp(-criterion.log_var_vel).item()
             w_cos = torch.exp(-criterion.log_var_cos).item()
+            # w_phy = torch.exp(-criterion.log_var_phy).item() # Commented out
             w_zupt = torch.exp(-criterion.log_var_zupt).item()
             w_cov = torch.exp(-criterion.log_var_cov).item()
 
-        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | Val_Total={val_history['total'][-1]:.4f}"
+        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f}"
         if model_name != "only_tcn":
-            log_str += f" | Train_Pos={train_history['pos'][-1]:.4f} | Val_Pos={val_history['pos'][-1]:.4f}"
-            log_str += f" | Train_Vel={train_history['vel'][-1]:.4f} | Val_Vel={val_history['vel'][-1]:.4f}"
-            log_str += f" | Train_Cos={train_history['cos'][-1]:.4f} | Val_Cos={val_history['cos'][-1]:.4f}"
-            log_str += f"\n    Weights: Pos={w_pos:.3f} | Vel={w_vel:.3f} | Cos={w_cos:.3f} | ZUPT={w_zupt:.3f} | Cov={w_cov:.3f}"
+            # log_str += f" | Train_Pos={train_history['pos'][-1]:.4f}" # Commented out as pos_loss is removed
+            log_str += f" | Train_Vel={train_history['vel'][-1]:.4f}"
+            log_str += f" | Train_Cos={train_history['cos'][-1]:.4f}"
+            # log_str += f" | Train_Phy={train_history['phy'][-1]:.4f}" # Commented out as phy_loss is removed
+            log_str += f"\n    Weights: Vel={w_vel:.3f} | Cos={w_cos:.3f} | ZUPT={w_zupt:.3f} | Cov={w_cov:.3f}"
         else:
             log_str += f" | Weight_Pos={w_pos:.3f}"
         print(log_str)
@@ -389,7 +398,7 @@ def train(
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
 
-    # Plotting training and validation history
+    # Plotting training history
     plt.figure(figsize=(12, 8))
 
     # Define a consistent order for plotting metrics
@@ -398,12 +407,10 @@ def train(
     for metric in plot_order:
         if metric in train_history and train_history[metric]:
             plt.plot(train_history[metric], label=f"Train {metric.capitalize()} Loss", marker='.')
-        if metric in val_history and val_history[metric]:
-            plt.plot(val_history[metric], label=f"Val {metric.capitalize()} Loss", linestyle='--', marker='x')
 
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title(f"Training and Validation Loss History ({model_name})")
+    plt.title(f"Training Loss History ({model_name})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
@@ -450,9 +457,10 @@ def main() -> None:
     """Main function to parse arguments, set up training, and start the training process."""
     parser = argparse.ArgumentParser(description="Train various trajectory estimation models.")
     parser.add_argument("--model", type=str, default="eskf_tcn", choices=["eskf_tcn", "aekf_tcn", "only_tcn"], help="Type of model to train.")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs.")
+    parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for physics loss warmup.") # Added arg
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
     args, _ = parser.parse_known_args()
 
@@ -515,7 +523,7 @@ def main() -> None:
 
     model_path = f"{args.model}_model.pth"
 
-    train(args.model, model, train_dataloader, val_dataloader, args.epochs, args.lr, args.device, model_path, mean, std, **loss_weights)
+    train(args.model, model, train_dataloader, val_dataloader, args.epochs, args.lr, args.device, model_path, mean, std, **loss_weights, warmup_epochs=args.warmup_epochs)
 
 
 if __name__ == "__main__":
