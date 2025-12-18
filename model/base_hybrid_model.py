@@ -105,7 +105,7 @@ class BaseFilterTCNModel(nn.Module):
 
         # --- Normalization Layer for TCN Input ---
         # Layer normalization helps stabilize TCN training by normalizing its input features.
-        self.input_norm_layer = nn.LayerNorm(tcn_input_size)
+        # self.input_norm_layer = nn.LayerNorm(tcn_input_size) # Removed in favor of BatchNorm in TCN
 
         # --- Physical Constants ---
         # Pen tip offset from the IMU's origin, expressed in the IMU's body frame.
@@ -318,12 +318,9 @@ class BaseFilterTCNModel(nn.Module):
                 start_idx = t - receptive_field
                 tcn_input_window = tcn_feature_seq[:, start_idx:t, :].clone()
 
-                # Normalize the TCN input window.
-                tcn_input_norm = self.input_norm_layer(tcn_input_window)
-
                 # Get predictions from the TCN. The TCN typically outputs a sequence
                 # of corrections/parameters; we take the latest prediction.
-                tcn_output_seq = self.tcn(tcn_input_norm)
+                tcn_output_seq = self.tcn(tcn_input_window)
                 tcn_output = {k: v[:, -1, :] for k, v in tcn_output_seq.items()}
 
                 # Store TCN predictions for later use or loss calculation.
