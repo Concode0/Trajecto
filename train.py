@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split # Add random_split
+from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 
@@ -96,6 +97,7 @@ class UncertaintyLoss(nn.Module):
              loss_pos = precision_pos * mse_pos + self.log_var_pos
              total_loss += loss_pos
              losses["pos"] = mse_pos.item()
+             losses["w_pos"] = loss_pos.item()
 
         # --- Hybrid Model Losses (ESKF-TCN, AEKF-TCN) ---
         if model_name != "only_tcn":
@@ -114,6 +116,7 @@ class UncertaintyLoss(nn.Module):
             loss_vel = precision_vel * mse_vel + self.log_var_vel
             total_loss += loss_vel
             losses["vel"] = mse_vel.item()
+            losses["w_vel"] = loss_vel.item()
 
             # 2. Cosine Similarity Loss for Velocity Direction
             # Loss = 1 - cosine_similarity. Range [0, 2].
@@ -124,6 +127,7 @@ class UncertaintyLoss(nn.Module):
             loss_cos = precision_cos * mean_cos_loss + self.log_var_cos
             total_loss += loss_cos
             losses["cos"] = mean_cos_loss.item()
+            losses["w_cos"] = loss_cos.item()
 
             # --- Kinematic Consistency Loss (Physics Loss) ---
             # This loss term was found to be detrimental, as it penalizes acceleration
@@ -182,12 +186,15 @@ class UncertaintyLoss(nn.Module):
                 loss_zupt = precision_zupt * bce_zupt + self.log_var_zupt
                 total_loss += loss_zupt
                 losses["zupt"] = bce_zupt.item()
+                losses["w_zupt"] = loss_zupt.item()
 
             # --- Regularization Loss (fixed weight) ---
             masked_vel_resid = pred_vel_resid_b * mask_3d
             loss_reg = torch.norm(masked_vel_resid)
-            total_loss += reg_weight * loss_reg
+            weighted_reg_loss = reg_weight * loss_reg
+            total_loss += weighted_reg_loss
             losses["reg"] = loss_reg.item()
+            losses["w_reg"] = weighted_reg_loss.item()
 
         # --- Probabilistic Model Loss (ESKF-TCN) ---
         if model_name == "eskf_tcn":
@@ -208,6 +215,7 @@ class UncertaintyLoss(nn.Module):
             loss_cov = precision_cov * nll_cov + self.log_var_cov
             total_loss += loss_cov
             losses["cov"] = nll_cov.item()
+            losses["w_cov"] = loss_cov.item()
 
         return total_loss, losses
 
@@ -277,8 +285,12 @@ def train(
 
     # Ensure the learnable loss parameters are included in the optimizer
     optimizer = torch.optim.Adam(list(model.parameters()) + list(criterion.parameters()), lr=lr)
-    # Scheduler now monitors training loss
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
+    
+    # Calculate total_steps for OneCycleLR
+    total_steps = epochs * len(train_dataloader)
+    
+    # Use OneCycleLR scheduler
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, div_factor=25)
 
     if os.path.exists(model_path):
         print(f"Loading saved model from {model_path} to resume training...")
@@ -287,7 +299,7 @@ def train(
     model.to(device)
 
     # Initialize history dictionaries for both training and validation
-    train_history: Dict[str, List[float]] = {"total": [], "pos": [], "vel": [], "cos": [], "zupt": [], "reg": [], "cov": []}
+    train_history: Dict[str, List[float]] = {"total": [], "pos": [], "vel": [], "cos": [], "zupt": [], "reg": [], "cov": [], "lr": []}
 
 
     print(f"Start Training for {model_name} on {device}...")
@@ -309,7 +321,11 @@ def train(
 
         # --- Training Loop ---
         model.train() # Set model to training mode
-        epoch_train_losses: Dict[str, float] = {k: 0.0 for k in train_history.keys()}
+        epoch_train_losses: Dict[str, float] = {k: 0.0 for k in train_history.keys() if k != "lr"}
+        # Add weighted loss keys for tracking
+        for k in ["pos", "vel", "cos", "zupt", "reg", "cov"]:
+            epoch_train_losses[f"w_{k}"] = 0.0
+
         pbar_train = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
 
         for batch in pbar_train:
@@ -353,29 +369,34 @@ def train(
                 # we can use a small weight or just add it.
                 # Let's add it to total loss and log it under 'reg' (accumulating).
                 # Assuming reg_weight is appropriate for this too (it's usually small, e.g., 1e-4).
-                loss += reg_weight * pen_tip_loss
+                weighted_pen_tip = reg_weight * pen_tip_loss
+                loss += weighted_pen_tip
                 sub_losses["reg"] = sub_losses.get("reg", 0.0) + pen_tip_loss.item()
+                sub_losses["w_reg"] = sub_losses.get("w_reg", 0.0) + weighted_pen_tip.item()
 
 
             if not torch.isnan(loss):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step() # Step the scheduler after each batch
 
             epoch_train_losses["total"] += loss.item() if not torch.isnan(loss) else 0
             pbar_train_postfix: Dict[str, float] = {"L": loss.item()}
             for k, v in sub_losses.items():
                 if k in epoch_train_losses:
                     epoch_train_losses[k] += v if not np.isnan(v) else 0
-                pbar_train_postfix[f"L_{k}"] = v
+                if not k.startswith("w_"): # Only show raw losses in progress bar
+                    pbar_train_postfix[f"L_{k}"] = v
             pbar_train.set_postfix(pbar_train_postfix)
 
         for k in train_history.keys():
             if k in epoch_train_losses:
                 train_history[k].append(epoch_train_losses[k] / len(train_dataloader))
-
-        # Adjust learning rate based on training total loss
-        scheduler.step(train_history["total"][-1])
+        
+        # Log Learning Rate
+        current_lr = optimizer.param_groups[0]['lr']
+        train_history["lr"].append(current_lr)
 
         # Calculate weights for logging
         with torch.no_grad():
@@ -386,15 +407,21 @@ def train(
             w_zupt = torch.exp(-criterion.log_var_zupt).item()
             w_cov = torch.exp(-criterion.log_var_cov).item()
 
-        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f}"
+        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | LR={current_lr:.2e}"
+        
+        total_sum = epoch_train_losses["total"]
+        def get_pct(key):
+            val = epoch_train_losses.get(f"w_{key}", 0.0)
+            return (val / total_sum) * 100.0 if total_sum > 0 else 0.0
+
         if model_name != "only_tcn":
             # log_str += f" | Train_Pos={train_history['pos'][-1]:.4f}" # Commented out as pos_loss is removed
-            log_str += f" | Train_Vel={train_history['vel'][-1]:.4f}"
-            log_str += f" | Train_Cos={train_history['cos'][-1]:.4f}"
+            log_str += f" | Train_Vel={train_history['vel'][-1]:.4f} ({get_pct('vel'):.1f}%)"
+            log_str += f" | Train_Cos={train_history['cos'][-1]:.4f} ({get_pct('cos'):.1f}%)"
             # log_str += f" | Train_Phy={train_history['phy'][-1]:.4f}" # Commented out as phy_loss is removed
-            log_str += f"\n    Weights: Vel={w_vel:.3f} | Cos={w_cos:.3f} | ZUPT={w_zupt:.3f} | Cov={w_cov:.3f}"
+            log_str += f"\n    Weights: Vel={w_vel:.3f} | Cos={w_cos:.3f} | ZUPT={w_zupt:.3f} ({get_pct('zupt'):.1f}%) | Cov={w_cov:.3f} ({get_pct('cov'):.1f}%) | Reg=({get_pct('reg'):.1f}%)"
         else:
-            log_str += f" | Weight_Pos={w_pos:.3f}"
+            log_str += f" | Weight_Pos={w_pos:.3f} ({get_pct('pos'):.1f}%)"
         print(log_str)
 
     torch.save(model.state_dict(), model_path)
