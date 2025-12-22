@@ -73,10 +73,10 @@ extern "C" void app_main(void) {
             // NOTE: For best Allan Variance results, use the widest range possible
             // to avoid clipping, even though the device is stationary.
             .accelerometer_range = Imu::AccelerometerRange::RANGE_16G,
-            .accelerometer_odr = Imu::AccelerometerODR::ODR_400_HZ,
+            .accelerometer_odr = Imu::AccelerometerODR::ODR_50_HZ,
             .accelerometer_bandwidth = Imu::AccelerometerBandwidth::NORMAL_AVG4,
             .gyroscope_range = Imu::GyroscopeRange::RANGE_2000DPS,
-            .gyroscope_odr = Imu::GyroscopeODR::ODR_400_HZ,
+            .gyroscope_odr = Imu::GyroscopeODR::ODR_50_HZ,
             .gyroscope_bandwidth = Imu::GyroscopeBandwidth::NORMAL_MODE,
             .gyroscope_performance_mode = Imu::GyroscopePerformanceMode::PERFORMANCE_OPTIMIZED,
             .enable_advanced_features = true,

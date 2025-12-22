@@ -28,6 +28,7 @@ class AEKFTCN_model(BaseFilterTCNModel):
         tcn_num_channels: list = Config.AEKFTCN.TCN_NUM_CHANNELS,
         tcn_kernel_size: int = Config.AEKFTCN.TCN_KERNEL_SIZE,
         tcn_dropout: float = Config.AEKFTCN.TCN_DROPOUT,
+        tcn_dilation_factors: Optional[List[int]] = Config.AEKFTCN.TCN_DILATION_FACTORS,
         dt: float = Config.DT,
         separable: bool = Config.AEKFTCN.USE_SEPARABLE_CONV,
     ) -> None:
@@ -37,6 +38,7 @@ class AEKFTCN_model(BaseFilterTCNModel):
             kernel_size=tcn_kernel_size,
             dropout=tcn_dropout,
             device=device,
+            tcn_dilation_factors=tcn_dilation_factors,
             dt=dt,
             loop_type="open",
             separable=separable,

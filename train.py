@@ -9,7 +9,6 @@ data augmentation, adaptive learning rate scheduling, and comprehensive logging
 of training history, ultimately saving the trained model and loss plots.
 """
 
-
 import argparse
 import math
 import os
@@ -284,11 +283,11 @@ def train(
     criterion: nn.Module = UncertaintyLoss(device=device)
 
     # Ensure the learnable loss parameters are included in the optimizer
-    optimizer = torch.optim.Adam(list(model.parameters()) + list(criterion.parameters()), lr=lr)
-    
+    optimizer = torch.optim.AdamW(list(model.parameters()) + list(criterion.parameters()), lr=lr)
+
     # Calculate total_steps for OneCycleLR
     total_steps = epochs * len(train_dataloader)
-    
+
     # Use OneCycleLR scheduler
     scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, div_factor=25)
 
@@ -393,7 +392,7 @@ def train(
         for k in train_history.keys():
             if k in epoch_train_losses:
                 train_history[k].append(epoch_train_losses[k] / len(train_dataloader))
-        
+
         # Log Learning Rate
         current_lr = optimizer.param_groups[0]['lr']
         train_history["lr"].append(current_lr)
@@ -408,7 +407,7 @@ def train(
             w_cov = torch.exp(-criterion.log_var_cov).item()
 
         log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | LR={current_lr:.2e}"
-        
+
         total_sum = epoch_train_losses["total"]
         def get_pct(key):
             val = epoch_train_losses.get(f"w_{key}", 0.0)
@@ -486,11 +485,11 @@ def main() -> None:
     """Main function to parse arguments, set up training, and start the training process."""
     parser = argparse.ArgumentParser(description="Train various trajectory estimation models.")
     parser.add_argument("--model", type=str, default="eskf_tcn", choices=["eskf_tcn", "aekf_tcn", "only_tcn"], help="Type of model to train.")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for physics loss warmup.") # Added arg
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
+    parser.add_argument("--device", type=str, default="mps" if torch.cuda.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
     args, _ = parser.parse_known_args()
 
     # Note: Most loss weights are now learned automatically. Only `reg_weight` remains.

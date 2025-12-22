@@ -27,6 +27,7 @@ from model.config import Config
 from model.dataset import TrajectoryDataset
 from model.ESKF_TCN import ESKFTCN_model
 from model.onlyTCN import OnlyTCN
+from model.rotation_utils import *
 
 
 def load_model(

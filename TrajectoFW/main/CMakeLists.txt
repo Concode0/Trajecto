@@ -1,9 +1,6 @@
 idf_component_register(
     SRCS
-        "main.cpp"
-        "eskf.cpp"
-        "tcn_wrapper.cpp"
-        "tcn_model.cc"
+        "data_acquire.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         espp__bmi270

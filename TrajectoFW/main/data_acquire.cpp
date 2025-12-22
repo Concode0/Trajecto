@@ -217,7 +217,7 @@ extern "C" void app_main(void) {
     fsr_io_conf.pin_bit_mask = (1ULL << FSR_ENABLE_PIN);
     gpio_config(&fsr_io_conf);
     // and set it high
-    gpio_set_level(FSR_ENABLE_PIN, 1); // When High 10M, Low 10k
+    gpio_set_level(FSR_ENABLE_PIN, 0); // When High 10M, Low 10k
 
     // FSR ADC configuration
     static constexpr auto FSR_ADC_UNIT = ADC_UNIT_1;
@@ -277,10 +277,10 @@ extern "C" void app_main(void) {
         .imu_config =
             {
                 .accelerometer_range = Imu::AccelerometerRange::RANGE_4G,
-                .accelerometer_odr = Imu::AccelerometerODR::ODR_400_HZ,
+                .accelerometer_odr = Imu::AccelerometerODR::ODR_50_HZ,
                 .accelerometer_bandwidth = Imu::AccelerometerBandwidth::NORMAL_AVG4,
                 .gyroscope_range = Imu::GyroscopeRange::RANGE_1000DPS,
-                .gyroscope_odr = Imu::GyroscopeODR::ODR_400_HZ,
+                .gyroscope_odr = Imu::GyroscopeODR::ODR_50_HZ,
                 .gyroscope_bandwidth = Imu::GyroscopeBandwidth::NORMAL_MODE,
                 .gyroscope_performance_mode = Imu::GyroscopePerformanceMode::PERFORMANCE_OPTIMIZED,
                 .enable_advanced_features = true,
@@ -319,7 +319,7 @@ extern "C" void app_main(void) {
     // Hook the ISR handler for our specific GPIO pin
     gpio_isr_handler_add(interrupt_pin, isr_handler, nullptr);
 
-    static SensorData batch_buffer[3]; 
+    static SensorData batch_buffer[3];
     static int batch_idx = 0;
 
     // make a task to read out the IMU data and print it to console
@@ -365,7 +365,7 @@ extern "C" void app_main(void) {
                 if (is_connected && should_send_data) {
                     gpio_set_level(DATA_LED_PIN, 1);
                     struct os_mbuf *txom = ble_hs_mbuf_from_flat(batch_buffer, sizeof(batch_buffer));
-                
+
                     if (trajecto_chr_val_handle != 0) {
                         int rc = ble_gatts_notify_custom(conn_handle, trajecto_chr_val_handle, txom);
                         if (rc != 0) {
@@ -387,14 +387,6 @@ extern "C" void app_main(void) {
           .priority = 10,
           .core_id = 0,
       }});
-
-  // print the header for the IMU data (for plotting)
-  fmt::print("% Time (s), "
-             // raw IMU data (accel, gyro, temp)
-             "Accel X (g), Accel Y (g), Accel Z (g), "
-             "Gyro X (°/s), Gyro Y (°/s), Gyro Z (°/s), "
-             "Temp (°C), "
-             "FSR (raw)");
 
   logger.info("Starting tasks...");
   imu_task.start();

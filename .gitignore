@@ -6,13 +6,13 @@ dist/
 wheels/
 data/
 Firmware/
-.vscode/
+.vscode
 acquired_data/
 data/
-.vscode
 .gitignore
 *.egg-info
-docs/
+results/
+GEMINI.md
 
 # Virtual environments
 .venv

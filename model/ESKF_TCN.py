@@ -44,7 +44,7 @@ class ESKFTCN_model(BaseFilterTCNModel):
         kernel_size: int = Config.ESKFTCN.KERNEL_SIZE,
         dropout: float = Config.ESKFTCN.DROPOUT,
         device: str = "cpu",
-        tcn_dilation_factors: Optional[List[int]] = None,
+        tcn_dilation_factors: Optional[List[int]] = Config.ESKFTCN.TCN_DILATION_FACTORS,
         dt: float = Config.DT,
         use_zupt: bool = Config.ESKFTCN.USE_ZUPT,
         use_tcn_zupt: bool = Config.ESKFTCN.USE_TCN_ZUPT,
