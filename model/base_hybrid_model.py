@@ -11,7 +11,7 @@ or open-loop configuration.
 
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -407,19 +407,24 @@ class BaseFilterTCNModel(nn.Module):
 
         # --- Helper for padding sequences ---
         def pad_sequence(
-            seq: List[torch.Tensor], final_dim: int, dtype: torch.dtype
+            seq: List[torch.Tensor], final_dim: Union[int, Tuple[int, ...]], dtype: torch.dtype
         ) -> torch.Tensor:
             """Pads a list of tensors to a consistent sequence length for concatenation."""
+            if isinstance(final_dim, int):
+                shape_suffix = (final_dim,)
+            else:
+                shape_suffix = final_dim
+
             if not seq:
                 # If sequence is empty, return a zero tensor of the expected final shape.
                 return torch.zeros(
-                    batch_size, seq_len, final_dim, device=self.device, dtype=dtype
+                    batch_size, seq_len, *shape_suffix, device=self.device, dtype=dtype
                 )
             # Calculate how many initial time steps were skipped (due to TCN receptive field).
             num_missing = seq_len - len(seq)
             # Create padding tensor for the skipped steps.
             padding_tensor = torch.zeros(
-                batch_size, num_missing, final_dim, device=self.device, dtype=dtype
+                batch_size, num_missing, *shape_suffix, device=self.device, dtype=dtype
             )
             stacked_seq = torch.stack(seq, dim=1)
             return torch.cat([padding_tensor, stacked_seq], dim=1)
@@ -440,6 +445,14 @@ class BaseFilterTCNModel(nn.Module):
         pred_covariance_R = pad_sequence(pred_covariance_R_seq, 6, imu_data_raw.dtype)
         filter_innovation = pad_sequence(filter_innovation_seq, 6, imu_data_raw.dtype)
         stacked_filter_vel_w = torch.stack(filter_vel_w_seq, dim=1)
+        
+        # Pad and stack P_error sequence
+        # Determine covariance shape dynamically
+        cov_shape = (15, 15) # Default ESKF
+        if P_error_seq:
+            cov_shape = P_error_seq[0].shape[1:]
+        
+        stacked_P_error = pad_sequence(P_error_seq, cov_shape, imu_data_raw.dtype)
 
         # --- Final Trajectory Calculation (Open-loop vs. Closed-loop) ---
         final_pen_tip_trajectory_w: torch.Tensor
@@ -492,5 +505,6 @@ class BaseFilterTCNModel(nn.Module):
             "filter_vel_w": stacked_filter_vel_w,
             "filter_quat": quaternions_b_to_w,
             "filter_innovation": filter_innovation,
+            "filter_covariance": stacked_P_error,
             "tcn_output_mask": tcn_output_mask,
         }

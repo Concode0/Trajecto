@@ -39,7 +39,7 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         do_augment: bool = False,
         noise_std: float = 0.01,
         scale_range: tuple = (0.9, 1.1),
-        yaw_range: tuple = (-3.14, 3.14),
+        yaw_range: tuple = (-0.78, 0.78), # Control Rotation
     ) -> None:
         """Initializes the TrajectoryDataset.
 
@@ -135,34 +135,34 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         real_idx = idx % self.num_original_samples
         data = self.cached_data[real_idx]
 
-        sensor_data = data["sensor"].clone()
-        pos_data = data["pos"].clone()
-        vel_data = data["vel"].clone()
+        sensor_data = data["sensor"].clone()  # Shape: (Seq, 7) [Acc(3), Gyro(3), FSR(1)]
+        pos_data = data["pos"].clone()        # Shape: (Seq, 3)
+        vel_data = data["vel"].clone()        # Shape: (Seq, 3)
 
         if self.do_augment and idx >= self.num_original_samples:
-            # Apply random yaw rotation to Ground Truth (World Frame) ONLY.
-            # We do NOT rotate sensor_data because that would simulate a different
-            # sensor mounting/grip (Body Frame), which doesn't correlate 1:1 with
-            # World Frame trajectory rotation.
-            # We do NOT scale data because scaling accelerometer scales gravity (9.81),
-            # violating the physics model.
             yaw = torch.rand(1) * (self.yaw_range[1] - self.yaw_range[0]) + self.yaw_range[0]
-            cos_yaw = torch.cos(yaw)
-            sin_yaw = torch.sin(yaw)
-            # Yaw rotation matrix (World Frame rotation around Z-axis)
+            cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+
+            # Yaw Rotation Matrix
             rot_mat = torch.tensor([
                 [cos_yaw, -sin_yaw, 0],
                 [sin_yaw, cos_yaw, 0],
                 [0, 0, 1]
             ]).float()
 
-            # Rotate position and velocity (World Frame)
+            # Rotate GT Data
             pos_data = (rot_mat @ pos_data.T).T
             vel_data = (rot_mat @ vel_data.T).T
 
-            # Add noise to sensor data
-            noise = torch.randn_like(sensor_data[:, :6]) * self.noise_std
-            sensor_data[:, :6] += noise
+            # Rotate Sensor Data
+            accel_rot = (rot_mat @ sensor_data[:, :3].T).T
+            gyro_rot = (rot_mat @ sensor_data[:, 3:6].T).T
+            sensor_data[:, :3] = accel_rot
+            sensor_data[:, 3:6] = gyro_rot
+
+            # Inject Noise in all channels
+            noise = torch.randn_like(sensor_data) * self.noise_std
+            sensor_data += noise
 
         return {
             "imu_seq_raw": sensor_data,

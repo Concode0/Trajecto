@@ -1,51 +1,60 @@
 # Trajecto: 3D Pen Trajectory Reconstruction
 
-[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)
-![ESP32](https://img.shields.io/badge/ESP32-C3-green)
-![Embedded](https://img.shields.io/badge/Embedded-Firmware-red)
+**Trajecto** is a high-precision handwriting trajectory estimation system that reconstructs 3D pen movements using a single 6-axis IMU (BMI270).
 
-Trajecto is a comprehensive system for robust 3D pen trajectory reconstruction from a single IMU sensor. It combines classic state estimation techniques with deep learning to overcome the inherent drift problem in inertial sensors, enabling accurate tracking of movement in 3D space.
+It utilizes a **Hybrid Architecture** combining Deep Learning (Temporal Convolutional Networks) with Physics-based Filtering (ESKF/AEKF) to overcome the inherent drift of low-cost inertial sensors. The system is designed for **Sim2Real** deployment, featuring a complete pipeline from PyTorch training to optimized C++ inference on ESP32 microcontrollers.
 
 ## Features
 
-- **Hybrid Models**: Implements hybrid architectures combining Kalman Filters (ESKF, AEKF) with a Temporal Convolutional Network (TCN) for state-of-the-art drift correction.
-- **Standalone Model**: Includes a pure TCN model (`OnlyTCN`) for a direct deep learning-based approach.
-- **Data Pipeline**: Full pipeline from data acquisition, preprocessing, training, to visualization.
-- **Embedded Firmware**: Contains the firmware for the ESP32-based data acquisition hardware.
-- **Pressure-based ZUPT**: Utilizes a pressure sensor for robust Zero-Velocity Updates, significantly improving tracking accuracy during pauses.
+- **Hybrid Physics+AI Models**: Integrates Error-State Kalman Filters (ESKF) with TCNs to correct velocity and orientation errors in real-time.
+- **Robust Data Protocol**: Implements a strict "Tap-Wait-Write" acquisition protocol for reliable synchronization and gravity alignment.
+- **Embedded Inference**: Fully optimized C++ port for ESP32-S3 using TFLite Micro with INT8 quantization and stateful buffering.
+- **Sim2Real Pipeline**: Automated tools for exporting PyTorch models to ONNX, TFLite, and C++ arrays.
+- **Advanced ZUPT**: Zero-Velocity Update detection to minimize drift during stationary periods.
 
 ## System Architecture
 
-The core of this project lies in its hybrid modeling approach to trajectory reconstruction. By combining physical models (Kalman Filters) with data-driven deep learning models (TCN), Trajecto achieves high-precision 3D trajectories.
+The system estimates a 15-dimensional Error State to correct the inertial integration:
 
-### Models
-- **ESKF-TCN**: An Error-State Kalman Filter provides a robust trajectory baseline, which is then corrected by a TCN that learns to compensate for non-linear errors.
-- **AEKF-TCN**: An Adaptive Extended Kalman Filter-based hybrid model.
-- **OnlyTCN**: A standalone TCN that directly predicts the 3D trajectory from IMU data.
+1.  **Input**: 6-axis IMU data (Accel, Gyro) in the Body Frame.
+2.  **TCN Engine**: Extracts features and predicts corrections (velocity residuals, zero-velocity probability).
+3.  **Filter (ESKF/AEKF)**: Fuses raw IMU physics with TCN predictions.
+    -   **State**: Position, Velocity, Orientation (Quaternion), Accel Bias, Gyro Bias.
+    -   **Output**: Trajectory in the World Frame (NED).
 
-## Repository Structure
+## Data Acquisition Protocol (CRITICAL)
 
-```
+All data collection must strictly follow the **"Tap-Wait-Write"** protocol to ensure valid initialization:
+
+1.  **Tap**: A sharp acceleration spike used for temporal synchronization.
+2.  **Skip**: ~0.5s after Tap is discarded to avoid impact vibration.
+3.  **Static Buffer (Leveling)**: ~1.5s of static data is **KEPT** to initialize gravity alignment and sensor biases.
+4.  **Write**: The actual handwriting motion.
+
+## Directory Structure
+
+```text
 Trajecto/
-├── TrajectoFW/         # Firmware for the ESP32-based hardware
-├── acquired_data/      # Raw data from the data acquisition scripts
-├── collection/         # Scripts for data acquisition
-├── data/               # Processed and training-ready data
-├── model/              # Model implementations (ESKF, AEKF, TCNs)
-├── plots/              # Saved plots from training and visualization
-├── utils/              # Utility scripts for preprocessing and visualization
-├── train.py            # Main script for training the models
-├── README.md           # This file
-└── pyproject.toml      # Project dependencies
+├── acquired_data/      # Raw CSV data from sensors
+├── analyzer/           # Julia-based offline analysis tools
+├── data/               # Training datasets and stats
+├── docs/               # Documentation
+├── firmware/           # ESP32 C++ Firmware (ESP-IDF)
+├── model/              # PyTorch Model definitions (ESKF, TCN, etc.)
+├── onnx_export/        # Exported ONNX models
+├── utils/              # Utility scripts (Acquisition, Export, Visualization)
+├── Embedded_Porting.md # Detailed guide for ESP32 deployment
+├── GEMINI.md           # Project Context & Standards
+├── train.py            # Main training script
+└── pyproject.toml      # Project dependencies (managed by uv)
 ```
 
 ## Getting Started
 
 ### Prerequisites
 - Python 3.9+
-- `uv` package manager (`pip install uv`)
+- [uv](https://github.com/astral-sh/uv) package manager
+- ESP-IDF (for firmware development)
 
 ### Installation
 
@@ -55,66 +64,64 @@ Trajecto/
     cd Trajecto
     ```
 
-2.  **Create and activate a virtual environment:**
+2.  **Sync dependencies:**
+    Trajecto uses `uv` for fast dependency management.
     ```bash
-    uv venv
+    uv sync
     source .venv/bin/activate
     ```
 
-3.  **Install dependencies:**
-    ```bash
-    uv pip install -r requirements.txt
-    ```
-    *(Note: If a `requirements.txt` is not present, you may need to generate it from `pyproject.toml` or install dependencies from it directly if your toolchain supports it.)*
-
 ## Workflow
 
-The project follows a standard machine learning workflow.
-
 ### 1. Data Acquisition
-Raw trajectory data can be collected using the scripts in the `collection/` directory. These scripts interface with the hardware to gather IMU and pressure sensor data.
-- `collection/data_acquire.py`: Main script to start data acquisition.
+Use the utility scripts to collect training data from the device over BLE/Serial.
+- `utils/acquire.py`: Main script for data collection.
+- `utils/receive.py`: Passive receiver script.
 
-### 2. Preprocessing
-Once raw data is collected, it needs to be preprocessed into a format suitable for training.
-- `utils/preprocess.py`: This script cleans the raw data, computes features, and creates the final HDF5 dataset (`dataset.h5`) used for training.
+### 2. Training
+Train the hybrid models using `train.py`. The script handles data loading and augmentation.
 
-### 3. Training
-Train the models using the `train.py` script. You can specify which model to train using command-line arguments.
-
-**Train the ESKF-TCN model:**
 ```bash
+# Train ESKF-TCN (Standard Hybrid)
 python train.py --model eskf_tcn --epochs 200 --lr 1e-4
+
+# Train Standalone TCN
+python train.py --model only_tcn --epochs 200
 ```
 
-**Train the AEKF-TCN model:**
-```bash
-python train.py --model aekf_tcn --epochs 200 --lr 1e-4
-```
+### 3. Visualization
+Visualize the reconstructed 3D trajectories:
+- `utils/h5_viewer.py`: Interactive TUI for viewing HDF5 datasets.
+- `utils/check_data.py`: Quick validation of data integrity.
 
-**Train the OnlyTCN model:**
-```bash
-python train.py --model only_tcn --epochs 200 --lr 1e-4
-```
-The trained model weights (`.pth` file) and loss history plots will be saved.
+### 4. Embedded Deployment (Sim2Real)
+To deploy the trained model to the ESP32:
 
-### 4. Visualization
-After training, you can visualize the performance of your model on test data.
-- `utils/visualize.py`: This script loads a trained model and a data sample, runs inference, and generates 3D plots comparing the predicted trajectory to the ground truth.
+1.  **Train**: Generate `results/eskf_tcn_model.pth`.
+2.  **Export**: `python utils/export_onnx.py` -> `onnx_export/tcn_model.onnx`.
+3.  **Convert**: `python utils/convert_tflite.py` -> `firmware/main/tcn_model_dynamic_range_quant.tflite`.
+4.  **Flash**: Build and flash the `firmware/` project.
+
+*See [Embedded_Porting.md](Embedded_Porting.md) for the complete step-by-step guide.*
+
+## Hardware
+
+The system uses a custom PCB with an ESP32-S3 and BMI270 IMU.
+Design files are available in the `hardware/` directory.
+
+| Top View | Bottom View |
+| :---: | :---: |
+| ![Top](hardware/images/Trajecto-Board-Top.png) | ![Bottom](hardware/images/Trajecto-Board-Bottom.png) |
 
 ## Firmware
 
-The `TrajectoFW/` directory contains the C++ firmware for the ESP32-C3 based custom hardware. It uses the ESP-IDF framework. For more details on building and flashing the firmware, see the `README.md` inside the `TrajectoFW` directory.
+The `firmware/` directory contains the C++ implementation for the ESP32-S3.
+- **Framework**: ESP-IDF
+- **Inference**: TFLite Micro (INT8/Dynamic Quantization)
+- **Math**: Eigen (for Kalman Filtering)
 
 ## License
 
-This work is licensed under a **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License**.
+This work is licensed under the **GNU General Public License v3.0**.
 
-<a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/">
-    <img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-sa/4.0/88x31.png" />
-</a>
-
-## References & Acknowledgements
-
-* **Code Implementation:**
-  * Based on [h5viewer](https://github.com/kszenes/h5tui)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
