@@ -1,0 +1,7 @@
+firmware/components/** linguist-vendored
+firmware/managed_components/** linguist-vendored
+firmware/build/** linguist-vendored
+
+docs/** linguist-documentation
+
+*.gen.c linguist-generated
