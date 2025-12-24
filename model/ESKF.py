@@ -62,10 +62,6 @@ class ErrorStateKalmanFilter(nn.Module):
         obs_dim: int = 6,  # 3 accel + 3 gyro
         dt: float = Config.DT,
         device: str = "cpu",
-        zupt_window_size: int = Config.ZUPT_WINDOW_SIZE,
-        zupt_accel_threshold: float = Config.ZUPT_ACCEL_THRESHOLD,
-        zupt_force_var_threshold: float = Config.ZUPT_FORCE_VAR_THRESHOLD,
-        zupt_force_delta_threshold: float = Config.ZUPT_FORCE_DELTA_THRESHOLD,
         use_zupt: bool = True,
         use_tcn_zupt: bool = False,
     ):
@@ -79,10 +75,6 @@ class ErrorStateKalmanFilter(nn.Module):
                 3-axis accelerometer and 3-axis gyroscope measurements.
             dt: Time step (delta time) in seconds.
             device: The compute device ('cpu', 'cuda', 'mps').
-            zupt_window_size: Number of samples for ZUPT variance check.
-            zupt_accel_threshold: Accelerometer variance threshold for ZUPT.
-            zupt_force_var_threshold: Force variance threshold for ZUPT.
-            zupt_force_delta_threshold: Force delta threshold for ZUPT.
             use_zupt: Boolean flag to enable or disable traditional ZUPT detection.
             use_tcn_zupt: Boolean flag to enable ZUPT decisions based on TCN output.
         """
@@ -201,37 +193,33 @@ class ErrorStateKalmanFilter(nn.Module):
         accel_b_corrected = accel_b_raw - accel_bias_b
 
         # --- Quaternion propagation (orientation update) ---
-        # The quaternion derivative is q_dot = 0.5 * q * [0; omega], where omega
-        # is the angular velocity. This is the kinematic equation describing how
-        # the quaternion changes with angular velocity.
-        q_dot = 0.5 * quaternion_multiply(
-            quat_b_to_w,
-            torch.cat(
-                [
-                    torch.zeros_like(gyro_b_corrected[..., :1]),
-                    gyro_b_corrected,
-                ],
-                dim=-1,
-            ),
-        )
-        # Integrate using Euler method: q_new = q_old + q_dot * dt and normalize.
-        quat_b_to_w_new = F.normalize(
-            quat_b_to_w + q_dot * self.dt, p=2, dim=-1
-        )
+        # Trapezoidal Integration (Exponential Map):
+        # Instead of linearizing using q_dot, we use the exact solution for constant
+        # angular velocity over the interval dt. This is equivalent to the exponential map.
+        # q_new = q_old * Exp(omega * dt)
+        angle_change = gyro_b_corrected * self.dt
+        delta_quat = small_angle_to_quaternion(angle_change)
+        quat_b_to_w_new = quaternion_multiply(quat_b_to_w, delta_quat)
 
-        # --- Acceleration in World Frame ---
-        # Rotate the corrected body-frame acceleration to the world frame and
-        # subtract gravity to get pure kinematic acceleration.
+        # --- Acceleration in World Frame (Old State) ---
         rot_mat_b_to_w = quaternion_to_rotation_matrix(quat_b_to_w)
         accel_w = (
             rot_mat_b_to_w @ accel_b_corrected.unsqueeze(-1)
         ).squeeze(-1) - self.gravity_w
 
-        # --- Position and Velocity Integration ---
-        # p_new = p_old + v_old * dt + 0.5 * a_old * dt^2
-        pos_w_new = pos_w + vel_w * self.dt + 0.5 * accel_w * (self.dt**2)
-        # v_new = v_old + a_old * dt
-        vel_w_new = vel_w + accel_w * self.dt
+        # --- Acceleration in World Frame (New State) ---
+        # We re-compute acceleration with the updated orientation to apply the Trapezoidal Rule.
+        rot_mat_b_to_w_new = quaternion_to_rotation_matrix(quat_b_to_w_new)
+        accel_w_new = (
+            rot_mat_b_to_w_new @ accel_b_corrected.unsqueeze(-1)
+        ).squeeze(-1) - self.gravity_w
+
+        # --- Position and Velocity Integration (Trapezoidal Rule) ---
+        # v_new = v_old + 0.5 * (a_old + a_new) * dt
+        vel_w_new = vel_w + 0.5 * (accel_w + accel_w_new) * self.dt
+
+        # p_new = p_old + 0.5 * (v_old + v_new) * dt
+        pos_w_new = pos_w + 0.5 * (vel_w + vel_w_new) * self.dt
 
         # Biases are modeled as random walks, so their nominal values do not
         # change during deterministic propagation. Their uncertainty evolution is
@@ -296,11 +284,17 @@ class ErrorStateKalmanFilter(nn.Module):
         F_error_matrix[:, 6:9, 9:12] = -torch.eye(3, device=self.device) * self.dt
 
         # --- 2. Get Q_error: The Process Noise Covariance Matrix ---
-        # This matrix quantifies the uncertainty introduced by the system model.
-        Q_error_matrix = self.get_Q().unsqueeze(0)
+        # We use a trapezoidal integration approximation for the discrete-time Q matrix:
+        # Q_k ≈ 0.5 * (F * Q_continuous * F^T + Q_continuous) * dt
+        # This provides a higher-order approximation than the simple Q_continuous * dt.
+        Q_continuous = torch.diag(self.Q_diag).unsqueeze(0).expand(batch_size, -1, -1)
+        
+        Q_error_matrix = 0.5 * (
+            F_error_matrix @ Q_continuous @ F_error_matrix.transpose(-2, -1) + Q_continuous
+        ) * self.dt
 
         # --- 3. Predict Covariance ---
-        # P_k|k-1 = F * P_k-1|k-1 * F^T + Q
+        # P_k|k-1 = F * P_k-1|k-1 * F^T + Q_k
         P_predicted = (
             F_error_matrix @ P_error_covariance @ F_error_matrix.transpose(-2, -1)
             + Q_error_matrix
@@ -467,7 +461,12 @@ class ErrorStateKalmanFilter(nn.Module):
 
             # R_zupt_scaled = min_R_val / (clamped_prob + 1e-6)  # Alternative scaling
             R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
-            R_zupt_matrix = torch.diag_embed(R_zupt_scaled_diag.repeat(1, 3)) # Repeat for 3 velocity components
+            
+            # Ensure R_zupt_scaled_diag has shape (Batch, 3)
+            if R_zupt_scaled_diag.shape[-1] == 1:
+                R_zupt_scaled_diag = R_zupt_scaled_diag.repeat(1, 3)
+                
+            R_zupt_matrix = torch.diag_embed(R_zupt_scaled_diag) # (Batch, 3, 3)
         else:
             R_zupt_matrix = self.get_R_zupt().unsqueeze(0).expand(batch_size, -1, -1)
 
@@ -716,15 +715,15 @@ class ErrorStateKalmanFilter(nn.Module):
             # assumption that accel=gravity and gyro=0 (static) is invalid during
             # motion. Applying it indiscriminately fights the integration.
             # We only compute the innovation for feature logging/TCN input.
-            
+
             # Recompute necessary variables for innovation (normally done inside update)
             rot_mat_world_to_body = quaternion_to_rotation_matrix(quat_b_to_w_pred).transpose(-2, -1)
             gravity_body = (rot_mat_world_to_body @ self.gravity_w.unsqueeze(0).T).squeeze(-1)
-            
+
             accel_pred = gravity_body + accel_bias_b_pred
             gyro_pred = gyro_bias_b_pred
             h_predicted = torch.cat([accel_pred, gyro_pred], dim=-1)
-            
+
             innovation_output = measurement - h_predicted
             # No delta_x update or P_error update in this branch.
 
