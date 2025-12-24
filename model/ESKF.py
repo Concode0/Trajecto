@@ -26,6 +26,7 @@ from rotation_utils import (
     quaternion_multiply,
     quaternion_to_rotation_matrix,
     small_angle_to_quaternion,
+    quaternion_from_two_vectors,
 )
 from zupt_detector import ZuptDetector
 from config import Config
@@ -288,7 +289,7 @@ class ErrorStateKalmanFilter(nn.Module):
         # Q_k ≈ 0.5 * (F * Q_continuous * F^T + Q_continuous) * dt
         # This provides a higher-order approximation than the simple Q_continuous * dt.
         Q_continuous = torch.diag(self.Q_diag).unsqueeze(0).expand(batch_size, -1, -1)
-        
+
         Q_error_matrix = 0.5 * (
             F_error_matrix @ Q_continuous @ F_error_matrix.transpose(-2, -1) + Q_continuous
         ) * self.dt
@@ -311,7 +312,8 @@ class ErrorStateKalmanFilter(nn.Module):
         gyro_bias_b: torch.Tensor,
         measurement: torch.Tensor,
         R_override: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gating_threshold: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Updates the error state and its covariance based on a measurement.
 
         This function performs the measurement update (correction) step of the ESKF.
@@ -323,12 +325,14 @@ class ErrorStateKalmanFilter(nn.Module):
             gyro_bias_b: Current nominal gyroscope bias.
             measurement: The actual 6-dimensional sensor measurement (z_k).
             R_override: Optional override for the measurement noise covariance (R_k).
+            gating_threshold: Optional Mahalanobis distance threshold for gating.
 
         Returns:
             A tuple containing:
                 - delta_x: The estimated 15-dimensional error state (δx_k|k).
                 - P_error_new: The updated 15x15 error covariance matrix (P_k|k).
                 - innovation: The measurement innovation (y_k).
+                - mahalanobis_sq: The squared Mahalanobis distance (d^2).
         """
         batch_size = P_error_pred.shape[0]
 
@@ -398,6 +402,15 @@ class ErrorStateKalmanFilter(nn.Module):
         # Update error state: δx_k|k = K_k * y_k
         delta_x = (K_gain @ innovation.unsqueeze(-1)).squeeze(-1)
 
+        # Calculate Mahalanobis Distance (squared): d^2 = y^T * S^-1 * y
+        # solve S * x = y for x.
+        innovation_unsq = innovation.unsqueeze(-1)
+        # Re-use S_matrix (already inverted implicitly above? No, solved against H@P.T)
+        # We need to solve S * x = innovation
+        sol_x = torch.linalg.solve(S_matrix, innovation_unsq)
+        # d^2 = innovation^T * x
+        mahalanobis_sq = (innovation.unsqueeze(1) @ sol_x).squeeze(-1).squeeze(-1) # Shape: (Batch,)
+
         # Update covariance using Joseph Form for numerical stability:
         # P_k|k = (I - K*H) * P_k|k-1 * (I - K*H)^T + K * R * K^T
         I_matrix = torch.eye(self.error_state_dim, device=self.device)
@@ -410,7 +423,15 @@ class ErrorStateKalmanFilter(nn.Module):
         # Enforce symmetry.
         P_error_new = self._make_symmetric(P_error_new)
 
-        return delta_x, P_error_new, innovation
+        # --- 5. Mahalanobis Gating ---
+        if gating_threshold is not None:
+             reject_mask = mahalanobis_sq > gating_threshold
+             # If rejected, delta_x should be 0 (no correction)
+             delta_x = torch.where(reject_mask.unsqueeze(-1), torch.zeros_like(delta_x), delta_x)
+             # If rejected, P should remain P_pred (no information gain)
+             P_error_new = torch.where(reject_mask.unsqueeze(-1).unsqueeze(-1), P_error_pred, P_error_new)
+
+        return delta_x, P_error_new, innovation, mahalanobis_sq
 
     def _calculate_zupt_update(
         self,
@@ -461,11 +482,11 @@ class ErrorStateKalmanFilter(nn.Module):
 
             # R_zupt_scaled = min_R_val / (clamped_prob + 1e-6)  # Alternative scaling
             R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
-            
+
             # Ensure R_zupt_scaled_diag has shape (Batch, 3)
             if R_zupt_scaled_diag.shape[-1] == 1:
                 R_zupt_scaled_diag = R_zupt_scaled_diag.repeat(1, 3)
-                
+
             R_zupt_matrix = torch.diag_embed(R_zupt_scaled_diag) # (Batch, 3, 3)
         else:
             R_zupt_matrix = self.get_R_zupt().unsqueeze(0).expand(batch_size, -1, -1)
@@ -656,7 +677,7 @@ class ErrorStateKalmanFilter(nn.Module):
                 - gyro_bias_b_new: (Batch, 3)
                 - accel_bias_b_new: (Batch, 3)
                 - P_error_final: (Batch, 15, 15)
-                - tcn_features: Dict with keys "body_velocity" (Batch, 3), "zupt_flag" (Batch, 1), "innovation" (Batch, 6)
+                - tcn_features: Dict with keys "body_velocity" (Batch, 3), "zupt_flag" (Batch, 1), "innovation" (Batch, 6), "mahalanobis" (Batch, 1)
         """
         # --- 1. Prediction Step ---
         pos_w_pred, vel_w_pred, quat_b_to_w_pred, gyro_bias_b_pred, accel_bias_b_pred = (
@@ -670,6 +691,7 @@ class ErrorStateKalmanFilter(nn.Module):
         P_error_final = P_error_pred
         total_delta_x = torch.zeros(pos_w.shape[0], self.error_state_dim, device=self.device, dtype=pos_w.dtype)
         innovation_output = torch.zeros(pos_w.shape[0], self.obs_dim, device=self.device, dtype=pos_w.dtype)
+        mahalanobis_output = torch.zeros(pos_w.shape[0], device=self.device, dtype=pos_w.dtype)
 
         # Determine if ZUPT should be applied.
         if self.use_tcn_zupt and tcn_output is not None:
@@ -703,12 +725,26 @@ class ErrorStateKalmanFilter(nn.Module):
             P_error_final = P_after_tcn
 
             # Standard Measurement Update (with TCN-provided adaptive R)
-            tcn_cov_diag = F.softplus(tcn_output["covariance_R"])
+            # TCN now predicts log(R), so use exp to get R
+            tcn_cov_diag = torch.exp(tcn_output["covariance_R"])
             R_tcn_override = torch.diag_embed(tcn_cov_diag)
-            delta_x_up, P_after_up, innovation = self.update(P_error_final, quat_b_to_w_pred, accel_bias_b_pred, gyro_bias_b_pred, measurement, R_override=R_tcn_override)
+
+            # Pass gating threshold from Config
+            gating_thresh = Config.ESKFTCN.MAHALANOBIS_GATE_THRESHOLD
+
+            delta_x_up, P_after_up, innovation, mahalanobis_sq = self.update(
+                P_error_final,
+                quat_b_to_w_pred,
+                accel_bias_b_pred,
+                gyro_bias_b_pred,
+                measurement,
+                R_override=R_tcn_override,
+                gating_threshold=gating_thresh
+            )
             total_delta_x += delta_x_up
             P_error_final = P_after_up
             innovation_output = innovation
+            mahalanobis_output = mahalanobis_sq
         else:
             # Standard Measurement Update (without TCN)
             # Logic Change: We DO NOT perform a standard update here because the
@@ -742,6 +778,7 @@ class ErrorStateKalmanFilter(nn.Module):
             "body_velocity": vel_body,
             "zupt_flag": is_zupt.float().unsqueeze(-1),
             "innovation": innovation_output,
+            "mahalanobis": mahalanobis_output.unsqueeze(-1),
         }
 
         return (pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new, accel_bias_b_new, P_error_final, tcn_features)
