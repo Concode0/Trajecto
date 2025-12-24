@@ -18,6 +18,8 @@ class Config:
     AUGMENT_MULTIPLIER = 1
     SUBSAMPLE_STEP = 1
     DO_AUGMENT = False
+    YAW_ANGLE = (-0.78, 0.78)   # Set small angle in first and increase when fine tunning.
+    SIGMA_TILT = 0.00           # Same ( Don't increase too large (0.02 ~ 0.52))
     SCALER_STATS_H5_PATH = "./data/scaler_stats.h5"
 
     # --- ZUPT Parameters (used by ESKF and AEKF) ---
@@ -44,7 +46,7 @@ class Config:
         TCN_CHANNELS = [64, 64, 64, 64]
         KERNEL_SIZE = 5
         DROPOUT = 0.1
-        TCN_DILATION_FACTORS = [1, 2, 4, 8] # Added TCN Dilation Factors
+        TCN_DILATION_FACTORS = [1, 4, 8, 16] # Added TCN Dilation Factors
         USE_ZUPT = False
         USE_TCN_ZUPT = True
         ADAPTIVE_GAIN_ESKF = 0.5 # Specific to ESKF's R adaptivity

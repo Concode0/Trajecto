@@ -40,6 +40,7 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         noise_std: float = 0.01,
         scale_range: tuple = (0.9, 1.1),
         yaw_range: tuple = (-0.78, 0.78), # Control Rotation
+        sigma_tilt: float = 0.00
     ) -> None:
         """Initializes the TrajectoryDataset.
 
@@ -62,6 +63,7 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         self.noise_std = noise_std
         self.scale_range = scale_range
         self.yaw_range = yaw_range
+        self.sigma_tilt = sigma_tilt
 
         print("Loading dataset into RAM for high-speed training...")
         with h5py.File(preprocessed_file, "r") as f:
@@ -142,23 +144,39 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         if self.do_augment and idx >= self.num_original_samples:
             yaw = torch.rand(1) * (self.yaw_range[1] - self.yaw_range[0]) + self.yaw_range[0]
             cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
-
-            # Yaw Rotation Matrix
-            rot_mat = torch.tensor([
+            rot_yaw = torch.tensor([
                 [cos_yaw, -sin_yaw, 0],
                 [sin_yaw, cos_yaw, 0],
                 [0, 0, 1]
             ]).float()
 
-            # Rotate GT Data
-            pos_data = (rot_mat @ pos_data.T).T
-            vel_data = (rot_mat @ vel_data.T).T
+            # Rotate sensor_data and gt_data
+            pos_data = (rot_yaw @ pos_data.T).T
+            vel_data = (rot_yaw @ vel_data.T).T
+            sensor_data[:, :3] = (rot_yaw @ sensor_data[:, :3].T).T
+            sensor_data[:, 3:6] = (rot_yaw @ sensor_data[:, 3:6].T).T
 
-            # Rotate Sensor Data
-            accel_rot = (rot_mat @ sensor_data[:, :3].T).T
-            gyro_rot = (rot_mat @ sensor_data[:, 3:6].T).T
-            sensor_data[:, :3] = accel_rot
-            sensor_data[:, 3:6] = gyro_rot
+            # Set sigmal_tilt as (0.017~0.052 rad)
+            # Simulate Local Grip Error based on Lie Group
+            delta_theta = torch.randn(3) * self.sigma_tilt
+
+            # Exponential Map (Rodrigues' rotation formula)
+            angle = torch.norm(delta_theta)
+            if angle > 1e-8:
+                axis = delta_theta / angle
+                # Generate Skew-symmetric matrix
+                K = torch.tensor([
+                    [0, -axis[2], axis[1]],
+                    [axis[2], 0, -axis[0]],
+                    [-axis[1], axis[0], 0]
+                ])
+                # Rodrigues Formula: R = I + sin(theta)K + (1-cos(theta))K^2
+                I = torch.eye(3)
+                rot_local = I + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
+
+                # Adopt local grip error in sensor data only
+                sensor_data[:, :3] = (rot_local @ sensor_data[:, :3].T).T
+                sensor_data[:, 3:6] = (rot_local @ sensor_data[:, 3:6].T).T
 
             # Inject Noise in all channels
             noise = torch.randn_like(sensor_data) * self.noise_std
