@@ -172,7 +172,7 @@ class TCN(nn.Module):
                 "vel_corr": nn.Linear(tcn_channels[-1], 3),  # 3D velocity correction
                 "covariance_R": nn.Linear(
                     tcn_channels[-1], 6
-                ),  # Parameters for 6D R matrix (e.g., diagonal)
+                ),  # Parameters for 6D log(R) (e.g., log-diagonal)
                 "zupt_prob": nn.Linear(
                     tcn_channels[-1], 1
                 ),  # Scalar ZUPT probability
