@@ -114,7 +114,7 @@ class PencilDataRecorder: ObservableObject {
         var csv = "timestamp,x,y,force,azimuth,altitude,hoverDistance,isHovering,rollAngle\n"
         
         for point in sample.dataPoints {
-            csv += String(format: "%.6f,%.2f,%.2f,%.4f,%.4f,%.4f,%.4f,%d,%.4f\n",
+            csv += String(format: "%.6f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%.4f\n",
                           point.timestamp,
                           point.x, point.y,
                           point.force,

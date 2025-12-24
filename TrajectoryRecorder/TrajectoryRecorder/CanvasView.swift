@@ -96,7 +96,7 @@ class PencilTrackingView: UIView {
     }
     
     private func handleTouch(_ touch: UITouch) {
-        let location = touch.location(in: self)
+        let location = touch.preciseLocation(in: self)
         let force = touch.force
         let azimuth = touch.azimuthAngle(in: self)
         let altitude = touch.altitudeAngle
@@ -118,23 +118,5 @@ class PencilTrackingView: UIView {
         )
         
         dataRecorder?.addDataPoint(dataPoint)
-    }
-}
-
-// MARK: - Legacy Tracking View Wrapper
-
-/// SwiftUI wrapper for the `PencilTrackingView`.
-struct PencilTrackingViewRepresentable: UIViewRepresentable {
-    @ObservedObject var dataRecorder: PencilDataRecorder
-    
-    func makeUIView(context: Context) -> PencilTrackingView {
-        let view = PencilTrackingView()
-        view.dataRecorder = dataRecorder
-        view.backgroundColor = UIColor.clear
-        return view
-    }
-    
-    func updateUIView(_ uiView: PencilTrackingView, context: Context) {
-        uiView.dataRecorder = dataRecorder
     }
 }

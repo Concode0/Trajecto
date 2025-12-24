@@ -167,7 +167,7 @@ class EnhancedPKCanvasView: PKCanvasView {
     }
     
     private func handleTouch(_ touch: UITouch) {
-        let location = touch.location(in: self)
+        let location = touch.preciseLocation(in: self)
         let force = touch.force
         let azimuth = touch.azimuthAngle(in: self)
         let altitude = touch.altitudeAngle
