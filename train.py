@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split # Add random_split
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
@@ -121,7 +121,9 @@ class UncertaintyLoss(nn.Module):
             # Loss = 1 - cosine_similarity. Range [0, 2].
             cos_sim = F.cosine_similarity(pred_total_vel_w, batch["gt_vel_w"], dim=-1, eps=1e-6)
             per_element_cos_loss = 1.0 - cos_sim
-            mean_cos_loss = (per_element_cos_loss * mask).sum() / valid_element_count
+            moving_mask = mask * (1.0 - batch["gt_zupt"].squeeze(-1)) # Adopt Cos Loss when Moving
+            mean_cos_loss = (per_element_cos_loss * moving_mask).sum() / (moving_mask.sum() + 1e-8)
+            # mean_cos_loss = (per_element_cos_loss * mask).sum() / valid_element_count
             precision_cos = torch.exp(-self.log_var_cos)
             loss_cos = precision_cos * mean_cos_loss + self.log_var_cos
             total_loss += loss_cos
@@ -524,6 +526,8 @@ def main() -> None:
         augment_multiplier=Config.AUGMENT_MULTIPLIER,
         subsample_step=Config.SUBSAMPLE_STEP,
         do_augment=Config.DO_AUGMENT,
+        yaw_range=Config.YAW_ANGLE,
+        sigma_tilt=Config.SIGMA_TILT
     )
 
     # Load Validation Dataset (No augmentation)
