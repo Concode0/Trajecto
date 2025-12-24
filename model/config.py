@@ -54,6 +54,8 @@ class Config:
         ZUPT_NOISE_STD_ESKF = [0.01, 0.01, 0.01]
         # Whether to use Depthwise Separable Convolutions in TCN for ESKFTCN.
         USE_SEPARABLE_CONV = False
+        # Mahalanobis distance threshold for measurement gating (Chi-square dist, dof=6, p=0.99 => ~16.8)
+        MAHALANOBIS_GATE_THRESHOLD = 16.8
 
     class AEKFTCN:
         TCN_INPUT_SIZE = 20
