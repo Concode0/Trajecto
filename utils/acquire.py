@@ -187,6 +187,39 @@ def find_force_segments(df_gt: pd.DataFrame, threshold: int, margin: int) -> Lis
         segments.append((max(0, s - margin), min(len(force), e + margin)))
     return segments
 
+def check_and_fix_gt_jump(self, df: pd.DataFrame, threshold_pt: float = 0.5) -> pd.DataFrame:
+    touch_starts = df.index[(df['isHovering'].shift(1) == 0) & (df['isHovering'] > 0)].tolist()
+
+    if not touch_starts:
+        return df
+
+    corrected_df = df.copy()
+    was_any_fixed = False
+
+    for idx in touch_starts:
+        if idx < 1: continue
+
+        prev_avg = df.loc[idx-2:idx-1, ['x', 'y']].mean()
+        curr_avg = df.loc[idx:idx+1, ['x', 'y']].mean()
+
+        diff = curr_avg - prev_avg
+        jump_dist = np.sqrt(diff['x']**2 + diff['y']**2)
+
+        if jump_dist > threshold_pt:
+            print(f"\n[Segment Jump at Index {idx}]")
+            print(f"  - Jump: {jump_dist:.2f} pts")
+
+            choice = input(f"  - Align hover segment ending at {idx}? (y/n): ").lower()
+            if choice == 'y':
+                last_touch_end = df[:idx].index[df['force'].shift(-1) > 0].tolist()
+                hover_start = last_touch_end[-2] + 1 if len(last_touch_end) > 1 else 0
+
+                corrected_df.loc[hover_start:idx-1, 'x'] += diff['x']
+                corrected_df.loc[hover_start:idx-1, 'y'] += diff['y']
+                was_any_fixed = True
+
+    return corrected_df, was_any_fixed
+
 # --- Acquisition & Processing Class ---
 
 class AcquisitionManager:
@@ -368,6 +401,10 @@ class AcquisitionManager:
         # Save for visualization
         debug_info["sensor_aligned"] = df_sensor_aligned
         debug_info["gt_aligned"] = df_gt_aligned
+
+        # Check point jumps in gt_data
+        df_gt_aligned, was_corrected = self.check_and_fix_gt_jump(df_gt_aligned)
+        debug_info["jump_corrected"] = was_corrected
 
         # 4. Segmentation
         # Find start/end taps in GT Force to define ROI
