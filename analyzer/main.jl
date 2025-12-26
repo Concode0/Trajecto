@@ -11,12 +11,12 @@ ENV["JULIA_PYTHONCALL_EXE"] = VENV_PATH
 # 2. Configuration
 # Adjust these paths according to your actual data location
 h5_path = joinpath(PROJECT_ROOT, "data/dataset.h5")
-model_path = joinpath(PROJECT_ROOT, "eskf_tcn_model.pth")
+model_path = joinpath(PROJECT_ROOT, "")
 script_path = joinpath(PROJECT_ROOT, "model")
 scaler_path = joinpath(PROJECT_ROOT, "data/scaler_stats.h5")
 
 # Select Model Type: "eskf", "aekf", "tcn"
-const MODEL_TYPE = "eskf"
+const MODEL_TYPE = "pure_eskf"
 
 # 3. Instantiate Components
 # A. Perception Layer

@@ -25,6 +25,15 @@ include("Estimation/PyTorchEstimator.jl")
 using .PyTorchEstimator
 export TrajectoEstimator
 
+# Analysis Tools
+include("Analysis/Metrics.jl")
+using .Metrics
+export calculate_metrics, align_trajectory
+
+include("Analysis/CRLB.jl")
+using .CRLB
+export CRLBConfig, compute_crlb
+
 # Application Plugins
 include("Application/Dashboard.jl")
 using .Dashboard

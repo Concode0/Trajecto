@@ -1,6 +1,6 @@
 # Trajecto Firmware (ESP32)
 
-This directory contains the embedded C++ firmware for the Trajecto system, designed for the ESP32-S3 microcontroller.
+This directory contains the embedded C++ firmware for the Trajecto system, designed for the ESP32C3 microcontroller.
 
 It implements a **Sim2Real** pipeline, running the full hybrid ESKF-TCN trajectory estimation model on-device in real-time.
 
@@ -24,13 +24,13 @@ The firmware is built on **ESP-IDF** and utilizes a layered architecture:
 ## Features
 
 - **On-Device Inference**: Runs the full TCN+ESKF model at ~50Hz (inference) / 400Hz (integration).
-- **Quantization**: Uses INT8 TFLite models for efficient execution on ESP32-S3.
+- **Quantization**: Uses INT8 TFLite models for efficient execution on ESP32C3.
 - **Stateful Buffer**: Manages TCN causal history for continuous streaming.
 - **BLE Service**: Streams real-time trajectory and raw sensor data.
 
 ## Hardware Setup
 
-*   **MCU**: ESP32-S3 (Required for adequate AI instruction support).
+*   **MCU**: ESP32C3 (Required for adequate AI instruction support).
 *   **IMU**: BMI270 connected to I2C.
     *   SDA: GPIO 10
     *   SCL: GPIO 4

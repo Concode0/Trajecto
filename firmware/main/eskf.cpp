@@ -1,5 +1,7 @@
 #include "eskf.hpp"
 #include <iostream>
+#include <cmath>
+#include <algorithm>
 
 namespace trajecto {
 
@@ -9,7 +11,6 @@ ESKF::ESKF(float dt) : dt_(dt) {
     P_ *= 0.1f;
 
     // Initialize Process Noise Q (Diagonal)
-    // Values derived from Config.py (approximate)
     // VRW (Velocity Random Walk) -> Accel Noise
     float vrw = 1.0e-3f; 
     // ARW (Angle Random Walk) -> Gyro Noise
@@ -33,6 +34,9 @@ ESKF::ESKF(float dt) : dt_(dt) {
 
     // Gravity (Z-up assumption for World Frame)
     gravity_w_ << 0.0f, 0.0f, 9.81f;
+    
+    // Gating
+    mahalanobis_gate_threshold_ = 20.0f;
 }
 
 void ESKF::initialize(const Eigen::Vector3f& accel_init) {
@@ -109,14 +113,8 @@ void ESKF::predict(const Eigen::Vector3f& gyro_raw, const Eigen::Vector3f& accel
     // Vel deriv wrt Accel Bias ( -R * dt )
     F.block<3, 3>(3, 12) = -R_bw * dt_;
 
-    // Ori deriv wrt Ori (Identity for small angles in body frame usually, but here standard approx)
-    // Using simple error state dynamics: delta_theta_new = delta_theta - R_bw * gyro_bias * dt?
-    // Actually: delta_theta_dot = -[w]_x * delta_theta - delta_bias_g
-    // So F_theta_theta is I - [w]_x * dt. But often approximated as I if w is small or incorporated.
-    // Standard ESKF: F_theta_theta = R{w*dt}^T.
-    // Let's stick to the Python implementation:
-    // F_error_matrix[:, 6:9, 9:12] = -torch.eye(3) * self.dt
-    // It seems Python neglected the [w]_x term or assumed it's small/handled in integration.
+    // Ori deriv wrt Ori (Identity approximation)
+    // Ori deriv wrt Gyro Bias ( -I * dt )
     F.block<3, 3>(6, 9) = -Eigen::Matrix3f::Identity() * dt_;
 
     // Q Matrix
@@ -130,7 +128,7 @@ void ESKF::predict(const Eigen::Vector3f& gyro_raw, const Eigen::Vector3f& accel
     enforce_symmetry();
 }
 
-void ESKF::update_zupt() {
+void ESKF::update_zupt(float prob) {
     // Measurement: Zero Velocity
     // H matrix selects Velocity Error (3x15)
     Eigen::Matrix<float, 3, STATE_DIM> H;
@@ -140,7 +138,61 @@ void ESKF::update_zupt() {
     // Measurement Noise R
     Eigen::Matrix3f R;
     R.setIdentity();
-    R *= (zupt_noise_std_ * zupt_noise_std_);
+
+    if (prob >= 0.0f) {
+        // Scale R based on probability (matches Python _calculate_zupt_update logic)
+        // R = R_min * prob + R_max * (1 - prob)
+        // This logic in Python seems inverted or handled via linear interpolation.
+        // Actually Python says: R_zupt_scaled_diag = min_R_val * prob + max_R_val * (1 - prob)
+        // Wait, if prob is high (near 1.0, confident ZUPT), R should be small (min_R).
+        // If prob is low (near 0.0, moving), R should be huge (max_R).
+        // Let's check Python code again carefully.
+        
+        // Python:
+        // clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
+        // R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
+        
+        // If clamped_prob is 0.99 (confident): R = min * 0.99 + max * 0.01. This is WRONG.
+        // If prob is high, we want MIN noise.
+        // The Python code actually says:
+        // R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
+        // This effectively makes R large when prob is high?
+        // Let's re-read Python code carefully.
+        
+        /*
+            # Let R_min be self.zupt_noise_std**2, and R_max be a large value for uncertainty
+            min_R_val = self.zupt_noise_std**2
+            # A large value for R when ZUPT prob is low (e.g., 100 times min_R_val)
+            max_R_val = min_R_val * 100
+
+            # Clamp probability to avoid extreme values and numerical instability
+            # Epsilon ensures we don't divide by zero or have extremely small R
+            clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
+
+            # R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
+        */
+        
+        // If prob = 0.99 (Static): R = min * 0.99 + max * 0.01.
+        // If prob = 0.01 (Moving): R = min * 0.01 + max * 0.99.
+        // R is dominated by max_R when Moving. (Correct)
+        // R is dominated by min_R when Static? No.
+        // If max_R = 100, min_R = 1.
+        // Prob 0.99: R = 1*0.99 + 100*0.01 = 0.99 + 1 = 1.99. (Close to min)
+        // Prob 0.01: R = 1*0.01 + 100*0.99 = 0.01 + 99 = 99.01. (Close to max)
+        // So the interpolation logic effectively works, but it's mixing them.
+        // It's a linear blend.
+        // Okay, I will implement exactly this.
+        
+        float min_R_val = zupt_noise_std_ * zupt_noise_std_;
+        float max_R_val = min_R_val * 100.0f;
+        float clamped_prob = std::max(0.01f, std::min(prob, 0.99f));
+        
+        float r_val = min_R_val * clamped_prob + max_R_val * (1.0f - clamped_prob);
+        R.diagonal().setConstant(r_val);
+    } else {
+        // Standard fixed ZUPT noise
+        R *= (zupt_noise_std_ * zupt_noise_std_);
+    }
 
     // Innovation (0 - vel_pred)
     Eigen::Vector3f innovation = -state_.vel;
@@ -162,19 +214,7 @@ void ESKF::update_zupt() {
 }
 
 void ESKF::update_tcn_vel(const Eigen::Vector3f& vel_corr_body, const Eigen::Matrix<float, 6, 1>& R_params) {
-    // TCN predicts velocity correction in BODY frame.
-    // We treat this as a measurement of velocity error? 
-    // Or as a measurement of velocity: z = v_body_pred + vel_corr_body?
-    
-    // In Python `_apply_tcn_velocity_correction`:
-    // It treats "vel_corr_w" as the innovation directly.
-    // Wait, the TCN output is `vel_corr` (body frame).
-    // The Python code rotates it to World: `vel_corr_w = R * vel_corr_b`.
-    // Then `innovation = vel_corr_w`.
-    // This implies the measurement `z` was "Velocity should be adjusted by X".
-    // Effectively, it's treating the TCN output as an observation of the Velocity Error itself.
-    // Measurement model: z = delta_v + noise.
-    // So H maps state to delta_v. H for delta_v is Identity on indices 3-5.
+    // Treat TCN velocity correction (body frame) as a direct measurement of velocity error.
     
     // Rotate correction to world frame
     Eigen::Matrix3f R_bw = state_.quat.toRotationMatrix();
@@ -213,7 +253,8 @@ void ESKF::update_tcn_vel(const Eigen::Vector3f& vel_corr_body, const Eigen::Mat
 Eigen::Matrix<float, 6, 1> ESKF::update_imu(
     const Eigen::Vector3f& accel_raw,
     const Eigen::Vector3f& gyro_raw,
-    const Eigen::Matrix<float, 6, 1>& R_diag
+    const Eigen::Matrix<float, 6, 1>& R_diag,
+    float* out_mahalanobis
 ) {
     // 1. Build H Matrix (6x15)
     Eigen::Matrix<float, 6, STATE_DIM> H;
@@ -262,7 +303,26 @@ Eigen::Matrix<float, 6, 1> ESKF::update_imu(
     Eigen::Matrix<float, STATE_DIM, 6> PHt = P_ * H.transpose();
     Eigen::Matrix<float, 6, 6> S = H * PHt + R;
     
-    // S inverse (6x6)
+    // Calculate Mahalanobis Distance for Gating
+    // d^2 = y^T * S^-1 * y
+    // Use LDLT for solving S * x = y
+    Eigen::Matrix<float, 6, 1> S_inv_y = S.ldlt().solve(innovation);
+    float mahalanobis_sq = innovation.dot(S_inv_y);
+
+    if (out_mahalanobis) {
+        *out_mahalanobis = mahalanobis_sq;
+    }
+
+    if (mahalanobis_sq > mahalanobis_gate_threshold_) {
+        // Gating: Reject update
+        // We do NOT update State or P
+        // But we return the innovation for logging/TCN
+        return innovation; 
+    }
+    
+    // Continue with Update if passed gating
+    
+    // S inverse (6x6) - we can reuse decomposition or just invert
     Eigen::Matrix<float, STATE_DIM, 6> K = PHt * S.inverse();
 
     // 5. Update State

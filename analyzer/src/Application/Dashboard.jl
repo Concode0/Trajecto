@@ -1,6 +1,7 @@
 module Dashboard
 
 using ..AbstractLayers
+using ..Metrics
 using GLMakie
 using GeometryBasics
 using Statistics
@@ -11,12 +12,6 @@ struct MakieDashboard <: AbstractApplication
 end
 
 MakieDashboard() = MakieDashboard((1600, 1000))
-
-function calculate_ate(gt::AbstractMatrix, pred::AbstractMatrix)
-    # Expecting (Seq, 3)
-    errors = sqrt.(sum((gt .- pred).^2, dims=2))
-    return mean(errors)
-end
 
 function calculate_ellipsoid_model(cov_3x3, pos_3d)
     # Eigen decomposition for orientation and scale
@@ -59,7 +54,11 @@ function AbstractLayers.run_app(app::MakieDashboard, trajectory_data, input_stre
     sensor = input_stream.sensor
     
     seq_len = size(gt_pos, 1)
-    ate = calculate_ate(gt_pos, pred_pos)
+    
+    # Calculate detailed metrics
+    # Assuming 50Hz (0.02s) as per standard Trajecto protocol
+    metrics = calculate_metrics(gt_pos, pred_pos, 0.02)
+    aligned_pred = metrics.aligned_traj
     
     # FIX: resolution -> size (Deprecated in Makie)
     fig = Figure(size = app.resolution, font = "sans")
@@ -102,15 +101,23 @@ function AbstractLayers.run_app(app::MakieDashboard, trajectory_data, input_stre
         end
     end
 
+    # Title Info
+    title_str = "Trajecto Analysis\n" * 
+                "APE(RMSE): $(round(metrics.ape_rmse*100, digits=2)) cm | " *
+                "Err/Dist: $(round(metrics.error_over_dist*100, digits=2)) % | " * 
+                "Err/Time: $(round(metrics.error_over_time*100, digits=2)) cm/s"
+
     # 1. 3D Trajectory
-    ax3d = Axis3(fig[1, 1:2], title = "Trajecto 3D Analysis (ATE: $(round(ate*100, digits=2))cm)",
+    ax3d = Axis3(fig[1, 1:2], title = title_str,
                  aspect = :data, perspectiveness = 0.5)
 
     # Static full trajectories
     lines!(ax3d, gt_pos[:, 1], gt_pos[:, 2], gt_pos[:, 3], 
            color = :blue, linewidth = 1, label = "Ground Truth", linestyle = :dash, alpha=0.5)
     lines!(ax3d, pred_pos[:, 1], pred_pos[:, 2], pred_pos[:, 3], 
-           color = :red, linewidth = 2, label = "Prediction", alpha=0.5)
+           color = :red, linewidth = 2, label = "Raw Prediction", alpha=0.5)
+    lines!(ax3d, aligned_pred[:, 1], aligned_pred[:, 2], aligned_pred[:, 3], 
+           color = :green, linewidth = 1, label = "Aligned Pred", linestyle = :dot, alpha=0.6)
 
     # Dynamic markers
     # Lift position based on slider value
@@ -120,7 +127,7 @@ function AbstractLayers.run_app(app::MakieDashboard, trajectory_data, input_stre
     scatter!(ax3d, gt_pt, color = :blue, markersize = 15, label = "GT Head")
     scatter!(ax3d, pred_pt, color = :red, markersize = 15, label = "Pred Head")
 
-    # Dynamic Error Ellipsoid (3-sigma)
+    # Dynamic Error Ellipsoid (3-sigma) on Raw Prediction
     ellipsoid_model = @lift(calculate_ellipsoid_model(
         pred_cov[$frame_idx_obs, 1:3, 1:3], 
         pred_pos[$frame_idx_obs, :]
@@ -138,13 +145,14 @@ function AbstractLayers.run_app(app::MakieDashboard, trajectory_data, input_stre
     # vlines! with lifted observable vector
     vlines!(ax_acc, @lift([$frame_idx_obs]), color = :black, linestyle = :dash)
 
-    # 3. Error Distribution
-    dist = sqrt.(sum((gt_pos .- pred_pos).^2, dims=2))[:]
-    ax_err = Axis(fig[2, 2], title = "Point-to-Point Error", xlabel = "Frame", ylabel = "Error (m)")
+    # 3. Error Distribution (Aligned)
+    # Using aligned prediction for error to match APE metrics
+    dist = sqrt.(sum((gt_pos .- aligned_pred).^2, dims=2))[:]
+    ax_err = Axis(fig[2, 2], title = "Aligned Point-to-Point Error", xlabel = "Frame", ylabel = "Error (m)")
     
     # band! with explicit vector for lower bound
-    band!(ax_err, 1:length(dist), zeros(length(dist)), dist, color = (:red, 0.2))
-    lines!(ax_err, dist, color = :red, linewidth = 1)
+    band!(ax_err, 1:length(dist), zeros(length(dist)), dist, color = (:green, 0.2))
+    lines!(ax_err, dist, color = :green, linewidth = 1)
     vlines!(ax_err, @lift([$frame_idx_obs]), color = :black, linestyle = :dash)
 
     display(fig)

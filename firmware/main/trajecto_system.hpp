@@ -3,6 +3,7 @@
 #include "eskf.hpp"
 #include "tcn_wrapper.hpp"
 #include <iostream>
+#include <cmath>
 
 namespace trajecto {
 
@@ -29,89 +30,53 @@ public:
         }
 
         // 1. ZUPT Detection (Heuristic)
-        bool is_zupt = eskf_.check_zupt(accel);
+        bool is_zupt_heuristic = eskf_.check_zupt(accel);
+        bool is_zupt = is_zupt_heuristic;
+        float zupt_prob = -1.0f;
 
         // 2. Predict (Propagate State)
         eskf_.predict(gyro, accel);
 
         // 3. TCN Inference
         // TCN needs features which depend on current state and *last* innovation
-        TCNOutput tcn_out = tcn_.process_step(accel, gyro, force, eskf_, last_innovation_, is_zupt);
+        TCNOutput tcn_out = tcn_.process_step(accel, gyro, force, eskf_, last_innovation_, is_zupt_heuristic);
 
-        // 4. Update
+        // Prepare Measurement Noise R
+        Eigen::Matrix<float, 6, 1> R_diag;
+        R_diag.setConstant(1e-4f); // Default baseline
+
         if (tcn_out.valid) {
-            // TCN Override for ZUPT?
-            // Python: is_zupt = tcn_output["zupt_prob"] > 0.5
+            // TCN Override for ZUPT
             if (tcn_out.zupt_prob > 0.5f) {
                 is_zupt = true;
             }
+            zupt_prob = tcn_out.zupt_prob;
 
-            if (is_zupt) {
-                eskf_.update_zupt();
-                // ZUPT update doesn't produce standard innovation for next step features?
-                // Actually, Python code: "innovation_output = innovation" (from update_imu or 0 if only ZUPT?)
-                // If only ZUPT is applied, innovation_output is usually zeroed or specific to ZUPT?
-                // Python: if ZUPT, apply ZUPT. If TCN, also apply TCN vel corr (masked if ZUPT).
-                // AND "Standard Measurement Update (with TCN-provided adaptive R)" is ALWAYS applied in Python loop
-                // UNLESS we are in a simplified mode.
-                // In `ESKF_TCN.py`:
-                //   if torch.any(is_zupt): apply ZUPT
-                //   if tcn_output: apply TCN Vel Corr (masked) AND apply Update (with R override)
-                
-                // So we should ALWAYS do update_imu for feature generation purposes at least.
-                // But if we are stationary, IMU update helps converge biases.
-                
-                // Let's replicate Python logic:
-                // 1. ZUPT Update (if needed)
-                // 2. TCN Velocity Correction (if valid and not stationary?)
-                // 3. IMU Update (Always, maybe with TCN R)
-                
-                // Correction: Python applies TCN Vel Corr *unless* ZUPT is active.
-                // "vel_corr_body = torch.where(is_zupt..., zeros, vel_corr_body)"
-                if (!is_zupt) {
-                   eskf_.update_tcn_vel(tcn_out.vel_corr, tcn_out.R_params); 
-                }
-                
-                // 4. IMU Measurement Update (For Biases + Innovation Feature)
-                // TCN provides R params (covariance_R).
-                // Python: R = softplus(covariance_R).
-                // We need to process R_params.
-                Eigen::Matrix<float, 6, 1> R_diag;
-                for(int i=0; i<6; i++) {
-                     // Softplus approximation: log(1 + exp(x))
-                     // TFLite doesn't have softplus op usually enabled?
-                     // We can do it here.
-                     float x = tcn_out.R_params[i];
-                     R_diag[i] = std::log(1.0f + std::exp(x));
-                }
-                
-                last_innovation_ = eskf_.update_imu(accel, gyro, R_diag);
-                
-            } else {
-                // TCN Valid but not ZUPT
-                // Apply TCN Vel
+            // Apply TCN Velocity Correction (if not ZUPT)
+            if (!is_zupt) {
                 eskf_.update_tcn_vel(tcn_out.vel_corr, tcn_out.R_params);
-                
-                // Apply IMU Update
-                Eigen::Matrix<float, 6, 1> R_diag;
-                for(int i=0; i<6; i++) {
-                     float x = tcn_out.R_params[i];
-                     R_diag[i] = std::log(1.0f + std::exp(x));
-                }
-                last_innovation_ = eskf_.update_imu(accel, gyro, R_diag);
             }
-            
-        } else {
-            // TCN Not Ready (Startup)
-            if (is_zupt) {
-                eskf_.update_zupt();
+
+            // Parse R from TCN for IMU Update
+            for(int i=0; i<6; i++) {
+                 float x = tcn_out.R_params[i];
+                 // Softplus approximation: log(1 + exp(x))
+                 // Use simple check to avoid overflow for large x
+                 float val = (x > 20.0f) ? x : std::log(1.0f + std::exp(x));
+                 R_diag[i] = val + 1e-6f;
             }
-            
-            // Standard IMU Update with default R
-            Eigen::Matrix<float, 6, 1> R_default;
-            R_default.setConstant(1e-4f); // Default
-            last_innovation_ = eskf_.update_imu(accel, gyro, R_default);
         }
+
+        // 4. ZUPT Update
+        if (is_zupt) {
+            eskf_.update_zupt(zupt_prob);
+        }
+
+        // 5. Standard IMU Update
+        // This estimates biases and generates innovation for the next TCN step.
+        // It now includes Mahalanobis Gating logic inside.
+        float mahalanobis_sq = 0.0f;
+        last_innovation_ = eskf_.update_imu(accel, gyro, R_diag, &mahalanobis_sq);
     }
 
     const NominalState& get_state() const { return eskf_.get_state(); }

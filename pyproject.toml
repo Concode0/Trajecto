@@ -35,4 +35,5 @@ dependencies = [
     "onnx-graphsurgeon>=0.5.8",
     "sng4onnx>=1.0.4",
     "onnxsim>=0.4.36",
+    "evo>=1.34.0",
 ]

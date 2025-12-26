@@ -97,15 +97,15 @@ function AbstractLayers.predict_trajectory(estimator::TrajectoEstimator, input_d
         pred_pos_py = nothing
         pred_cov_py = nothing
         
-        if estimator.model_type == "tcn" || estimator.model_type == "pure_eskf"
-            # OnlyTCN and PureESKF return tensor directly
+        if estimator.model_type == "tcn"
+            # OnlyTCN returns tensor directly
             pred_pos_py = output.squeeze(0) # (Seq, 3)
             # Dummy covariance
             seq_len = pred_pos_py.shape[0]
             # Create a zero covariance matrix (Seq, 15, 15)
             pred_cov_py = engine.torch.zeros(seq_len, 15, 15)
         else
-            # Hybrid models return Dict
+            # Hybrid models and PureESKF return Dict
             pred_pos_py = output["pred_pos_w"].squeeze(0) # (Seq, 3)
             pred_cov_py = output["filter_covariance"].squeeze(0) # (Seq, 15, 15) or (Seq, 16, 16)
         end

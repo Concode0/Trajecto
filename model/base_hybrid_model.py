@@ -404,6 +404,9 @@ class BaseFilterTCNModel(nn.Module):
                 rot_mat_b_to_w_t @ pen_tip_vel_b.unsqueeze(-1)
             ).squeeze(-1)
             filter_vel_w_seq.append(filter_vel_w)
+            
+            # Log covariance
+            P_error_seq.append(filter_output[-2])
 
         # --- Helper for padding sequences ---
         def pad_sequence(

@@ -52,8 +52,10 @@ public:
 
     /**
      * @brief Update step using Zero Velocity Update (ZUPT).
+     * 
+     * @param prob Optional probability (0.0 to 1.0) from TCN. If < 0, uses standard fixed noise.
      */
-    void update_zupt();
+    void update_zupt(float prob = -1.0f);
 
     /**
      * @brief Update step using TCN predicted velocity correction.
@@ -69,12 +71,14 @@ public:
      * @param accel_raw Raw Accel
      * @param gyro_raw Raw Gyro
      * @param R_diag Measurement noise variance (6D)
+     * @param out_mahalanobis Optional pointer to store squared Mahalanobis distance
      * @return Eigen::Matrix<float, 6, 1> Innovation vector (Accel 3 + Gyro 3)
      */
     Eigen::Matrix<float, 6, 1> update_imu(
         const Eigen::Vector3f& accel_raw,
         const Eigen::Vector3f& gyro_raw,
-        const Eigen::Matrix<float, 6, 1>& R_diag
+        const Eigen::Matrix<float, 6, 1>& R_diag,
+        float* out_mahalanobis = nullptr
     );
 
     /**
@@ -106,6 +110,9 @@ private:
 
     // Gravity Vector (World Frame)
     Eigen::Vector3f gravity_w_;
+    
+    // Gating
+    float mahalanobis_gate_threshold_;
 };
 
 } // namespace trajecto

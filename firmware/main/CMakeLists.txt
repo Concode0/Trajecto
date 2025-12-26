@@ -8,6 +8,7 @@ idf_component_register(
         espp__task
         espp__logger
         esp_adc
+        esp_nn
         bt
         nvs_flash
         eigen

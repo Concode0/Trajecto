@@ -1,6 +1,6 @@
 # Trajecto Embedded Implementation Plan (ESP32)
 
-This document outlines the plan to port the Trajecto ESKF-TCN closed-loop system to the ESP32 S3 (TrajectoFW).
+This document outlines the plan to port the Trajecto ESKF-TCN closed-loop system to the ESP32C3 (TrajectoFW).
 
 ## 1. System Architecture
 
@@ -46,6 +46,9 @@ To implement this on the ESP32, we need the following libraries in `TrajectoFW`:
 ### Step 2: C++ ESKF Port
 
 Implemented in `eskf.hpp`/`eskf.cpp`. Use `Eigen::Matrix` for all linear algebra.
+*   **Enhanced State Estimation**: The C++ ESKF now includes several advanced features mirroring the Python model:
+    *   **Mahalanobis Distance Gating**: Measurements with a Mahalanobis distance exceeding a `mahalanobis_gate_threshold` (default 20.0) are discarded, preventing corrupted data from degrading the estimate.
+    *   **Probabilistic ZUPT**: The Zero-Velocity Update (ZUPT) now dynamically adjusts its measurement noise covariance based on a probability (`zupt_prob`) from the TCN. This allows for soft-gating of ZUPT, increasing confidence when the TCN indicates stationarity.
 
 ### Step 3: Stateful TCN Wrapper
 
@@ -64,6 +67,67 @@ Implemented in `tcn_wrapper.hpp`/`tcn_wrapper.cpp`.
 The ESKF-TCN integration logic is now located in `TrajectoFW/main/main.cpp`. This file contains the `app_main` function which instantiates `TrajectoSystem`, handles IMU data acquisition, decimation, and calls `sys.step()`.
 
 The original data acquisition code (simple BLE logging) has been preserved in `TrajectoFW/main/data_acquire.cpp` for reference. To use it instead, you must modify `CMakeLists.txt`.
+
+### `TrajectoSystem::step()` Implementation Snippet
+
+The core `step` function in `TrajectoSystem` orchestrates the hybrid filter flow:
+
+```cpp
+void TrajectoSystem::step(const Eigen::Vector3f& accel, const Eigen::Vector3f& gyro, float force) {
+    if (!initialized_) {
+        initialize(accel);
+        return;
+    }
+
+    // 1. ZUPT Detection (Heuristic)
+    bool is_zupt_heuristic = eskf_.check_zupt(accel);
+    bool is_zupt = is_zupt_heuristic;
+    float zupt_prob = -1.0f; // Default for no TCN prob
+
+    // 2. Predict (Propagate State)
+    eskf_.predict(gyro, accel);
+
+    // 3. TCN Inference
+    TCNOutput tcn_out = tcn_.process_step(accel, gyro, force, eskf_, last_innovation_, is_zupt_heuristic);
+
+    // Prepare Measurement Noise R for IMU update
+    Eigen::Matrix<float, 6, 1> R_diag;
+    R_diag.setConstant(1e-4f); // Default baseline
+
+    if (tcn_out.valid) {
+        // TCN can override ZUPT decision and provide probability
+        if (tcn_out.zupt_prob > 0.5f) {
+            is_zupt = true;
+        }
+        zupt_prob = tcn_out.zupt_prob;
+
+        // Apply TCN Velocity Correction (if not ZUPT)
+        // Python equivalent: vel_corr_body = torch.where(is_zupt..., zeros, vel_corr_body)
+        if (!is_zupt) {
+            eskf_.update_tcn_vel(tcn_out.vel_corr, tcn_out.R_params);
+        }
+
+        // Parse R from TCN for IMU Update
+        for(int i=0; i<6; i++) {
+             float x = tcn_out.R_params[i];
+             // Softplus approximation: log(1 + exp(x)) for numerical stability
+             float val = (x > 20.0f) ? x : std::log(1.0f + std::exp(x));
+             R_diag[i] = val + 1e-6f; // Add epsilon for numerical stability
+        }
+    }
+
+    // 4. ZUPT Update
+    if (is_zupt) {
+        eskf_.update_zupt(zupt_prob);
+    }
+
+    // 5. Standard IMU Update
+    // This estimates biases, incorporates measurements, and generates innovation for the next TCN step.
+    // Includes Mahalanobis Gating logic internally.
+    float mahalanobis_sq = 0.0f;
+    last_innovation_ = eskf_.update_imu(accel, gyro, R_diag, &mahalanobis_sq);
+}
+```
 
 ## 4. Build Instructions
 
@@ -93,13 +157,13 @@ When maintaining or extending this embedded port, follow these critical guidelin
 ### 5.2. Memory Management
 *   **Tensor Arena**: TFLite Micro requires a static `tensor_arena`.
     *   *Sizing*: Start with a generous size (e.g., 60KB). If `AllocateTensors()` fails, increase it. If it succeeds, check the logs for "Arena used bytes" and reduce it to save RAM.
-    *   *Placement*: On ESP32-S3, place the arena in internal SRAM (default) for speed. If the model is huge, use PSRAM (`heap_caps_malloc(size, MALLOC_CAP_SPIRAM)`), but expect higher latency.
+    *   *Placement*: On ESP32C3, place the arena in internal SRAM (default) for speed. If the model is huge, use PSRAM (`heap_caps_malloc(size, MALLOC_CAP_SPIRAM)`), but expect higher latency.
 *   **Stack Usage**:
     *   Eigen objects can be large. Avoid allocating large matrices on the stack in recursive functions.
     *   Increase the FreeRTOS task stack size (default 4KB is often too small for TFLite+Eigen). We use **8KB** or **16KB**.
 
 ### 5.3. Performance Optimization
-*   **Quantization**: Always use **INT8** models for the ESP32-S3. The ESP-NN library accelerates integer vector instructions.
+*   **Quantization**: Always use **INT8** models for the ESP32C3. The ESP-NN library accelerates integer vector instructions.
 *   **Op Resolver**: Use `MicroMutableOpResolver` instead of `AllOpsResolver`. Only add the specific operations your model uses (e.g., `AddConv2D`, `AddReshape`, `AddFullyConnected`). This saves ~200KB of flash.
 *   **Clock Speed**: Ensure the ESP32 is running at 240MHz (`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240`).
 

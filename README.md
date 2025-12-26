@@ -1,5 +1,7 @@
 # Trajecto: 3D Pen Trajectory Reconstruction
 
+## Status: Under Active Development
+
 **Trajecto** is a high-precision handwriting trajectory estimation system that reconstructs 3D pen movements using a single 6-axis IMU (BMI270).
 
 It utilizes a **Hybrid Architecture** combining Deep Learning (Temporal Convolutional Networks) with Physics-based Filtering (ESKF/AEKF) to overcome the inherent drift of low-cost inertial sensors. The system is designed for **Sim2Real** deployment, featuring a complete pipeline from PyTorch training to optimized C++ inference on ESP32 microcontrollers.
@@ -8,7 +10,7 @@ It utilizes a **Hybrid Architecture** combining Deep Learning (Temporal Convolut
 
 - **Hybrid Physics+AI Models**: Integrates Error-State Kalman Filters (ESKF) with TCNs to correct velocity and orientation errors in real-time.
 - **Robust Data Protocol**: Implements a strict "Tap-Wait-Write" acquisition protocol for reliable synchronization and gravity alignment.
-- **Embedded Inference**: Fully optimized C++ port for ESP32-S3 using TFLite Micro with INT8 quantization and stateful buffering.
+- **Embedded Inference**: Fully optimized C++ port for ESP32C3 using TFLite Micro with INT8 quantization and stateful buffering.
 - **Sim2Real Pipeline**: Automated tools for exporting PyTorch models to ONNX, TFLite, and C++ arrays.
 - **Advanced ZUPT**: Zero-Velocity Update detection to minimize drift during stationary periods.
 
@@ -24,12 +26,13 @@ The system estimates a 15-dimensional Error State to correct the inertial integr
 
 ## Data Acquisition Protocol (CRITICAL)
 
-All data collection must strictly follow the **"Tap-Wait-Write"** protocol to ensure valid initialization:
+All data collection must strictly follow the **"Double-Tap-Wait-Write"** protocol to ensure valid synchronization and leveling:
 
-1.  **Tap**: A sharp acceleration spike used for temporal synchronization.
-2.  **Skip**: ~0.5s after Tap is discarded to avoid impact vibration.
-3.  **Static Buffer (Leveling)**: ~1.5s of static data is **KEPT** to initialize gravity alignment and sensor biases.
-4.  **Write**: The actual handwriting motion.
+1.  **Initial Tap (Start Sync)**: A sharp acceleration spike to mark the beginning of data capture.
+2.  **Calib/Static Wait**: ~2 seconds of static data collection to initialize gravity alignment and sensor biases. This also serves as a buffer for discarding initial impact noise.
+3.  **Write**: The actual handwriting motion.
+4.  **Stop Wait**: A brief period of static data after writing is complete.
+5.  **Final Tap (End Sync)**: A sharp acceleration spike to mark the end of the writing segment.
 
 ## Directory Structure
 
@@ -106,7 +109,7 @@ To deploy the trained model to the ESP32:
 
 ## Hardware
 
-The system uses a custom PCB with an ESP32-S3 and BMI270 IMU.
+The system uses a custom PCB with an ESP32C3 and BMI270 IMU.
 Design files are available in the `hardware/` directory.
 
 | Top View | Bottom View |
@@ -115,7 +118,7 @@ Design files are available in the `hardware/` directory.
 
 ## Firmware
 
-The `firmware/` directory contains the C++ implementation for the ESP32-S3.
+The `firmware/` directory contains the C++ implementation for the ESP32C3.
 - **Framework**: ESP-IDF
 - **Inference**: TFLite Micro (INT8/Dynamic Quantization)
 - **Math**: Eigen (for Kalman Filtering)

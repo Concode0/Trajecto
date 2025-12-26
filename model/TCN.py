@@ -75,13 +75,13 @@ class CausalConv1d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Pad only on the left side
         x = F.pad(x, (self.padding, 0))
-        
+
         if self.separable and self.depthwise is not None:
             x = self.depthwise(x)
             x = self.pointwise(x)
         else:
             x = self.conv(x)
-            
+
         x = self.relu(x)
         x = self.dropout(x)
         return x
@@ -138,7 +138,7 @@ class TCN(nn.Module):
         # Batch Normalization applied to the input features across the time dimension.
         # This replaces the LayerNorm that was previously in the wrapper class.
         # BatchNorm is more efficient for inference (can be fused) and treats features independently.
-        self.input_bn = nn.BatchNorm1d(input_size)
+        self.input_bn = nn.GroupNorm(num_groups=8, num_channels=input_size)
 
         self.tcn_layers = nn.ModuleList()  # Stores the sequential TCN blocks.
         in_channels = input_size
@@ -147,7 +147,7 @@ class TCN(nn.Module):
         # Construct the TCN layers using CausalConv1d blocks.
         for i, out_channels in enumerate(tcn_channels):
             dilation = tcn_dilation_factors[i]
-            
+
             self.tcn_layers.append(
                 CausalConv1d(
                     in_channels,

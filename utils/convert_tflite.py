@@ -37,25 +37,21 @@ def get_input_info(onnx_model):
     return info
 
 def representative_dataset_gen_factory(input_info):
-    """
-    Factory function to create a generator for the representative dataset.
-    It loads the numpy calibration data saved earlier and uses explicit input_info.
-    """
     def generator():
-        for i in range(1): # Assuming 1 sample in calib_data for now
+        num_samples = 200 # Config after acquire_calib
+        for i in range(num_samples):
             input_tensors = []
             for info in input_info:
                 name = info['name']
-                shape = info['shape']
                 npy_path = os.path.join(CALIB_DATA_DIR, f"{name}.npy")
-                
+
                 if not os.path.exists(npy_path):
-                    print(f"Error: Calibration file {npy_path} not found.")
-                    return
-                
-                data = np.load(npy_path)[i] # Get the i-th sample
-                # Ensure the data has the correct shape and type
-                input_tensors.append(tf.constant(data, dtype=tf.float32))
+                    raise FileNotFoundError(f"Calibration file {npy_path} not found.")
+
+                all_data = np.load(npy_path)
+                sample_data = all_data[i] # [Batch, Seq, Feat]
+
+                input_tensors.append(sample_data.astype(np.float32))
             yield input_tensors
     return generator
 
@@ -68,7 +64,7 @@ def main():
     print(f"Loading ONNX from {ONNX_PATH}...")
     onnx_model = onnx.load(ONNX_PATH)
     input_info = get_input_info(onnx_model)
-    
+
     # Get all input names to prevent onnx2tf from messing with their layout
     input_names = [i['name'] for i in input_info]
     print(f"Preserving shapes for inputs: {input_names}")
@@ -76,19 +72,19 @@ def main():
     # Generate calibration data (for TFLiteConverter's representative_dataset)
     print("Generating calibration data (for TFLiteConverter's representative_dataset)...")
     os.makedirs(CALIB_DATA_DIR, exist_ok=True)
-    
+
     num_calib_samples = 1 # We'll just use one sample for now, matching the original setup
-    
+
     for info in input_info:
         name = info['name']
         shape = info['shape']
         # Calibration data shape: [N, ...]
         calib_shape = (num_calib_samples,) + shape
-        
+
         # Generate random data (similar to representative_dataset_gen)
         # Using float32
         data = np.random.normal(0, 1, calib_shape).astype(np.float32)
-        
+
         npy_path = os.path.join(CALIB_DATA_DIR, f"{name}.npy")
         # Save each sample separately if num_calib_samples > 1, or just the one sample
         if num_calib_samples == 1:
@@ -99,7 +95,7 @@ def main():
             print("Warning: Currently only saving one calibration sample. Adjust logic for multiple samples.")
 
     print("Converting ONNX to TensorFlow SavedModel using onnx2tf...")
-    
+
     cmd = [
         "onnx2tf",
         "-i", ONNX_PATH,
@@ -108,48 +104,23 @@ def main():
         "-kat", *input_names, # Keep shape absolutely
         "--not_use_onnxsim", # Disable onnxsim
     ]
-    
+
     print(f"Running command: {' '.join(cmd)}")
-    
+
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         print(f"onnx2tf failed with error: {e}")
         return
 
-    # Convert the TensorFlow SavedModel to TFLite (Float32)
-    print(f"Converting TensorFlow SavedModel from {TF_PATH} to Float32 TFLite...")
-    converter = tf.lite.TFLiteConverter.from_saved_model(TF_PATH)
-    tflite_model = converter.convert()
-
-    float32_tflite_path = os.path.join(os.path.dirname(TFLITE_PATH), "tcn_model_float32.tflite")
-    os.makedirs(os.path.dirname(float32_tflite_path), exist_ok=True)
-
-    with open(float32_tflite_path, "wb") as f:
-        f.write(tflite_model)
-    print(f"Float32 TFLite model saved to {float32_tflite_path}")
-
-    # Convert the TensorFlow SavedModel to TFLite (Dynamic Range Quantization)
-    print(f"Converting TensorFlow SavedModel from {TF_PATH} to Dynamic Range Quantized TFLite...")
-    converter = tf.lite.TFLiteConverter.from_saved_model(TF_PATH)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model_dr_quant = converter.convert()
-
-    dr_quant_tflite_path = os.path.join(os.path.dirname(TFLITE_PATH), "tcn_model_dynamic_range_quant.tflite")
-    os.makedirs(os.path.dirname(dr_quant_tflite_path), exist_ok=True)
-
-    with open(dr_quant_tflite_path, "wb") as f:
-        f.write(tflite_model_dr_quant)
-    print(f"Dynamic Range Quantized TFLite model saved to {dr_quant_tflite_path}")
-
     # Convert the TensorFlow SavedModel to TFLite (Full Integer Quantization)
     print(f"Converting TensorFlow SavedModel from {TF_PATH} to Full Integer Quantized TFLite...")
     converter = tf.lite.TFLiteConverter.from_saved_model(TF_PATH)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative_dataset_gen_factory(input_info)
-    
+
     # Ensure that ops are only quantized to integers
-    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8, tf.lite.OpsSet.TFLITE_BUILTINS]
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     # Set the input and output tensors to uint8 (or int8)
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
@@ -162,8 +133,8 @@ def main():
     with open(full_int_quant_tflite_path, "wb") as f:
         f.write(tflite_model_full_int_quant)
     print(f"Full Integer Quantized TFLite model saved to {full_int_quant_tflite_path}")
-    
-    print("Success! (Float32, Dynamic Range Quantized, and Full Integer Quantized TFLite models generated)")
+
+    print("Success! (Full Integer Quantized TFLite model generated)")
 
 
 if __name__ == "__main__":
