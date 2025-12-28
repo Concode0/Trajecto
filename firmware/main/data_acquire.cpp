@@ -9,6 +9,107 @@
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 
+// Bosch Driver Headers#include "bmi270.h" 
+
+// Context for I2C communication with device address
+struct I2cContext {
+    espp::I2c *i2c;
+    uint8_t address;
+};
+
+// Bridge functions for Bosch driver <-> ESPP I2C
+static int8_t bmi2_i2c_read_bridge(uint8_t reg_addr, uint8_t *data, uint32_t len, void *intf_ptr) {
+    auto *ctx = static_cast<I2cContext *>(intf_ptr);
+    if (ctx->i2c->read_at_register(ctx->address, reg_addr, data, len)) {
+        return BMI2_OK;
+    }
+    return BMI2_E_COM_FAIL;
+}
+
+static int8_t bmi2_i2c_write_bridge(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr) {
+    auto *ctx = static_cast<I2cContext *>(intf_ptr);
+    // Create a temporary buffer that holds the register address and the data
+    std::vector<uint8_t> write_buffer;
+    write_buffer.reserve(1 + len); // Reserve space for reg_addr + data
+    write_buffer.push_back(reg_addr);
+    for (size_t i = 0; i < len; ++i) {
+        write_buffer.push_back(data[i]);
+    }
+    // Use the generic write function
+    if (ctx->i2c->write(ctx->address, write_buffer.data(), write_buffer.size())) {
+        return BMI2_OK;
+    }
+    return BMI2_E_COM_FAIL;
+}
+
+static void bmi2_delay_us_bridge(uint32_t period, void *intf_ptr) {
+    if (period == 0) return;
+    uint32_t delay_ms = (period / 1000) + 1;
+    TickType_t ticks = pdMS_TO_TICKS(delay_ms);
+    if (ticks == 0) ticks = 1; // Ensure at least 1 tick wait
+    vTaskDelay(ticks);
+}
+
+// Executes CRT to fix 17m error and performs Gyro FOC
+static void run_crt_calibration(espp::I2c *i2c, uint8_t dev_addr) {
+    espp::Logger logger({.tag = "CRT_CALIB", .level = espp::Logger::Verbosity::INFO});
+    
+    struct bmi2_dev dev;
+    I2cContext ctx = {i2c, dev_addr}; // Context 생성
+
+// Configure Bosch BMI2 driver struct
+    dev.read = bmi2_i2c_read_bridge;
+    dev.write = bmi2_i2c_write_bridge;
+    dev.delay_us = bmi2_delay_us_bridge;
+    dev.intf = BMI2_I2C_INTF;
+    dev.read_write_len = 32;
+    dev.intf_ptr = &ctx; 
+    dev.config_file_ptr = NULL; // Config file is loaded by bmi270_init, not espp::Bmi270 in this context
+
+    logger.warn("========================================");
+    logger.warn("STARTING CRT CALIBRATION (Sensitivity Fix)");
+    logger.warn("KEEP THE PEN STILL ON THE TABLE!");
+    logger.warn("========================================");
+
+    // 1. Initialize sensor with raw driver
+    // espp::Bmi270 object initializes the sensor later; this performs basic init.
+    int8_t rslt = bmi270_init(&dev);
+    if (rslt != BMI2_OK) {
+        logger.error("Failed to init raw driver: {}", rslt);
+        return;
+    }
+
+    // 2. Execute CRT (core function)
+    rslt = bmi2_do_crt(&dev);
+    if (rslt == BMI2_OK) {
+        logger.info("✅ CRT SUCCESS! Sensitivity Restored.");
+        
+        // 3. FOC (Offset Compensation) - Optional but recommended
+        // Note: Accel FOC requires specifying the gravity axis.
+        // Accel FOC is skipped to avoid incorrect calibration if device orientation is unknown.
+        
+        // Enable Gyro for FOC
+        uint8_t sens_list[1] = {BMI2_GYRO};
+        rslt = bmi2_sensor_enable(sens_list, 1, &dev);
+        if (rslt == BMI2_OK) {
+             // Wait a bit for the sensor to stabilize after enabling
+             vTaskDelay(pdMS_TO_TICKS(100)); 
+             rslt = bmi2_perform_gyro_foc(&dev);
+        }
+
+        if (rslt == BMI2_OK) {
+            logger.info("✅ Gyro FOC Done.");
+        } else {
+            logger.error("❌ Gyro FOC Failed: {}", rslt);
+        }
+        
+        logger.info("✅ Calibration Sequence Complete.");
+        
+    } else {
+        logger.error("❌ CRT FAILED code: {}. (Did you move the pen?)", rslt);
+    }
+}
+
 // For BLE
 #include "esp_nimble_hci.h"
 #include "nimble/nimble_port.h"
@@ -299,8 +400,11 @@ extern "C" void app_main(void) {
         .enable_data_ready = true,
     };
 
-    // create the IMU
+    // Create the IMU object
     Imu imu(config);
+
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short delay for stability
+    run_crt_calibration(&i2c, bmi270_address);
 
     std::error_code ec;
     imu.configure_interrupts(int_config, ec);

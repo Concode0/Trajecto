@@ -11,11 +11,11 @@ maintainers:
 - William Emfinger <waemfinger@gmail.com>
 repository: git://github.com/esp-cpp/espp.git
 repository_info:
-  commit_sha: ea6e470ea8253c912aebbe8c2fb7b101c889be32
+  commit_sha: 35428fbc3d604554f52d16d8bac712a244e65c59
   path: components/i2c
 tags:
 - cpp
 - Component
 - I2C
 url: https://github.com/esp-cpp/espp/tree/main/components/i2c
-version: 1.0.31
+version: 1.0.33
