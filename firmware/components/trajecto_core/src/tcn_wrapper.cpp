@@ -1,4 +1,5 @@
 #include "tcn_wrapper.hpp"
+#include "fast_math_lut.hpp"
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -32,7 +33,7 @@ bool TCNWrapper::setup() {
     }
 
     // 2. Resolver
-    static tflite::MicroMutableOpResolver<10> resolver;
+    static tflite::MicroMutableOpResolver<11> resolver;
     resolver.AddConv2D();
     resolver.AddDepthwiseConv2D(); // Enabled for Depthwise Separable TCN
     resolver.AddFullyConnected();
@@ -43,6 +44,7 @@ bool TCNWrapper::setup() {
     resolver.AddRelu();
     resolver.AddAdd();
     resolver.AddMul();
+    resolver.AddConcatenation();
 
     // 3. Tensor Arena
     tensor_arena_ = new uint8_t[kTensorArenaSize];
@@ -100,6 +102,7 @@ void TCNWrapper::extract_features(
     
     Eigen::Vector3f pen_tip_vel_b = vel_b_linear + vel_tangential;
     
+    // Using std::tanh for now as we focused on exp/sigmoid LUT.
     for (int i=0; i<3; i++) pen_tip_vel_b[i] = std::tanh(pen_tip_vel_b[i]);
 
     Eigen::Matrix<float, 6, 1> inn_squashed;
@@ -176,7 +179,8 @@ TCNOutput TCNWrapper::process_step(
     for(int i=0; i<6; i++) result.R_params[i] = out_cov->data.f[i];
 
     float zupt_logit = out_zupt->data.f[0];
-    result.zupt_prob = 1.0f / (1.0f + std::exp(-zupt_logit));
+    // Optimized: Use Fast Sigmoid LUT
+    result.zupt_prob = fast_sigmoid(zupt_logit);
 
     // 6. Read Outputs 3..M (New States) and Update Buffers
     for (int i = 0; i < TCN_NUM_LAYERS; i++) {

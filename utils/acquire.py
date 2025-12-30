@@ -24,7 +24,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
-from scipy.signal import iirfilter, lfilter, correlate, correlation_lags
+from scipy.signal import butter, filtfilt, correlate, correlation_lags
+from scipy.ndimage import gaussian_filter1d
 
 # Ensure we can import 'receive.py' from the same directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +33,7 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 try:
-    from receive import TrajectoDriver
+    from receive import TrajectoDriver, RawImuPacket
 except ImportError:
     print("Error: Could not import 'receive.py'. Ensure it is in the 'utils/' directory.")
     sys.exit(1)
@@ -46,8 +47,8 @@ VALIDATION_DATASET_PATH = "data/validation_dataset.h5"
 SCALER_STATS_PATH = "data/scaler_stats.h5"
 
 # Acquisition Config
-NUM_SESSIONS = 1
-LABELS_PER_SESSION = 30
+NUM_SESSIONS = 3
+LABELS_PER_SESSION = 10
 CONTINUOUS_SHAPES = [
     "Infinity Loop (∞)", "Spiral (In-Out)", "Spiral (Out-In)",
     "Zigzag", "Random Scribble (Fast)", "Random Scribble (Slow)",
@@ -69,48 +70,216 @@ WORD_LIST = [
 ]
 
 # Preprocessing Config
-TARGET_SAMPLING_RATE_HZ = 50.0
-GRAVITY = 9.81
-CUTOFF_FREQ_HZ = 20.0
+TARGET_SAMPLING_RATE_HZ = 50.107
+GRAVITY = 9.80665  # Standard gravity (m/s²) - CODATA 2018
+CUTOFF_FREQ_HZ = 5.0  # Reduced from 20.0 for better noise reduction (see optimize_fsr_zero_phase.py)
 FILTER_ORDER = 4
-SEGMENTATION_THRESHOLD = 0
-SEGMENTATION_MARGIN = 15
-PIXEL_TO_METER = 2.1277e-4
+SEGMENTATION_THRESHOLD = 0.01  # GT iPad screen force (0-1 normalized): exclude true zeros, keep actual writing (was: 0)
+SEGMENTATION_MARGIN = 30
+PIXEL_TO_METER = 0.0254 / 132.0  # iPad Retina display: 264 PPI ( 132 )
 MAX_SEQUENCE_LENGTH = int(TARGET_SAMPLING_RATE_HZ * 35.0)
-TRAIN_VAL_SPLIT = 0.9
+TRAIN_VAL_SPLIT = 1.0
 
 # Parameters for synchronization and segmentation
 SYNC_WINDOW_S = 5.0  # Window for correlation in estimate_time_alignment_two_taps
 ROI_TAP_SEARCH_WINDOW_S = 5.0  # Initial search window for taps to define ROI in preprocess_single
 ROI_MARGIN_S = 0.5  # Margin around taps to define writing ROI
 MIN_SEGMENT_LENGTH_S = 1.0 # Minimum length for a valid segment (after margin)
+STATIC_BUFFER_S = 2 # Static buffer duration to include before the segment
+
+# Digitizer Error Detection
+DIGITIZER_JUMP_THRESHOLD_M = 0.010  # 10mm - Maximum plausible single-frame position jump
+DIGITIZER_JUMP_MIN_VELOCITY = 0.5  # m/s - Minimum velocity threshold to trigger jump detection (ignore static regions)
 
 
 # --- Helper Functions (Preprocessing) ---
 
 def butter_lowpass_filter(data: np.ndarray, cutoff: float, fs: float, order: int) -> np.ndarray:
+    """Zero-phase Butterworth lowpass filter using filtfilt.
+
+    Unlike lfilter (causal), filtfilt processes the signal forward and backward,
+    resulting in zero phase distortion - critical for preserving temporal alignment
+    between FSR and velocity features in training data.
+    """
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
-    b, a = iirfilter(order, normal_cutoff, btype='low', ftype='butter', analog=False)
-    return lfilter(b, a, data)
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return filtfilt(b, a, data)
 
 def pad_sequence(data: np.ndarray, max_len: int, is_velocity: bool = False) -> np.ndarray:
+    """Pads or truncates sequence to fixed length with appropriate padding strategy.
+
+    Implements two padding strategies based on data type:
+    - **Position/sensor data**: Edge padding (repeat last value) to maintain continuity
+    - **Velocity data**: Zero padding to avoid artificial motion
+
+    This function is used to normalize all sequences to MAX_SEQUENCE_LENGTH for
+    batched training, as PyTorch requires fixed-size tensors.
+
+    Args:
+        data: Input sequence array of shape [seq_len, features]
+        max_len: Target sequence length (usually MAX_SEQUENCE_LENGTH=1750)
+        is_velocity: If True, use zero padding; if False, use edge padding.
+            Default: False
+
+    Returns:
+        np.ndarray: Padded/truncated array of shape [max_len, features]
+
+    Example:
+        >>> position = np.random.randn(1000, 3)  # Short sequence
+        >>> padded_pos = pad_sequence(position, 1750, is_velocity=False)
+        >>> padded_pos.shape
+        (1750, 3)
+        >>> # Last 750 samples are copies of position[999]
+
+        >>> velocity = np.random.randn(2000, 3)  # Long sequence
+        >>> padded_vel = pad_sequence(velocity, 1750, is_velocity=True)
+        >>> padded_vel.shape
+        (1750, 3)
+        >>> # Truncated to first 1750 samples
+    """
     seq_len = min(len(data), max_len)
     padded = np.zeros((max_len, data.shape[1]))
     padded[:seq_len, :] = data[:seq_len, :]
 
     if not is_velocity and seq_len < max_len:
+        # Edge padding: Repeat last value for position/sensor data
         padded[seq_len:, :] = data[seq_len - 1, :]
+    # Velocity uses zero padding (default from np.zeros initialization)
     return padded
 
+def detect_digitizer_jumps(pos_xyz: np.ndarray, force: np.ndarray, fs: float) -> Dict[str, Any]:
+    """Detect unrealistic position jumps caused by digitizer errors.
+
+    Args:
+        pos_xyz: Position array [N, 3] in meters (x, y, z)
+        force: Force array [N] normalized 0-1 (or raw FSR values)
+        fs: Sampling frequency in Hz
+
+    Returns:
+        Dictionary containing:
+            - has_jumps: bool
+            - jump_indices: List of sample indices where jumps occur
+            - jump_magnitudes: List of jump distances in meters
+            - max_jump: Maximum jump distance in meters
+            - num_jumps: Total number of jumps detected
+    """
+    if len(pos_xyz) < 2:
+        return {
+            "has_jumps": False,
+            "jump_indices": [],
+            "jump_magnitudes": [],
+            "max_jump": 0.0,
+            "num_jumps": 0
+        }
+
+    # Calculate frame-to-frame position differences
+    pos_diff = np.diff(pos_xyz, axis=0)
+    jump_distances = np.linalg.norm(pos_diff, axis=1)
+
+    # Calculate instantaneous velocity (m/s)
+    dt = 1.0 / fs
+    velocities = jump_distances / dt
+
+    # Detect jumps: position change exceeds threshold AND velocity is above minimum
+    # (ignore static regions where small noise can look like relative jumps)
+    is_moving = velocities > DIGITIZER_JUMP_MIN_VELOCITY
+    is_jump = (jump_distances > DIGITIZER_JUMP_THRESHOLD_M) & is_moving
+
+    jump_indices = np.where(is_jump)[0] + 1  # +1 because diff shifts indices
+    jump_magnitudes = jump_distances[is_jump].tolist()
+
+    result = {
+        "has_jumps": bool(np.any(is_jump)),
+        "jump_indices": jump_indices.tolist(),
+        "jump_magnitudes": jump_magnitudes,
+        "max_jump": float(np.max(jump_distances)) if len(jump_distances) > 0 else 0.0,
+        "num_jumps": int(np.sum(is_jump))
+    }
+
+    return result
+
 def preprocess_gt_data(gt_data_dict: Dict[str, np.ndarray], target_fs: float) -> pd.DataFrame:
+    """Preprocesses ground truth data from iPad: unit conversion, filtering, resampling.
+
+    This function performs a complete preprocessing pipeline on raw iPad Apple Pencil data:
+
+    **Step 1: Unit Conversion**
+    - X, Y: pixels → meters (using PIXEL_TO_METER = 0.0254/132 for iPad Retina 264 PPI)
+    - Z: Calculated from hoverDistance (mm) using power law: z = 12.49 * hover^0.78 / 1000
+
+    **Step 2: Outlier Filtering**
+    - Detects unrealistic position jumps (>100 pixels ≈ 9.6mm in single frame)
+    - Removes outlier frames caused by digitizer glitches
+
+    **Step 3: Gaussian Smoothing**
+    - Applies Gaussian filter (sigma=1.0) to x, y, z, force
+    - Reduces high-frequency noise from 240Hz iPad sampling
+
+    **Step 4: Resampling**
+    - Resamples to target_fs (50.107 Hz) using PCHIP interpolation
+    - PCHIP (Piecewise Cubic Hermite) preserves monotonicity and avoids overshooting
+    - Handles duplicate timestamps and sorts data temporally
+
+    Args:
+        gt_data_dict: Dictionary with keys:
+            - 'timestamp': Unix timestamps in seconds (float)
+            - 'x', 'y': Position in pixels (float)
+            - 'hoverDistance': Pencil hover distance in mm (float)
+            - 'force': Normalized pressure 0-1 (float)
+            - Optional: 'azimuthAngle', 'altitudeAngle'
+        target_fs: Target sampling frequency in Hz (typically TARGET_SAMPLING_RATE_HZ=50.107)
+
+    Returns:
+        pd.DataFrame: Preprocessed ground truth data with columns:
+            - 'timestamp': Resampled timestamps at target_fs
+            - 'x', 'y', 'z': Position in meters (float)
+            - 'force': Smoothed force 0-1 (float)
+            - Other numeric columns from input (resampled)
+
+    Note:
+        - All position outputs are in SI units (meters)
+        - Z-axis accuracy is limited by Apple Pencil hover distance noise
+        - Short sequences (<2 samples) are returned without resampling
+
+    Example:
+        >>> raw_gt = {
+        ...     'timestamp': np.array([1.0, 1.004, 1.008]),
+        ...     'x': np.array([512.0, 513.0, 514.0]),  # pixels
+        ...     'y': np.array([768.0, 769.0, 770.0]),
+        ...     'hoverDistance': np.array([5.0, 5.1, 5.2]),  # mm
+        ...     'force': np.array([0.5, 0.6, 0.7])
+        ... }
+        >>> df = preprocess_gt_data(raw_gt, 50.107)
+        >>> df['x'].values  # Now in meters
+        array([0.098..., 0.099..., 0.100...])
+    """
     df = pd.DataFrame(gt_data_dict)
     if "timestamp" not in df.columns:
         return df
 
+    # STEP 1: Convert all units FIRST (pixels → meters, mm → meters)
+    # Convert X, Y from pixels to meters
+    df["x"] = df["x"] * PIXEL_TO_METER
+    df["y"] = df["y"] * PIXEL_TO_METER
+
+    # Calculate and convert Z from hoverDistance (mm → meters)
     if "hoverDistance" in df.columns:
         df = df.rename(columns={"hoverDistance": "zOffset"})
-        df["z"] = 12.49 * df["zOffset"].pow(0.78)
+        df["z"] = 12.49 * df["zOffset"].pow(0.78) / 1000.0
+
+    # STEP 2: Outlier filtering (now in meters)
+    pos_diff = np.diff(df[["x", "y"]].to_numpy(), axis=0)
+    dist = np.linalg.norm(pos_diff, axis=1)
+
+    # Threshold in meters: 100 pixels * PIXEL_TO_METER ≈ 0.0096 m
+    valid_mask = np.insert(dist < (100.0 * PIXEL_TO_METER), 0, True)
+    df = df[valid_mask].reset_index(drop=True)
+
+    # STEP 3: Gaussian smoothing (sigma is in sample units, not data units)
+    for col in ["x", "y", "z", "force"]:
+        if col in df.columns:
+            df[col] = gaussian_filter1d(df[col].to_numpy(), sigma=1.0)
 
     # Sort and unique
     original_time = df["timestamp"].to_numpy()
@@ -142,13 +311,66 @@ def preprocess_gt_data(gt_data_dict: Dict[str, np.ndarray], target_fs: float) ->
     return upsampled_df
 
 def estimate_time_alignment_two_taps(sig_ref: np.ndarray, sig_target: np.ndarray, fs: float) -> Tuple[float, float, bool]:
+    """Estimates clock drift and offset using two-tap correlation synchronization.
+
+    This is the core synchronization algorithm for aligning ESP32 IMU data with
+    iPad ground truth. It exploits the "Tap-Wait-Write-Tap" acquisition protocol:
+
+    **Protocol Overview:**
+    1. Start Tap: Sharp acceleration spike at sequence beginning
+    2. Writing: Actual handwriting motion
+    3. End Tap: Sharp acceleration spike at sequence end
+
+    **Algorithm:**
+    1. Correlates start window (first SYNC_WINDOW_S seconds) to find lag_start
+    2. Correlates end window (last SYNC_WINDOW_S seconds) to find lag_end
+    3. Calculates linear clock drift:
+       - slope = (distance_ratio - 1.0) where ratio accounts for lag differences
+       - intercept = lag_start (initial time offset)
+
+    **Clock Drift Model:**
+    ```
+    target_time[i] = source_time[i] * (1 + slope) + intercept
+    ```
+    - slope: Clock rate mismatch (dimensionless, typically ±0.001 = ±1000 ppm)
+    - intercept: Initial time offset in samples
+
+    Args:
+        sig_ref: Reference signal (ESP32 acceleration norm - GRAVITY), normalized
+        sig_target: Target signal (iPad force), normalized
+        fs: Sampling frequency in Hz (must be same for both signals)
+
+    Returns:
+        Tuple[float, float, bool]:
+            - slope: Clock drift coefficient (dimensionless)
+            - intercept: Initial offset in samples
+            - success: True if sync succeeded, False if sequence too short
+
+    Example:
+        >>> # ESP32 clock runs 0.1% faster than iPad
+        >>> slope, intercept, ok = estimate_time_alignment_two_taps(
+        ...     sig_sensor, sig_gt, 50.107
+        ... )
+        >>> print(f"Drift: {slope*1e6:.1f} ppm, Offset: {intercept:.1f} samples")
+        Drift: +1000.0 ppm, Offset: -5.2 samples
+
+    Note:
+        - Requires sequences longer than 2*SYNC_WINDOW_S (default: 10s total)
+        - Both signals must be normalized (zero mean, unit variance)
+        - Accuracy degrades if taps are not sharp/distinct
+        - Correlation assumes taps are the dominant signal features
+
+    See Also:
+        - preprocess_single(): Applies the computed alignment to data
+        - SYNC_WINDOW_S: Correlation window size constant
+    """
     # Simplified version of the one in preprocess.py
     n = min(len(sig_ref), len(sig_target))
     window = int(SYNC_WINDOW_S * fs)
     if n < 2 * window:
         return 0.0, 0.0, False
 
-    # Start
+    # Start tap correlation
     corr_start = correlate(sig_ref[:window] - np.mean(sig_ref[:window]),
                            sig_target[:window] - np.mean(sig_target[:window]), mode='full')
     lag_start = correlation_lags(window, window, mode='full')[np.argmax(corr_start)]
@@ -171,54 +393,60 @@ def estimate_time_alignment_two_taps(sig_ref: np.ndarray, sig_target: np.ndarray
     return slope, intercept, True
 
 def find_force_segments(df_gt: pd.DataFrame, threshold: int, margin: int) -> List[Tuple[int, int]]:
+    """Detects active writing segments from iPad force signal using threshold detection.
+
+    Identifies continuous regions where Apple Pencil force exceeds a threshold,
+    indicating actual writing (as opposed to hover or static periods).
+
+    **Algorithm:**
+    1. Threshold force signal to create binary active mask
+    2. Detect rising edges (start of writing) and falling edges (end of writing)
+    3. Add margin samples around each segment to avoid truncating stroke boundaries
+    4. Handle edge cases (active at start/end of sequence)
+
+    Args:
+        df_gt: Ground truth DataFrame containing 'force' column (0-1 normalized)
+        threshold: Force threshold for active writing detection (typically SEGMENTATION_THRESHOLD=0.01)
+        margin: Number of samples to add before/after each segment (typically SEGMENTATION_MARGIN=30)
+
+    Returns:
+        List[Tuple[int, int]]: List of (start_idx, end_idx) tuples for each writing segment.
+            Returns [(0, len(df_gt))] if no force data or no active segments detected.
+
+    Example:
+        >>> df = pd.DataFrame({'force': [0, 0, 0.5, 0.6, 0.7, 0, 0]})
+        >>> segments = find_force_segments(df, threshold=0.01, margin=1)
+        >>> segments
+        [(1, 6)]  # Segment from index 1 to 6 (includes margin)
+
+    Note:
+        - Margin prevents cutting off stroke starts/ends due to force ramping
+        - Multiple segments may be returned for discontinuous writing
+        - Segment boundaries are clipped to [0, len(force)]
+
+    See Also:
+        - SEGMENTATION_THRESHOLD: Global force threshold constant
+        - SEGMENTATION_MARGIN: Global margin constant
+    """
     if "force" not in df_gt.columns: return [(0, len(df_gt))]
     force = df_gt["force"].to_numpy()
     active = force > threshold
     if not np.any(active): return [(0, len(force))]
 
+    # Detect segment boundaries using diff on binary mask
     diff = np.diff(active.astype(int))
-    starts = np.where(diff == 1)[0] + 1
-    ends = np.where(diff == -1)[0]
+    starts = np.where(diff == 1)[0] + 1  # Rising edges (+1 to get first active sample)
+    ends = np.where(diff == -1)[0]       # Falling edges (last active sample)
+
+    # Handle edge cases
     if active[0]: starts = np.insert(starts, 0, 0)
     if active[-1]: ends = np.append(ends, len(force) - 1)
 
+    # Apply margin and clip to valid range
     segments = []
     for s, e in zip(starts, ends):
-        segments.append((max(0, s - margin), min(len(force), e + margin)))
+        segments.append((max(0, s - margin), min(len(force), e + margin + 1)))
     return segments
-
-def check_and_fix_gt_jump(self, df: pd.DataFrame, threshold_pt: float = 0.5) -> pd.DataFrame:
-    touch_starts = df.index[(df['isHovering'].shift(1) == 0) & (df['isHovering'] > 0)].tolist()
-
-    if not touch_starts:
-        return df
-
-    corrected_df = df.copy()
-    was_any_fixed = False
-
-    for idx in touch_starts:
-        if idx < 1: continue
-
-        prev_avg = df.loc[idx-2:idx-1, ['x', 'y']].mean()
-        curr_avg = df.loc[idx:idx+1, ['x', 'y']].mean()
-
-        diff = curr_avg - prev_avg
-        jump_dist = np.sqrt(diff['x']**2 + diff['y']**2)
-
-        if jump_dist > threshold_pt:
-            print(f"\n[Segment Jump at Index {idx}]")
-            print(f"  - Jump: {jump_dist:.2f} pts")
-
-            choice = input(f"  - Align hover segment ending at {idx}? (y/n): ").lower()
-            if choice == 'y':
-                last_touch_end = df[:idx].index[df['force'].shift(-1) > 0].tolist()
-                hover_start = last_touch_end[-2] + 1 if len(last_touch_end) > 1 else 0
-
-                corrected_df.loc[hover_start:idx-1, 'x'] += diff['x']
-                corrected_df.loc[hover_start:idx-1, 'y'] += diff['y']
-                was_any_fixed = True
-
-    return corrected_df, was_any_fixed
 
 # --- Acquisition & Processing Class ---
 
@@ -229,7 +457,7 @@ class AcquisitionManager:
         os.makedirs("data", exist_ok=True)
 
         self.driver = None
-        self.pen_buffer = []
+        self.pen_buffer = []  # List[Dict]: IMU data in SI units (m/s², rad/s)
         self.global_counter = 0
         self.ipad_counter = 1
 
@@ -254,7 +482,7 @@ class AcquisitionManager:
 
     async def connect(self):
         print("Connecting to Device...")
-        self.driver = TrajectoDriver(data_callback=self._on_data)
+        self.driver = TrajectoDriver(raw_callback=self._on_data, verbose=True)
         if await self.driver.connect():
             print("Connected!")
             return True
@@ -265,7 +493,22 @@ class AcquisitionManager:
             await self.driver.disconnect()
             print("Disconnected.")
 
-    def _on_data(self, data):
+    def _on_data(self, packet: RawImuPacket):
+        """Callback for raw IMU packets from BLE
+
+        Stores data in SI units (m/s², rad/s) as received from firmware.
+        No conversion needed - units are already correct for preprocessing.
+        """
+        data = {
+            "time": packet.timestamp_us / 1_000_000.0,  # microseconds → seconds
+            "accel_x": packet.accel[0],  # m/s² (from firmware)
+            "accel_y": packet.accel[1],  # m/s²
+            "accel_z": packet.accel[2],  # m/s²
+            "gyro_x": packet.gyro[0],    # rad/s (from firmware)
+            "gyro_y": packet.gyro[1],    # rad/s
+            "gyro_z": packet.gyro[2],    # rad/s
+            "fsr": packet.force          # raw ADC value
+        }
         self.pen_buffer.append(data)
 
     async def setup_counters(self):
@@ -284,9 +527,13 @@ class AcquisitionManager:
         if not self.driver:
             return False
 
-        print(f"\n--- ACQUISITION: {self.global_counter + 1:03d} ---")
+        print(f"\n--- ACQUISITION: {(self.global_counter + 1):03d} ---")
         input("Press Enter to START recording...")
-        await self.driver.start_data_collection()
+
+        # Start streaming in RAW mode (mode=0)
+        if not await self.driver.start_streaming(mode=0):
+            print("Failed to start streaming!")
+            return False
 
         print("1. TAP (Start Sync)")
         os.system("afplay /System/Library/Sounds/Tink.aiff &")
@@ -297,7 +544,7 @@ class AcquisitionManager:
             print(f"         {i}...")
             await asyncio.sleep(1.0)
 
-        print("3. WRITE NOW! >>> {label}")
+        print(f"3. WRITE NOW! >>> {label}")
         os.system("afplay /System/Library/Sounds/Glass.aiff &")
         input("   Press Enter when FINISHED writing...")
 
@@ -309,7 +556,7 @@ class AcquisitionManager:
         os.system("afplay /System/Library/Sounds/Tink.aiff &")
         await asyncio.sleep(1.5)
 
-        await self.driver.stop_data_collection()
+        await self.driver.stop_streaming()
         print(f"Captured {len(self.pen_buffer)} samples.")
         return True
 
@@ -331,9 +578,91 @@ class AcquisitionManager:
         return None
 
     def preprocess_single(self, pen_data: List[Dict], df_gt_raw: pd.DataFrame, sample_name: str = "temp") -> Tuple[Optional[List[Dict]], Dict]:
-        """
-        Runs the preprocessing logic on a single in-memory sample.
-        Returns: (List of Processed Segments, Debug Info Dict)
+        """Preprocesses a single raw acquisition: synchronization, segmentation, filtering.
+
+        This is the core preprocessing pipeline that transforms raw sensor + iPad data
+        into training-ready samples. The pipeline consists of:
+
+        **Step 1: Data Preparation**
+        - Converts pen_data list to DataFrame (already in SI units: m/s², rad/s)
+        - Preprocesses ground truth via preprocess_gt_data() (unit conversion, resampling)
+
+        **Step 2: Two-Tap Synchronization**
+        - Normalizes acceleration magnitude and iPad force signals
+        - Runs estimate_time_alignment_two_taps() to get drift parameters
+        - Applies linear time warping: target_idx = source_idx * (1 + slope) + intercept
+        - Trims NaN values from interpolation boundaries
+        - Prints detailed time-lag compensation report
+
+        **Step 3: Digitizer Error Detection**
+        - Detects unrealistic position jumps in ground truth (>10mm single frame)
+        - Prints warning if jumps detected (possible iPad digitizer glitches)
+        - See detect_digitizer_jumps() for details
+
+        **Step 4: Segmentation (ROI Extraction)**
+        - Finds start/end taps in force signal to define Region of Interest
+        - Applies ROI_MARGIN_S to exclude tap artifacts
+        - Uses find_force_segments() to detect writing regions
+        - Adds STATIC_BUFFER_S (2s) before segment for ESKF initialization
+
+        **Step 5: FSR Filtering**
+        - Applies zero-phase Butterworth lowpass filter to FSR signal
+        - Cutoff: CUTOFF_FREQ_HZ (5 Hz), Order: 4
+
+        **Step 6: Output Formatting**
+        - Stacks sensor channels: [accel_xyz(3), gyro_xyz(3), fsr(1)] → (N, 7)
+        - Calculates ground truth velocity via np.gradient()
+        - Ensures Z position has minimum value (1e-7) to avoid numerical issues
+        - Returns segments with metadata
+
+        Args:
+            pen_data: List of IMU data dicts from BLE, keys:
+                - 'time': timestamp in seconds
+                - 'accel_x/y/z': acceleration in m/s²
+                - 'gyro_x/y/z': angular velocity in rad/s
+                - 'fsr': force sensor raw ADC value
+            df_gt_raw: Raw iPad DataFrame from CSV with columns:
+                - 'timestamp': Unix time in seconds
+                - 'x', 'y': position in pixels
+                - 'hoverDistance': hover in mm
+                - 'force': pressure 0-1
+            sample_name: Identifier for debug/visualization (e.g., "sample_042")
+
+        Returns:
+            Tuple[Optional[List[Dict]], Dict]:
+                - segments: List of processed segment dicts (or None on failure):
+                    - 'name': Segment identifier (e.g., "sample_042_seg0")
+                    - 'sensor': Sensor data [N, 7] (accel, gyro, fsr) in SI units
+                    - 'gt_pos': Ground truth position [N, 3] in meters
+                    - 'gt_vel': Ground truth velocity [N, 3] in m/s
+                - debug_info: Dictionary for visualization:
+                    - 'sync_success': bool
+                    - 'slope', 'intercept': Sync parameters
+                    - 'sensor_aligned', 'gt_aligned': Aligned DataFrames
+                    - 'segment': (start_idx, end_idx) tuple
+                    - 'digitizer_jumps': Jump detection results
+                    - 'error': Error message (if failed)
+
+        Example:
+            >>> manager = AcquisitionManager()
+            >>> pen_data = [...]  # From BLE acquisition
+            >>> df_gt = pd.read_csv("Sample_1.csv")
+            >>> segments, debug = manager.preprocess_single(pen_data, df_gt, "sample_001")
+            >>> if segments:
+            ...     print(f"Success! {len(segments)} segments")
+            ...     print(f"Sensor shape: {segments[0]['sensor'].shape}")
+
+        Note:
+            - Prints verbose synchronization diagnostics to console
+            - All units are SI (meters, m/s, m/s², rad/s)
+            - Digitizer jumps are detected but NOT corrected (manual review required)
+            - Z-axis uses power-law hover distance estimate (less accurate than X/Y)
+
+        See Also:
+            - estimate_time_alignment_two_taps(): Synchronization algorithm
+            - detect_digitizer_jumps(): Jump detection
+            - find_force_segments(): Segmentation
+            - visualize_sync(): Debug visualization
         """
         debug_info = {}
 
@@ -341,15 +670,15 @@ class AcquisitionManager:
         if not pen_data:
             return None, {"error": "No pen data"}
         df_sensor = pd.DataFrame(pen_data)
-        # Convert Accel to m/s^2 (assuming raw is in g)
-        for axis in ["x", "y", "z"]:
-            if f"accel_{axis}" in df_sensor.columns:
-                 df_sensor[f"accel_{axis}"] *= GRAVITY
+        # Data is already in SI units (m/s², rad/s) from firmware via BLE
+        # No conversion needed - ready for processing
 
         # 2. Prepare GT Data
         df_gt_proc = preprocess_gt_data(df_gt_raw.to_dict(orient='list'), TARGET_SAMPLING_RATE_HZ)
 
         # 3. Synchronization (Two-Tap / Correlation)
+        # Calculate acceleration magnitude (in m/s²)
+        # Subtract GRAVITY (9.80665 m/s²) to remove DC offset and detect taps
         acc_norm = np.sqrt(df_sensor["accel_x"]**2 + df_sensor["accel_y"]**2 + df_sensor["accel_z"]**2)
         sig_sensor = (acc_norm - GRAVITY) / (acc_norm.std() + 1e-6)
 
@@ -361,6 +690,26 @@ class AcquisitionManager:
         debug_info["sync_success"] = success
         debug_info["slope"] = slope
         debug_info["intercept"] = intercept
+
+        # === TIME-LAG COMPENSATION REPORT ===
+        duration_s = len(df_gt_proc) / TARGET_SAMPLING_RATE_HZ
+        time_offset_ms = (intercept / TARGET_SAMPLING_RATE_HZ) * 1000.0  # samples → ms
+        drift_ppm = slope * 1e6  # dimensionless → parts per million
+        total_drift_ms = (slope * len(df_gt_proc) / TARGET_SAMPLING_RATE_HZ) * 1000.0
+
+        print(f"\n{'='*60}")
+        print(f"TIME-LAG COMPENSATION: {sample_name}")
+        print(f"{'='*60}")
+        print(f"Status:   {'Two-Tap Sync' if success else 'Fallback Correlation'}")
+        print(f"Duration: {duration_s:.1f}s ({len(df_gt_proc)} samples @ {TARGET_SAMPLING_RATE_HZ}Hz)")
+        print(f"\nCompensation Values:")
+        print(f"  • Intercept: {intercept:+8.1f} samples = {time_offset_ms:+7.2f} ms")
+        print(f"  • Slope:     {slope:+.6f}         = {drift_ppm:+7.1f} ppm")
+        print(f"  • Total Drift: {total_drift_ms:+.2f} ms over {duration_s:.1f}s")
+        print(f"\nInterpretation:")
+        print(f"  ESP32 clock was {abs(time_offset_ms):.1f}ms {'ahead' if time_offset_ms > 0 else 'behind'} at start")
+        print(f"  ESP32 clock runs {abs(drift_ppm):.1f}ppm {'faster' if drift_ppm > 0 else 'slower'} than iPad")
+        print(f"{'='*60}")
 
         if success:
             # Apply Drift Correction
@@ -387,6 +736,11 @@ class AcquisitionManager:
             lag = correlation_lags(len(sig_sensor), len(sig_gt), mode='full')[np.argmax(corr)]
             debug_info["lag"] = lag
 
+            lag_ms = (lag / TARGET_SAMPLING_RATE_HZ) * 1000.0
+            print(f"\nFallback: Simple cross-correlation")
+            print(f"  • Lag: {lag:+d} samples = {lag_ms:+.2f} ms")
+            print(f"  (No clock drift correction - assumes constant rate)")
+
             if lag > 0:
                 df_sensor_aligned = df_sensor.iloc[lag:].reset_index(drop=True)
                 df_gt_aligned = df_gt_proc
@@ -402,9 +756,28 @@ class AcquisitionManager:
         debug_info["sensor_aligned"] = df_sensor_aligned
         debug_info["gt_aligned"] = df_gt_aligned
 
-        # Check point jumps in gt_data
-        df_gt_aligned, was_corrected = self.check_and_fix_gt_jump(df_gt_aligned)
-        debug_info["jump_corrected"] = was_corrected
+        # === DIGITIZER ERROR DETECTION ===
+        gt_pos = df_gt_aligned[["x", "y", "z"]].to_numpy()
+        gt_force_arr = df_gt_aligned["force"].to_numpy() if "force" in df_gt_aligned.columns else np.zeros(len(df_gt_aligned))
+
+        jump_info = detect_digitizer_jumps(gt_pos, gt_force_arr, TARGET_SAMPLING_RATE_HZ)
+        debug_info["digitizer_jumps"] = jump_info
+
+        if jump_info["has_jumps"]:
+            print(f"\n{'='*60}")
+            print(f"DIGITIZER JUMP DETECTION: {sample_name}")
+            print(f"{'='*60}")
+            print(f"Detected {jump_info['num_jumps']} position jump(s) in ground truth data:")
+            for idx, mag in zip(jump_info["jump_indices"], jump_info["jump_magnitudes"]):
+                time_s = idx / TARGET_SAMPLING_RATE_HZ
+                print(f"  • Sample {idx} (t={time_s:.2f}s): {mag*1000:.1f} mm jump")
+            print(f"\nMax jump: {jump_info['max_jump']*1000:.1f} mm (Threshold: {DIGITIZER_JUMP_THRESHOLD_M*1000:.1f} mm)")
+            print(f"\nPossible causes:")
+            print(f"  • iPad digitizer glitches during data collection")
+            print(f"  • Pencil tracking errors (occlusion, edge effects)")
+            print(f"  • Rapid movements exceeding digitizer sample rate")
+            print(f"\nNote: Review visualization carefully before saving.")
+            print(f"{'='*60}")
 
         # 4. Segmentation
         # Find start/end taps in GT Force to define ROI
@@ -438,6 +811,9 @@ class AcquisitionManager:
         # Merge segments into one block for Trajecto usually
         final_start, final_end = segments[0][0], segments[-1][1]
 
+        static_buffer_samples = int(STATIC_BUFFER_S * TARGET_SAMPLING_RATE_HZ)
+        final_start = max(0, final_start - static_buffer_samples)
+
         debug_info["segment"] = (final_start, final_end)
 
         # Extract Final Segment
@@ -451,10 +827,10 @@ class AcquisitionManager:
         # Format Output
         processed_segments = []
 
+        # All coordinates are already in meters from preprocess_gt_data
         gt_pos = df_g_seg[["x", "y", "z"]].to_numpy()
-        gt_pos[:, 0] *= PIXEL_TO_METER
-        gt_pos[:, 1] *= PIXEL_TO_METER
-        gt_pos[:, 2] = np.maximum(gt_pos[:, 2] * 0.001, 1e-7) # mm -> m
+        # Ensure Z has minimum value to avoid numerical issues
+        gt_pos[:, 2] = np.maximum(gt_pos[:, 2], 1e-7)
 
         gt_vel = np.gradient(gt_pos, 1.0/TARGET_SAMPLING_RATE_HZ, axis=0)
 
@@ -475,7 +851,7 @@ class AcquisitionManager:
         return processed_segments, debug_info
 
     def visualize_sync(self, debug_info: Dict, label: str):
-        """Shows synchronization plot to the user."""
+        """Shows comprehensive data integrity visualization."""
         if "sensor_aligned" not in debug_info:
             print("Cannot visualize: No aligned data.")
             return
@@ -483,24 +859,170 @@ class AcquisitionManager:
         df_s = debug_info["sensor_aligned"]
         df_g = debug_info["gt_aligned"]
         seg_start, seg_end = debug_info.get("segment", (0, 0))
+        jump_info = debug_info.get("digitizer_jumps", {})
 
+        # Create time axis in seconds
+        time_s = np.arange(len(df_s)) / TARGET_SAMPLING_RATE_HZ
+
+        # Prepare data
         acc_norm = np.sqrt(df_s["accel_x"]**2 + df_s["accel_y"]**2 + df_s["accel_z"]**2)
         gt_force = df_g["force"] if "force" in df_g.columns else np.zeros(len(df_g))
+        fsr = df_s["fsr"].to_numpy() if "fsr" in df_s.columns else np.zeros(len(df_s))
 
-        # Normalize for plotting
+        # GT position (already in meters)
+        gt_x = df_g["x"].to_numpy() if "x" in df_g.columns else np.zeros(len(df_g))
+        gt_y = df_g["y"].to_numpy() if "y" in df_g.columns else np.zeros(len(df_g))
+        gt_z = df_g["z"].to_numpy() if "z" in df_g.columns else np.zeros(len(df_g))
+
+        # Gyro data
+        gyro_norm = np.sqrt(df_s["gyro_x"]**2 + df_s["gyro_y"]**2 + df_s["gyro_z"]**2)
+
+        # Create figure with subplots
+        fig = plt.figure(figsize=(16, 10))
+        gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.3)
+
+        # 1. Sync Check (top left)
+        ax1 = fig.add_subplot(gs[0, 0])
         acc_vis = (acc_norm - acc_norm.mean()) / (acc_norm.std() + 1e-6)
         force_vis = (gt_force - gt_force.mean()) / (gt_force.std() + 1e-6)
+        ax1.plot(time_s, acc_vis, label="Sensor Accel (Norm)", alpha=0.7, linewidth=1)
+        ax1.plot(time_s, force_vis, label="GT Force (Norm)", alpha=0.7, linewidth=1)
+        ax1.axvspan(seg_start/TARGET_SAMPLING_RATE_HZ, seg_end/TARGET_SAMPLING_RATE_HZ,
+                    color='green', alpha=0.2, label="Selected Segment")
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(acc_vis, label="Sensor Accel (Norm)", alpha=0.7)
-        plt.plot(force_vis, label="GT Force (Norm)", alpha=0.7)
+        # Mark digitizer jumps
+        if jump_info.get("has_jumps"):
+            for idx in jump_info["jump_indices"]:
+                if idx < len(time_s):
+                    ax1.axvline(time_s[idx], color='red', linestyle='--', alpha=0.6, linewidth=2)
 
-        # Highlight Segment
-        plt.axvspan(seg_start, seg_end, color='green', alpha=0.2, label="Selected Segment")
+        ax1.set_title("Synchronization Check")
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Normalized Signal")
+        ax1.legend(loc='upper right', fontsize=8)
+        ax1.grid(True, alpha=0.3)
 
-        plt.title(f"Sync Check: {label}\n(Close window to continue)")
-        plt.legend()
-        plt.grid(True)
+        # 2. GT Position XY (top right)
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.plot(gt_x * 1000, gt_y * 1000, 'b-', linewidth=1.5, alpha=0.7)
+        ax2.plot(gt_x[0] * 1000, gt_y[0] * 1000, 'go', markersize=8, label='Start')
+        ax2.plot(gt_x[-1] * 1000, gt_y[-1] * 1000, 'ro', markersize=8, label='End')
+
+        # Mark digitizer jump locations
+        if jump_info.get("has_jumps"):
+            for idx in jump_info["jump_indices"]:
+                if idx < len(gt_x):
+                    ax2.plot(gt_x[idx] * 1000, gt_y[idx] * 1000, 'rx', markersize=12,
+                            markeredgewidth=3, label='Jump' if idx == jump_info["jump_indices"][0] else '')
+
+        ax2.set_title("GT Trajectory (X-Y)" + (f" [{jump_info['num_jumps']} jump(s)]" if jump_info.get("has_jumps") else ""))
+        ax2.set_xlabel("X (mm)")
+        ax2.set_ylabel("Y (mm)")
+        ax2.axis('equal')
+        ax2.legend(loc='upper right', fontsize=8)
+        ax2.grid(True, alpha=0.3)
+
+        # 3. GT Position Time Series (middle left)
+        ax3 = fig.add_subplot(gs[1, 0])
+        ax3.plot(time_s, gt_x * 1000, label='X', alpha=0.7, linewidth=1)
+        ax3.plot(time_s, gt_y * 1000, label='Y', alpha=0.7, linewidth=1)
+        ax3.plot(time_s, gt_z * 1000, label='Z', alpha=0.7, linewidth=1)
+        ax3.axvspan(seg_start/TARGET_SAMPLING_RATE_HZ, seg_end/TARGET_SAMPLING_RATE_HZ,
+                    color='green', alpha=0.2)
+
+        # Mark digitizer jumps
+        if jump_info.get("has_jumps"):
+            for idx in jump_info["jump_indices"]:
+                if idx < len(time_s):
+                    ax3.axvline(time_s[idx], color='red', linestyle='--', alpha=0.6, linewidth=2)
+
+        ax3.set_title("GT Position vs Time")
+        ax3.set_xlabel("Time (s)")
+        ax3.set_ylabel("Position (mm)")
+        ax3.legend(loc='upper right', fontsize=8)
+        ax3.grid(True, alpha=0.3)
+
+        # 4. FSR Signal (middle right)
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.plot(time_s, fsr, 'purple', alpha=0.7, linewidth=1)
+        ax4.axvspan(seg_start/TARGET_SAMPLING_RATE_HZ, seg_end/TARGET_SAMPLING_RATE_HZ,
+                    color='green', alpha=0.2)
+        ax4.set_title("FSR Signal (Sensor)")
+        ax4.set_xlabel("Time (s)")
+        ax4.set_ylabel("FSR (ADC)")
+        ax4.grid(True, alpha=0.3)
+
+        # 5. Acceleration Components (bottom left)
+        ax5 = fig.add_subplot(gs[2, 0])
+        ax5.plot(time_s, df_s["accel_x"], label='X', alpha=0.7, linewidth=1)
+        ax5.plot(time_s, df_s["accel_y"], label='Y', alpha=0.7, linewidth=1)
+        ax5.plot(time_s, df_s["accel_z"], label='Z', alpha=0.7, linewidth=1)
+        ax5.axvspan(seg_start/TARGET_SAMPLING_RATE_HZ, seg_end/TARGET_SAMPLING_RATE_HZ,
+                    color='green', alpha=0.2)
+        ax5.set_title("Acceleration (Sensor)")
+        ax5.set_xlabel("Time (s)")
+        ax5.set_ylabel("Accel (m/s²)")
+        ax5.legend(loc='upper right', fontsize=8)
+        ax5.grid(True, alpha=0.3)
+
+        # 6. Gyro Components (bottom right)
+        ax6 = fig.add_subplot(gs[2, 1])
+        ax6.plot(time_s, df_s["gyro_x"], label='X', alpha=0.7, linewidth=1)
+        ax6.plot(time_s, df_s["gyro_y"], label='Y', alpha=0.7, linewidth=1)
+        ax6.plot(time_s, df_s["gyro_z"], label='Z', alpha=0.7, linewidth=1)
+        ax6.axvspan(seg_start/TARGET_SAMPLING_RATE_HZ, seg_end/TARGET_SAMPLING_RATE_HZ,
+                    color='green', alpha=0.2)
+        ax6.set_title("Gyroscope (Sensor)")
+        ax6.set_xlabel("Time (s)")
+        ax6.set_ylabel("Gyro (rad/s)")
+        ax6.legend(loc='upper right', fontsize=8)
+        ax6.grid(True, alpha=0.3)
+
+        # 7. Data Integrity Stats (bottom span)
+        ax7 = fig.add_subplot(gs[3, :])
+        ax7.axis('off')
+
+        # Calculate statistics
+        duration = len(df_s) / TARGET_SAMPLING_RATE_HZ
+        seg_duration = (seg_end - seg_start) / TARGET_SAMPLING_RATE_HZ
+        path_length_2d = np.sum(np.sqrt(np.diff(gt_x)**2 + np.diff(gt_y)**2)) * 1000  # mm
+        path_length_3d = np.sum(np.sqrt(np.diff(gt_x)**2 + np.diff(gt_y)**2 + np.diff(gt_z)**2)) * 1000  # mm
+
+        # GT velocity
+        gt_vel = np.sqrt(np.diff(gt_x)**2 + np.diff(gt_y)**2 + np.diff(gt_z)**2) * TARGET_SAMPLING_RATE_HZ
+        avg_velocity = np.mean(gt_vel) * 1000  # mm/s
+        max_velocity = np.max(gt_vel) * 1000  # mm/s
+
+        # Acceleration stats
+        acc_mean = np.mean(acc_norm)
+        acc_std = np.std(acc_norm)
+
+        # Build status text with digitizer warning
+        digitizer_status = ""
+        if jump_info.get("has_jumps"):
+            digitizer_status = f"\nDigitizer Jumps: {jump_info['num_jumps']} detected, max={jump_info['max_jump']*1000:.1f}mm (red markers on plots)"
+
+        stats_text = f"""
+                DATA INTEGRITY SUMMARY - {label}{digitizer_status}
+                ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                Total Duration: {duration:.2f}s ({len(df_s)} samples)  |  Segment Duration: {seg_duration:.2f}s ({seg_end-seg_start} samples)
+                Path Length: 2D={path_length_2d:.1f}mm, 3D={path_length_3d:.1f}mm  |  Velocity: avg={avg_velocity:.1f}mm/s, max={max_velocity:.1f}mm/s
+                Accel Magnitude: mean={acc_mean:.2f}m/s², std={acc_std:.2f}m/s²  |  FSR Range: [{np.min(fsr):.1f}, {np.max(fsr):.1f}]
+                GT Position Range: X=[{np.min(gt_x)*1000:.1f}, {np.max(gt_x)*1000:.1f}]mm, Y=[{np.min(gt_y)*1000:.1f}, {np.max(gt_y)*1000:.1f}]mm, Z=[{np.min(gt_z)*1000:.1f}, {np.max(gt_z)*1000:.1f}]mm
+                ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                Close window to continue...
+                        """
+
+        text_color = 'red' if jump_info.get("has_jumps") else 'black'
+        bg_color = 'lightyellow' if jump_info.get("has_jumps") else 'wheat'
+
+        ax7.text(0.5, 0.5, stats_text, fontsize=10, family='monospace',
+                 verticalalignment='center', horizontalalignment='center',
+                 color=text_color,
+                 bbox=dict(boxstyle='round', facecolor=bg_color, alpha=0.5, edgecolor='red' if jump_info.get("has_jumps") else 'gray'))
+
+        title_suffix = f" (Digitizer Jumps: {jump_info['num_jumps']})" if jump_info.get("has_jumps") else ""
+        fig.suptitle(f"Data Integrity Check: {label}{title_suffix}", fontsize=14, fontweight='bold')
         plt.show()
 
     def save_data(self, pen_data, df_gt, processed_segs, label, ipad_idx: int):
@@ -593,6 +1115,8 @@ class AcquisitionManager:
                 # Add random words
                 for _ in range(LABELS_PER_SESSION - len(labels)):
                         labels.append(" ".join(random.choices(WORD_LIST, k=random.randint(10, 20))))
+
+                labels = labels[:LABELS_PER_SESSION]
                 random.shuffle(labels)
 
                 session_buffer = []
@@ -674,53 +1198,79 @@ class AcquisitionManager:
             await self.disconnect()
 
     def run_reprocess(self):
-        """Batch re-preprocessing of existing raw data."""
+        """Interactive re-preprocessing of existing raw data."""
         print(f"Reprocessing raw data from {RAW_HDF5_PATH}...")
 
         if not os.path.exists(RAW_HDF5_PATH):
             print("Raw data file not found.")
             return
 
+        # 1. Load all raw samples
+        samples = []
         with h5py.File(RAW_HDF5_PATH, "r") as f:
             if "raw_data" not in f:
+                print("No 'raw_data' group found.")
                 return
-            samples = []
+
             for k in f["raw_data"]:
                 grp = f["raw_data"][k]
-
-                # Check for approval - Default to True for old data without attribute
-                if not grp.attrs.get("user_approved", True):
-                    # print(f"Skipping {k}: Not approved.")
-                    continue
-
+                # Load data into memory
                 samples.append({
                     "name": k,
-                    "pen_data": grp["pen_data"][:],
-                    "gt_data": grp["gt_data"][:],
+                    "pen_data": pd.DataFrame(grp["pen_data"][:]).to_dict('records'),
+                    "gt_data": pd.DataFrame(grp["gt_data"][:]),
                     "label": grp.attrs.get("original_label", "unknown")
                 })
 
         # Sort by name
         samples.sort(key=lambda x: x["name"])
-        print(f"Found {len(samples)} approved samples. Processing...")
+        print(f"Found {len(samples)} samples. Starting interactive review...")
 
         all_segments = []
-        for s in samples:
-            pen_list = pd.DataFrame(s["pen_data"]).to_dict('records')
-            gt_df = pd.DataFrame(s["gt_data"])
 
-            proc_segs, debug = self.preprocess_single(pen_list, gt_df, s["name"])
+        for i, s in enumerate(samples):
+            print(f"\n[{i+1}/{len(samples)}] Reviewing: {s['name']} (Label: {s['label']})")
+
+            # Run Preprocessing
+            proc_segs, debug = self.preprocess_single(s["pen_data"], s["gt_data"], s["name"])
 
             if proc_segs:
-                for seg in proc_segs:
-                    seg["original_label"] = s["label"]
-                    all_segments.append(seg)
-                print(f"  Processed {s['name']}")
+                self.visualize_sync(debug, s['label'])
+                choice = input(f"  Action for {s['name']}? [ (A)pprove / (S)kip / (Q)uit ]: ").lower().strip()
             else:
-                print(f"  Failed {s['name']}: {debug.get('error')}")
+                print(f"  [Error] Preprocessing failed: {debug.get('error')}")
+                if "sensor_aligned" in debug:
+                    print("  Showing debug plot...")
+                    self.visualize_sync(debug, s['label'])
+                choice = input(f"  Action for {s['name']} (Failed)? [ (S)kip / (Q)uit ]: ").lower().strip()
 
-        self._finalize_dataset(all_segments)
-        self.update_scaler_stats()
+            if choice in ['a', 'approve', '']:
+                if proc_segs:
+                    for seg in proc_segs:
+                        seg["original_label"] = s["label"]
+                        all_segments.append(seg)
+                    print(f"  -> Approved. ({len(proc_segs)} segments)")
+                else:
+                    print("  -> Cannot approve failed sample.")
+            elif choice in ['q', 'quit', 'exit']:
+                print("Stopping review.")
+                if all_segments:
+                     if input("Save currently approved samples? (y/n): ").lower() == 'y':
+                         break
+                     else:
+                         return
+                else:
+                    return
+            else:
+                print("  -> Skipped.")
+
+        # Finalize
+        if all_segments:
+            print(f"\nReprocessing Complete. {len(all_segments)} valid segments collected.")
+            self._finalize_dataset(all_segments)
+            self.update_scaler_stats()
+        else:
+            print("No segments were approved. Dataset not updated.")
 
     def _finalize_dataset(self, segments: List[Dict]):
         """Splits data, calcs stats, and saves final datasets."""

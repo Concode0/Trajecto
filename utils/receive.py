@@ -1,277 +1,563 @@
 """
-This module implements the `TrajectoDriver` class, which facilitates Bluetooth
-Low Energy (BLE) communication with a custom hardware device named "Trajecto".
+Trajecto BLE Driver - Protocol-Compliant Implementation
 
-The driver handles the essential aspects of BLE interaction, including scanning
-for the device, establishing and managing connections, sending control commands,
-and receiving streaming sensor data via GATT notifications. It provides a
-callback mechanism for real-time processing of incoming sensor data.
+This module implements the `TrajectoDriver` class for BLE communication with the
+Trajecto hardware device. It follows the structured packet protocol defined in
+firmware/components/trajecto_protocol/include/trajecto_protocol.h
+
+The driver supports:
+- Handshake on connection (Ping/Pong)
+- Mode configuration (Raw IMU vs Trajectory)
+- Calibration control (CRT + FOC)
+- Dual streaming modes with proper packet parsing
 """
 
 import asyncio
 import struct
 import sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import time
+from enum import IntEnum
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from bleak import BleakClient, BleakScanner
 
 # --- BLE Service and Characteristic UUIDs ---
-# These UUIDs must match those defined in the Trajecto device's firmware.
 SERVICE_UUID: str = "ad43434e-c549-4594-b474-543153544557"
-"""The UUID for the custom BLE service provided by the Trajecto device."""
-DATA_CHAR_UUID: str = "ad43434f-c549-4594-b474-543153544557"
-"""The UUID for the characteristic used to receive sensor data notifications."""
-CMD_CHAR_UUID: str = "ad43434d-c549-4594-b474-543153544557"
-"""The UUID for the characteristic used to send commands to the device."""
+DATA_CHAR_UUID: str = "ad43434f-c549-4594-b474-543153544557"  # Notify
+CMD_CHAR_UUID: str = "ad43434d-c549-4594-b474-543153544557"   # Write
 DEVICE_NAME: str = "Trajecto"
-"""The advertised name of the BLE device to scan for."""
 
+
+# --- Protocol Definitions (matching trajecto_protocol.h) ---
+
+class PacketType(IntEnum):
+    """Packet type identifiers matching firmware enum"""
+    CMD_PING = 0x01
+    RSP_PONG = 0x02
+
+    CMD_SET_CONFIG = 0x10
+    RSP_CONFIG_OK = 0x11
+    CMD_GET_CONFIG = 0x12
+    RSP_CONFIG = 0x13
+
+    CMD_START_STREAM = 0x20
+    RSP_STREAM_STARTED = 0x21
+    CMD_STOP_STREAM = 0x22
+    RSP_STREAM_STOPPED = 0x23
+
+    CMD_CALIBRATE = 0x30
+    RSP_CALIB_STATUS = 0x31
+
+    DATA_RAW_IMU = 0x80
+    DATA_TRAJECTORY = 0x81
+
+
+@dataclass
+class Header:
+    """Packet header: type (1 byte) + length (1 byte)"""
+    type: PacketType
+    length: int
+
+    @staticmethod
+    def parse(data: bytes) -> Optional['Header']:
+        if len(data) < 2:
+            return None
+        return Header(type=PacketType(data[0]), length=data[1])
+
+    def pack(self) -> bytes:
+        return struct.pack('<BB', self.type, self.length)
+
+
+@dataclass
+class ConfigPayload:
+    """Configuration payload: mode, odr_hz, reserved[2]"""
+    mode: int      # 0: Raw, 1: Trajectory
+    odr_hz: int    # Sampling rate (fixed at 50Hz)
+    reserved: tuple = (0, 0)
+
+    @staticmethod
+    def parse(data: bytes) -> Optional['ConfigPayload']:
+        if len(data) < 4:
+            return None
+        unpacked = struct.unpack('<BBBB', data[:4])
+        return ConfigPayload(
+            mode=unpacked[0],
+            odr_hz=unpacked[1],
+            reserved=(unpacked[2], unpacked[3])
+        )
+
+    def pack(self) -> bytes:
+        return struct.pack('<BBBB', self.mode, self.odr_hz,
+                          self.reserved[0], self.reserved[1])
+
+
+@dataclass
+class RawImuPacket:
+    """Raw IMU data packet"""
+    timestamp_us: int
+    accel: tuple  # (x, y, z) in m/s^2
+    gyro: tuple   # (x, y, z) in rad/s
+    force: int    # FSR reading
+    temperature: float  # Temperature in °C
+
+    @staticmethod
+    def parse(data: bytes) -> Optional['RawImuPacket']:
+        if len(data) < 34:  # 4 + 12 + 12 + 2 + 4
+            return None
+        unpacked = struct.unpack('<Iffffffhf', data[:34])
+        return RawImuPacket(
+            timestamp_us=unpacked[0],
+            accel=(unpacked[1], unpacked[2], unpacked[3]),
+            gyro=(unpacked[4], unpacked[5], unpacked[6]),
+            force=unpacked[7],
+            temperature=unpacked[8]
+        )
+
+
+@dataclass
+class TrajectoryPacket:
+    """Trajectory estimation packet (ESKF-TCN output)"""
+    timestamp_us: int
+    pos: tuple    # (x, y, z) in meters
+    vel: tuple    # (x, y, z) in m/s
+    quat: tuple   # (w, x, y, z) quaternion
+    prob_zupt: float  # Zero-velocity probability
+
+    @staticmethod
+    def parse(data: bytes) -> Optional['TrajectoryPacket']:
+        if len(data) < 48:  # 4 + 12 + 12 + 16 + 4
+            return None
+        unpacked = struct.unpack('<Iffffffffff', data[:48])
+        return TrajectoryPacket(
+            timestamp_us=unpacked[0],
+            pos=(unpacked[1], unpacked[2], unpacked[3]),
+            vel=(unpacked[4], unpacked[5], unpacked[6]),
+            quat=(unpacked[7], unpacked[8], unpacked[9], unpacked[10]),
+            prob_zupt=unpacked[11]
+        )
+
+
+# --- Driver Class ---
 
 class TrajectoDriver:
-    """A driver class to connect to the Trajecto BLE device, manage data collection,
-    and control device state.
+    """
+    BLE driver for Trajecto device with full protocol support.
 
-    This class provides an asynchronous interface for interacting with the
-    Trajecto hardware, allowing for connection establishment, command transmission
-    (e.g., 'start'/'stop' data stream), and processing of incoming sensor data.
+    Features:
+    - Automatic handshake on connection
+    - Mode selection (Raw/Trajectory)
+    - Runtime calibration trigger
+    - Dual-mode data streaming
     """
 
     def __init__(
         self,
         device_name: str = DEVICE_NAME,
-        data_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        raw_callback: Optional[Callable[[RawImuPacket], None]] = None,
+        trajectory_callback: Optional[Callable[[TrajectoryPacket], None]] = None,
+        verbose: bool = True
     ):
-        """Initializes the TrajectoDriver.
+        """
+        Initialize Trajecto BLE driver.
 
         Args:
-            device_name: The advertised name of the BLE device to connect to.
-            data_callback: An optional callback function to be called with each
-                received sensor data point. If provided, `self.data` will not
-                store the data internally. The callback should accept a single
-                argument: a dictionary representing the sensor data.
+            device_name: BLE device name to scan for
+            raw_callback: Callback for raw IMU data packets
+            trajectory_callback: Callback for trajectory packets
+            verbose: Enable debug output
         """
-        self.device_name: str = device_name
-        self.client: Optional[BleakClient] = None  # Bleak client instance for BLE communication.
-        self.data: List[Dict[str, Any]] = []  # Internal buffer for collected data if no callback.
-        self.data_callback: Optional[
-            Callable[[Dict[str, Any]], None]
-        ] = data_callback  # User-defined function for data processing.
-        self._connected_event: asyncio.Event = asyncio.Event()  # Event to signal connection status.
+        self.device_name = device_name
+        self.client: Optional[BleakClient] = None
+        self.verbose = verbose
+
+        # Callbacks
+        self.raw_callback = raw_callback
+        self.trajectory_callback = trajectory_callback
+
+        # Internal state
+        self._connected_event = asyncio.Event()
+        self._handshake_done = asyncio.Event()
+        self._response_queue: asyncio.Queue = asyncio.Queue()
+
+        # Current config
+        self.current_config: Optional[ConfigPayload] = None
+        self.streaming_mode: Optional[int] = None  # 0: Raw, 1: Trajectory
+
+        # Data buffers (if no callbacks provided)
+        self.raw_data: List[RawImuPacket] = []
+        self.trajectory_data: List[TrajectoryPacket] = []
+
+    def _log(self, msg: str):
+        """Print log message if verbose enabled"""
+        if self.verbose:
+            print(f"[TrajectoDriver] {msg}")
 
     async def connect(self) -> bool:
-        """Scans for the specified BLE device and establishes a connection.
+        """
+        Scan for and connect to Trajecto device.
+        Performs handshake after connection.
 
         Returns:
-            True if connection was successful, False otherwise.
+            True if connection and handshake successful
         """
-        print(f"Scanning for '{self.device_name}'...")
-        # Search for the device by its advertised name.
+        self._log(f"Scanning for '{self.device_name}'...")
         device = await BleakScanner.find_device_by_name(self.device_name)
+
         if device is None:
-            print(f"Could not find device with name '{self.device_name}'")
+            self._log(f"Could not find device '{self.device_name}'")
             return False
 
         self.client = BleakClient(device)
-        print(f"Connecting to {self.device_name} ({device.address})...")
+        self._log(f"Connecting to {device.address}...")
+
         try:
-            # Attempt to connect to the discovered BLE device.
             await self.client.connect()
-            print("Connected successfully!")
-            self._connected_event.set()  # Signal that connection is established.
-            return True
+            self._log("Connected!")
+            self._connected_event.set()
+
+            # Start listening for notifications
+            await self.client.start_notify(DATA_CHAR_UUID, self._notification_handler)
+            self._log("Notifications enabled.")
+
+            # Wait for initial handshake from firmware
+            # Firmware sends RSP_STREAM_STOPPED on connection (line 566 in main.cpp)
+            self._log("Waiting for initial status from device...")
+            try:
+                header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
+                if header.type == PacketType.RSP_STREAM_STOPPED:
+                    self._log("Device ready (IDLE mode)")
+                    self._handshake_done.set()
+            except asyncio.TimeoutError:
+                self._log("No initial status received (continuing anyway)")
+                self._handshake_done.set()
+
+            # Perform ping-pong handshake
+            if await self._ping():
+                self._log("Handshake complete!")
+
+                # Query current configuration
+                config = await self.get_config()
+                if config:
+                    self._log(f"Device Config: Mode={config.mode}, ODR={config.odr_hz}Hz")
+
+                return True
+            else:
+                self._log("Handshake failed!")
+                await self.disconnect()
+                return False
+
         except Exception as e:
-            print(f"Failed to connect: {e}")
-            self.client = None  # Reset client on failure.
+            self._log(f"Connection failed: {e}")
+            self.client = None
             return False
 
-    async def disconnect(self) -> None:
-        """Disconnects from the BLE device if an active connection exists."""
+    async def disconnect(self):
+        """Disconnect from device"""
         if self.client and self.client.is_connected:
+            try:
+                await self.client.stop_notify(DATA_CHAR_UUID)
+            except:
+                pass
             await self.client.disconnect()
-            print("Disconnected.")
-        self.client = None  # Clear client instance.
-        self._connected_event.clear()  # Clear connection event.
+            self._log("Disconnected.")
 
-    def _notification_handler(self, sender: int, data: bytearray) -> None:
-        """Handles incoming data notifications received from the BLE device.
+        self.client = None
+        self._connected_event.clear()
+        self._handshake_done.clear()
 
-        This method is registered as a callback for the data characteristic.
-        It parses the raw byte array into structured sensor data, supporting
-        batches of data points within a single notification, and passes them
-        to the user-defined `data_callback` or stores them internally.
+    def _notification_handler(self, sender: int, data: bytearray):
+        """
+        Handle incoming BLE notifications.
+        Parses packets according to protocol and dispatches to callbacks.
+        """
+        if len(data) < 2:
+            return
 
-        The expected C++ struct format is:
-        struct SensorData {
-            float time;
-            float accel_x, accel_y, accel_z;
-            float gyro_x, gyro_y, gyro_z;
-            uint32_t fsr; // Or float if it's not a raw uint32
-        };
-        Total size: 7 floats (4 bytes each) + 1 uint32_t (4 bytes) = 28 + 4 = 32 bytes.
+        header = Header.parse(data)
+        if not header:
+            self._log(f"Invalid header: {data[:10].hex()}")
+            return
+
+        payload = data[2:2+header.length]
+
+        # Response packets → queue for async handlers (with payload)
+        if header.type in [PacketType.RSP_PONG, PacketType.RSP_CONFIG,
+                          PacketType.RSP_CONFIG_OK, PacketType.RSP_STREAM_STARTED,
+                          PacketType.RSP_STREAM_STOPPED, PacketType.RSP_CALIB_STATUS]:
+            # Store tuple of (header, payload) so we can parse response data
+            asyncio.create_task(self._response_queue.put((header, payload)))
+
+            if header.type == PacketType.RSP_CALIB_STATUS and len(payload) >= 1:
+                status = payload[0]
+                status_str = {0: "In Progress", 1: "Success", 2: "Failed"}
+                self._log(f"Calibration Status: {status_str.get(status, 'Unknown')}")
+
+        # Data packets → parse and callback
+        elif header.type == PacketType.DATA_RAW_IMU:
+            packet = RawImuPacket.parse(payload)
+            if packet:
+                if self.raw_callback:
+                    self.raw_callback(packet)
+                else:
+                    self.raw_data.append(packet)
+
+        elif header.type == PacketType.DATA_TRAJECTORY:
+            packet = TrajectoryPacket.parse(payload)
+            if packet:
+                if self.trajectory_callback:
+                    self.trajectory_callback(packet)
+                else:
+                    self.trajectory_data.append(packet)
+
+    async def _send_command(self, packet_type: PacketType, payload: bytes = b'') -> bool:
+        """Send command packet to device"""
+        if not self.client or not self.client.is_connected:
+            self._log("Not connected")
+            return False
+
+        header = Header(type=packet_type, length=len(payload))
+        packet = header.pack() + payload
+
+        try:
+            await self.client.write_gatt_char(CMD_CHAR_UUID, packet, response=True)
+            return True
+        except Exception as e:
+            self._log(f"Command failed: {e}")
+            return False
+
+    async def _ping(self) -> bool:
+        """Send ping and wait for pong"""
+        self._log("Sending PING...")
+        if not await self._send_command(PacketType.CMD_PING):
+            return False
+
+        try:
+            header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
+            if header.type == PacketType.RSP_PONG:
+                self._log("PONG received")
+                return True
+        except asyncio.TimeoutError:
+            self._log("PING timeout")
+
+        return False
+
+    async def get_config(self) -> Optional[ConfigPayload]:
+        """Query current device configuration"""
+        self._log("Querying config...")
+        if not await self._send_command(PacketType.CMD_GET_CONFIG):
+            return None
+
+        try:
+            header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
+            if header.type == PacketType.RSP_CONFIG:
+                # Parse config from response payload
+                config = ConfigPayload.parse(payload)
+                if config:
+                    self.current_config = config
+                    self._log(f"Config received: Mode={config.mode}, ODR={config.odr_hz}Hz")
+                    return config
+                else:
+                    self._log("Failed to parse config payload")
+        except asyncio.TimeoutError:
+            self._log("Config query timeout")
+
+        return None
+
+    async def set_config(self, mode: int, odr_hz: int = 50) -> bool:
+        """
+        Set device configuration.
 
         Args:
-            sender (int): The handle of the characteristic that sent the notification.
-            data (bytearray): The raw bytearray received from the device.
-                - Shape: (Batch_Size * 32,) bytes
-                - Content: Packed C-structs of sensor data
-                - Frame: Body (once unpacked)
+            mode: 0 for Raw IMU, 1 for Trajectory
+            odr_hz: Sampling rate (typically 50Hz)
+
+        Returns:
+            True if config accepted
         """
-        # Define the size and format of the C++ struct being sent by the device.
-        struct_size: int = 32
-        # '<fffffffI' specifies:
-        # '<': Little-endian byte order.
-        # 'f': 7 single-precision floats (time, accel_x,y,z, gyro_x,y,z).
-        # 'I': 1 unsigned integer (fsr).
-        struct_format: str = "<fffffffI"
+        config = ConfigPayload(mode=mode, odr_hz=odr_hz)
+        self._log(f"Setting config: Mode={mode}, ODR={odr_hz}Hz")
 
-        # Check if the received data length is a multiple of the expected struct size.
-        # This allows processing batches of sensor readings sent in one notification.
-        if len(data) % struct_size == 0:
-            num_structs: int = len(data) // struct_size
-            for i in range(num_structs):
-                offset: int = i * struct_size
-                chunk: bytes = data[offset : offset + struct_size]
-                try:
-                    # Unpack the byte chunk into a tuple of Python values.
-                    unpacked_data: Tuple[Any, ...] = struct.unpack(struct_format, chunk)
-                    sensor_data: Dict[str, Any] = {
-                        "time": unpacked_data[0],
-                        "accel_x": unpacked_data[1],
-                        "accel_y": unpacked_data[2],
-                        "accel_z": unpacked_data[3],
-                        "gyro_x": unpacked_data[4],
-                        "gyro_y": unpacked_data[5],
-                        "gyro_z": unpacked_data[6],
-                        "fsr": unpacked_data[7],  # FSR data, assumed to be unsigned int.
-                    }
-                    if self.data_callback:
-                        self.data_callback(sensor_data)  # Pass to external callback.
-                    else:
-                        self.data.append(sensor_data)  # Store internally.
-                        # Optional: print status periodically if storing internally.
-                        if len(self.data) % (10 * num_structs) == 0:
-                            print(f"Received data point #{len(self.data)}")
-                except struct.error as e:
-                    print(f"Error unpacking chunk {i+1}/{num_structs}: {e}")
-        else:
-            print(
-                f"Received unexpected data length (len: {len(data)}). Hex: {data.hex()}"
-            )
+        if not await self._send_command(PacketType.CMD_SET_CONFIG, config.pack()):
+            return False
 
-    async def start_data_collection(self) -> None:
-        """Subscribes to notifications on the data characteristic and sends the 'strt' command.
-
-        Requires an active BLE connection. This sequence initiates the sensor
-        data streaming from the device.
-        """
-        if not self.client or not self.client.is_connected:
-            print("Client not connected. Cannot start data collection.")
-            return
-
-        print("Starting data collection...")
         try:
-            # Start receiving notifications from the DATA_CHAR_UUID.
-            await self.client.start_notify(DATA_CHAR_UUID, self._notification_handler)
-            # Send the 'strt' command to the device to begin data streaming.
-            await self.client.write_gatt_char(CMD_CHAR_UUID, b"strt", response=True)
-            print("Sent 'strt' command and started notifications.")
-        except Exception as e:
-            print(f"Failed to start data collection: {e}")
-            # Attempt to clean up if something went wrong during startup.
-            await self.stop_data_collection()
+            header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
+            if header.type == PacketType.RSP_CONFIG_OK:
+                self._log("Config set successfully")
+                self.current_config = config
+                self.streaming_mode = mode
+                return True
+        except asyncio.TimeoutError:
+            self._log("Config set timeout")
 
-    async def stop_data_collection(self) -> None:
-        """Sends the 'stop' command to the device and unsubscribes from notifications.
+        return False
 
-        Requires an active BLE connection. This terminates the sensor data
-        streaming from the device.
+    async def start_streaming(self, mode: Optional[int] = None) -> bool:
         """
-        if not self.client or not self.client.is_connected:
-            print("Client not connected. Cannot stop data collection.")
-            return
-
-        print("Stopping data collection...")
-        try:
-            # Send the 'stop' command to the device.
-            await self.client.write_gatt_char(CMD_CHAR_UUID, b"stop", response=True)
-            # Stop receiving notifications from the DATA_CHAR_UUID.
-            await self.client.stop_notify(DATA_CHAR_UUID)
-            print("Sent 'stop' command and stopped notifications.")
-        except Exception as e:
-            print(f"Failed to stop data collection: {e}")
-
-    async def wait_for_connection(self) -> None:
-        """Waits indefinitely until a BLE connection is established."""
-        await self._connected_event.wait()
-
-    async def write_command(self, command: str) -> None:
-        """Writes a command string to the command characteristic.
+        Start data streaming.
 
         Args:
-            command: The command string to write (e.g., "strt", "stop").
-                Commands are typically short (e.g., 4 characters) due to BLE limitations.
-        """
-        if not self.client or not self.client.is_connected:
-            print("Client not connected. Cannot write command.")
-            return
+            mode: Optional mode override (0: Raw, 1: Trajectory)
+                 If None, uses current config
 
-        if len(command) > 4:
-            print("Warning: Command string might be truncated to 4 bytes on device.")
+        Returns:
+            True if streaming started
+        """
+        if mode is not None:
+            if not await self.set_config(mode):
+                return False
+
+        self._log("Starting stream...")
+        if not await self._send_command(PacketType.CMD_START_STREAM):
+            return False
 
         try:
-            # Encode the command string to ASCII bytes before sending.
-            await self.client.write_gatt_char(
-                CMD_CHAR_UUID, command.encode("ascii"), response=True
-            )
-            print(f"Command '{command}' sent.")
-        except Exception as e:
-            print(f"Failed to send command '{command}': {e}")
+            header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
+            if header.type == PacketType.RSP_STREAM_STARTED:
+                mode_str = {0: "RAW IMU", 1: "TRAJECTORY", None: "CURRENT"}
+                self._log(f"Streaming started ({mode_str.get(self.streaming_mode, 'Unknown')} mode)")
+                return True
+        except asyncio.TimeoutError:
+            self._log("Stream start timeout")
+
+        return False
+
+    async def stop_streaming(self) -> bool:
+        """Stop data streaming"""
+        self._log("Stopping stream...")
+        if not await self._send_command(PacketType.CMD_STOP_STREAM):
+            return False
+
+        try:
+            header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
+            if header.type == PacketType.RSP_STREAM_STOPPED:
+                self._log("Streaming stopped")
+                return True
+        except asyncio.TimeoutError:
+            self._log("Stream stop timeout")
+
+        return False
+
+    async def calibrate(self) -> bool:
+        """
+        Trigger CRT + FOC calibration.
+        Device must be stationary on a table.
+
+        Returns:
+            True if calibration initiated (check status via notifications)
+        """
+        self._log("Starting calibration - KEEP DEVICE STILL!")
+        if not await self._send_command(PacketType.CMD_CALIBRATE):
+            return False
+
+        # Initial status should arrive immediately
+        try:
+            header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
+            if header.type == PacketType.RSP_CALIB_STATUS:
+                self._log("Calibration started, waiting for completion...")
+                # Final status will arrive via notification handler
+                return True
+        except asyncio.TimeoutError:
+            self._log("Calibration start timeout")
+
+        return False
 
 
-async def main() -> None:
-    """Example of how to use TrajectoDriver as a standalone script for testing."""
+# --- Example Usage ---
 
-    def my_data_processor(sensor_data: Dict[str, Any]) -> None:
-        """Example callback to process data as it arrives. Prints selected fields."""
-        # For brevity in continuous stream, only print time, accel_x, and fsr.
-        print(
-            f"Time: {sensor_data['time']:.6f}s, Accel X: {sensor_data['accel_x']:.2f}g, FSR: {sensor_data['fsr']}"
-        )
+async def example_raw_stream():
+    """Example: Stream raw IMU data"""
 
-    # Instantiate the driver, providing the example data processor as a callback.
-    collector: TrajectoDriver = TrajectoDriver(data_callback=my_data_processor)
-    try:
-        # Attempt to connect to the device.
-        if await collector.connect():
-            # If connected, start data collection.
-            await collector.start_data_collection()
+    def on_raw_data(packet: RawImuPacket):
+        print(f"[{packet.timestamp_us/1e6:.3f}s] "
+              f"Accel: ({packet.accel[0]:6.2f}, {packet.accel[1]:6.2f}, {packet.accel[2]:6.2f}) m/s² | "
+              f"Gyro: ({packet.gyro[0]:6.2f}, {packet.gyro[1]:6.2f}, {packet.gyro[2]:6.2f}) rad/s | "
+              f"FSR: {packet.force} | "
+              f"Temp: {packet.temperature:.1f}°C")
 
-            print("\n--- Data Collection Started ---")
-            print("Press Ctrl+C to stop data collection and disconnect.")
+    driver = TrajectoDriver(raw_callback=on_raw_data)
 
-            # Keep the program running to receive notifications for a duration.
-            await asyncio.sleep(10)  # Collect data for 10 seconds.
-        else:
-            print("Failed to connect to the device.")
+    if await driver.connect():
+        # Stream raw data for 5 seconds
+        await driver.start_streaming(mode=0)  # 0 = Raw
+        await asyncio.sleep(5)
+        await driver.stop_streaming()
+        await driver.disconnect()
 
-    except asyncio.CancelledError:
-        print("\nProgram cancelled (e.g., by asyncio.run() timeout).")
-    except KeyboardInterrupt:
-        print("\nKeyboardInterrupt detected. Stopping data collection.")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-    finally:
-        # Ensure proper cleanup: stop data collection and disconnect.
-        if collector.client and collector.client.is_connected:
-            await collector.stop_data_collection()
-            await collector.disconnect()
+
+async def example_trajectory_stream():
+    """Example: Stream trajectory estimates"""
+
+    def on_trajectory(packet: TrajectoryPacket):
+        print(f"[{packet.timestamp_us/1e6:.3f}s] "
+              f"Pos: ({packet.pos[0]:6.3f}, {packet.pos[1]:6.3f}, {packet.pos[2]:6.3f}) m | "
+              f"ZUPT: {packet.prob_zupt:.2f}")
+
+    driver = TrajectoDriver(trajectory_callback=on_trajectory)
+
+    if await driver.connect():
+        # Stream trajectory for 5 seconds
+        await driver.start_streaming(mode=1)  # 1 = Trajectory
+        await asyncio.sleep(5)
+        await driver.stop_streaming()
+        await driver.disconnect()
+
+
+async def example_calibration():
+    """Example: Trigger device calibration"""
+
+    driver = TrajectoDriver(verbose=True)
+
+    if await driver.connect():
+        print("\n" + "="*60)
+        print("CALIBRATION PROCEDURE")
+        print("="*60)
+        print("1. Place the device on a FLAT, STABLE surface")
+        print("2. DO NOT MOVE the device during calibration (~5 seconds)")
+        print("3. Press Enter when ready...")
+        input()
+
+        await driver.calibrate()
+
+        # Wait for calibration to complete (listen for status notifications)
+        print("\nCalibrating... (Check logs for status)")
+        await asyncio.sleep(8)
+
+        await driver.disconnect()
+
+
+async def main():
+    """Interactive menu for testing driver"""
+
+    print("\n" + "="*60)
+    print("Trajecto BLE Driver - Test Interface")
+    print("="*60)
+    print("1. Stream Raw IMU Data")
+    print("2. Stream Trajectory Data")
+    print("3. Run Calibration")
+    print("4. Exit")
+
+    choice = input("\nSelect option [1-4]: ").strip()
+
+    if choice == '1':
+        await example_raw_stream()
+    elif choice == '2':
+        await example_trajectory_stream()
+    elif choice == '3':
+        await example_calibration()
+    elif choice == '4':
         print("Exiting.")
+    else:
+        print("Invalid choice.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nProgram interrupted by user on startup.")
+        print("\n\nInterrupted by user.")
     except Exception as e:
-        print(f"An error occurred during startup: {e}")
+        print(f"\nError: {e}")
+        import traceback
+        traceback.print_exc()

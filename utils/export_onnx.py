@@ -1,3 +1,62 @@
+"""PyTorch ESKF-TCN Model Export to ONNX for Trajecto Firmware Deployment.
+
+This script exports the trained PyTorch ESKF-TCN model to ONNX format with
+stateful TCN buffer management for real-time inference on ESP32. The export
+process handles:
+
+1. **Stateful Buffer Export**: TCN layers require causal history buffers to
+   maintain temporal context across single-timestep inference calls. This script
+   wraps the TCN in StatefulTCNExport to expose buffers as explicit inputs/outputs.
+
+2. **Parameter Export**: Generates C++ header file (model_params.hpp) containing:
+   - TCN architecture constants (input size, layer count)
+   - State buffer dimensions for each layer
+   - IMU normalization parameters (mean/std from scaler_stats.h5)
+   - Pen tip offset in body frame
+
+3. **ONNX Graph Construction**: Creates ONNX graph with:
+   - Input: [Batch=1, Seq=1, Features] current timestep features
+   - State Inputs: [Batch=1, History, Channels] per-layer history buffers
+   - Outputs: velocity correction, covariance R, ZUPT probability
+   - State Outputs: Updated history buffers for next timestep
+
+The exported ONNX model serves as input to convert_tflite.py for quantization
+and deployment to ESP32 via TFLite Micro.
+
+Dependencies:
+    - torch: PyTorch model loading and ONNX export
+    - onnx: ONNX format (implicit via torch.onnx)
+    - h5py: Loading scaler statistics from HDF5
+    - numpy: Array manipulation
+
+Usage:
+    python utils/export_onnx.py
+
+    Or import and call:
+    from utils.export_onnx import export_onnx
+    export_onnx(model_path="custom_model.pth", output_dir="custom_export")
+
+Prerequisites:
+    - Trained model file (default: eskf_tcn_model.pth)
+    - Scaler statistics (data/scaler_stats.h5) from preprocessing
+    - Model configuration in model/config.py
+
+Output:
+    - onnx_export/tcn_model.onnx: ONNX graph with stateful buffers
+    - onnx_export/model_params.hpp: C++ header with constants
+
+Architecture Notes:
+    The stateful export is critical for embedded real-time inference:
+    - Desktop inference: Process full sequences [Batch, SeqLen, Feat] in one call
+    - Embedded inference: Process single timesteps [1, 1, Feat] with persistent buffers
+    - Buffer management: Firmware maintains state between calls (ring buffer pattern)
+
+See Also:
+    - model/stateful_tcn.py: StatefulTCNExport wrapper implementation
+    - firmware/components/trajecto_core/tcn_wrapper.cpp: C++ buffer management
+    - utils/convert_tflite.py: Next step in deployment pipeline
+"""
+
 import torch
 import torch.nn as nn
 import sys
@@ -17,13 +76,81 @@ from model.stateful_tcn import StatefulTCNExport
 from model.config import Config
 
 def export_onnx(model_path="eskf_tcn_model.pth", output_dir="onnx_export"):
+    """Exports trained ESKF-TCN model to ONNX with stateful buffers and C++ parameters.
+
+    This function performs a complete export pipeline for embedded deployment:
+
+    **Step 1: Model Loading**
+    - Initializes ESKF-TCN model architecture from config
+    - Loads trained weights from .pth file
+    - Falls back to random weights if file missing (with warning)
+
+    **Step 2: Stateful TCN Wrapping**
+    - Wraps TCN layers in StatefulTCNExport for explicit buffer management
+    - Calculates state buffer dimensions based on kernel size and dilation:
+      - For layer i with kernel k, dilation d: history_length = (k-1) * d
+      - Supports both standard and depthwise separable convolutions
+    - Creates dummy inputs for ONNX tracing (input + per-layer state buffers)
+
+    **Step 3: ONNX Export**
+    - Exports to ONNX opset 13 with constant folding enabled
+    - Input/Output naming convention:
+      - Inputs: 'input_feature', 'state_in_0', 'state_in_1', ...
+      - Outputs: 'vel_corr', 'cov_R', 'zupt_prob', 'state_out_0', 'state_out_1', ...
+    - State tensors use NLC (Batch, History, Channels) layout
+
+    **Step 4: C++ Header Generation**
+    - Exports model_params.hpp with compile-time constants:
+      - TCN_INPUT_SIZE: Feature dimension (typically 20)
+      - TCN_NUM_LAYERS: Number of TCN layers (typically 4)
+      - TCN_STATE_DIMS[]: Array of {channels, history} per layer
+      - IMU_MEAN[], IMU_STD[]: Normalization parameters (7D: accel, gyro, force)
+      - PEN_TIP_OFFSET[]: Offset in body frame (3D: x, y, z)
+
+    Args:
+        model_path: Path to trained PyTorch model (.pth) relative to project root.
+            Default: "eskf_tcn_model.pth"
+        output_dir: Directory for ONNX and header files, relative to project root.
+            Default: "onnx_export"
+
+    Raises:
+        FileNotFoundError: If scaler_stats.h5 is missing (loads defaults with warning)
+        RuntimeError: If ONNX export fails during torch.onnx.export()
+
+    Side Effects:
+        Creates/overwrites files:
+        - {output_dir}/tcn_model.onnx
+        - {output_dir}/model_params.hpp
+        Prints verbose status messages during export process
+
+    Example:
+        >>> # Export with default paths
+        >>> export_onnx()
+
+        >>> # Export custom model
+        >>> export_onnx(
+        ...     model_path="experiments/best_model.pth",
+        ...     output_dir="deployment"
+        ... )
+
+    Implementation Notes:
+        - State buffer layout is critical for firmware compatibility
+        - Separable convolutions have different channel progression than standard
+        - ONNX constant folding reduces model size by pre-computing static ops
+        - Header file must be #include'd in firmware before TFLite conversion
+
+    See Also:
+        - model/stateful_tcn.py: StatefulTCNExport wrapper class
+        - firmware/components/trajecto_core/include/model_params.hpp: Template
+        - utils/convert_tflite.py: Next step (ONNX → TFLite)
+    """
     # Resolve paths relative to PROJECT_ROOT
     model_path_abs = os.path.join(PROJECT_ROOT, model_path)
     output_dir_abs = os.path.join(PROJECT_ROOT, output_dir)
     scaler_stats_path_abs = os.path.join(PROJECT_ROOT, Config.SCALER_STATS_H5_PATH)
 
     os.makedirs(output_dir_abs, exist_ok=True)
-    
+
     device = "cpu"
 
     # 1. Initialize Model

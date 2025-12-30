@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS
-        "data_acquire.cpp"
+        "main.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         espp__bmi270
@@ -9,9 +9,8 @@ idf_component_register(
         espp__task
         espp__logger
         esp_adc
-        #esp_nn
         bt
         nvs_flash
-        eigen
-        esp-tflite-micro
+        trajecto_core
+        trajecto_protocol
 )

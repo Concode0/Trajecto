@@ -363,7 +363,7 @@ class BaseFilterTCNModel(nn.Module):
             gravity_b_raw = (
                 rot_mat_w_to_b_t @ self.gravity_w.expand(batch_size, -1).unsqueeze(-1)
             ).squeeze(-1)
-            gravity_b_norm = gravity_b_raw / 9.81  # Normalize by magnitude of gravity
+            gravity_b_norm = gravity_b_raw / Config.GRAVITY_MAGNITUDE  # Normalize by magnitude of gravity
 
             # Calculate angular velocity and tangential velocity of pen tip.
             angular_velocity_b = gyro_b_raw - gyro_bias_b

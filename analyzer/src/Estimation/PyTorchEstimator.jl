@@ -34,8 +34,13 @@ function AbstractLayers.load_model(estimator::TrajectoEstimator)
 
     sys = pyimport("sys")
     abs_script_path = abspath(estimator.script_path)
+    # Add both the model directory and its parent to sys.path
+    parent_dir = dirname(abs_script_path)
     if !(abs_script_path in pyconvert(Vector, sys.path))
         sys.path.append(abs_script_path)
+    end
+    if !(parent_dir in pyconvert(Vector, sys.path))
+        sys.path.insert(0, parent_dir)
     end
 
     torch = pyimport("torch")
@@ -45,22 +50,26 @@ function AbstractLayers.load_model(estimator::TrajectoEstimator)
     raw_model = nothing
     
     if estimator.model_type == "eskf"
-        model_module = pyimport("ESKF_TCN")
+        model_module = pyimport("model.ESKF_TCN")
         raw_model = model_module.ESKFTCN_model(device="cpu")
     elseif estimator.model_type == "aekf"
-        model_module = pyimport("AEKF_TCN")
+        model_module = pyimport("model.AEKF_TCN")
         raw_model = model_module.AEKFTCN_model(device="cpu")
     elseif estimator.model_type == "tcn"
-        model_module = pyimport("onlyTCN")
+        model_module = pyimport("model.onlyTCN")
         raw_model = model_module.OnlyTCN(device="cpu")
     elseif estimator.model_type == "pure_eskf"
-        model_module = pyimport("pure_eskf")
+        model_module = pyimport("model.pure_eskf")
         raw_model = model_module.PureESKFModel(device="cpu")
+    elseif estimator.model_type == "pure_integration"
+        model_module = pyimport("model.pure_integration")
+        raw_model = model_module.PureIntegrationModel(device="cpu")
     else
         error("Unknown model type: $(estimator.model_type)")
     end
 
-    if estimator.model_type != "pure_eskf"
+    # Baseline models don't require pre-trained weights
+    if !(estimator.model_type in ["pure_eskf", "pure_integration"])
         state_dict = torch.load(abspath(estimator.model_path), map_location="cpu")
         raw_model.load_state_dict(state_dict)
     end
@@ -104,8 +113,14 @@ function AbstractLayers.predict_trajectory(estimator::TrajectoEstimator, input_d
             seq_len = pred_pos_py.shape[0]
             # Create a zero covariance matrix (Seq, 15, 15)
             pred_cov_py = engine.torch.zeros(seq_len, 15, 15)
+        elseif estimator.model_type in ["pure_eskf", "pure_integration"]
+            # Baseline models return only position
+            pred_pos_py = output["pred_pos_w"].squeeze(0) # (Seq, 3)
+            # Dummy covariance for baselines
+            seq_len = pred_pos_py.shape[0]
+            pred_cov_py = engine.torch.zeros(seq_len, 15, 15)
         else
-            # Hybrid models and PureESKF return Dict
+            # Hybrid models (ESKF-TCN, AEKF-TCN) return Dict with covariance
             pred_pos_py = output["pred_pos_w"].squeeze(0) # (Seq, 3)
             pred_cov_py = output["filter_covariance"].squeeze(0) # (Seq, 15, 15) or (Seq, 16, 16)
         end

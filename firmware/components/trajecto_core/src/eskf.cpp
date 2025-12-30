@@ -11,13 +11,14 @@ ESKF::ESKF(float dt) : dt_(dt) {
     P_ *= 0.1f;
 
     // Initialize Process Noise Q (Diagonal)
-    // VRW (Velocity Random Walk) -> Accel Noise
-    float vrw = 1.0e-3f; 
-    // ARW (Angle Random Walk) -> Gyro Noise
-    float arw = 4.0e-3f;
+    // Updated from Allan Variance analysis (2025-12-29) - averaged across axes
+    // VRW (Velocity Random Walk) -> Accel Noise [m/s²√s]
+    float vrw = 8.1255e-4f;  // avg(8.3297e-04, 6.7196e-04, 9.3271e-04)
+    // ARW (Angle Random Walk) -> Gyro Noise [rad/s√s]
+    float arw = 7.5427e-5f;  // avg(7.1664e-05, 7.9283e-05, 7.5335e-05)
     // Bias Instability
-    float accel_bi = 4.0e-4f;
-    float gyro_bi = 2.0e-3f;
+    float accel_bi = 2.9840e-4f;  // avg(4.3723e-04, 1.7697e-04, 2.8099e-04) [m/s²]
+    float gyro_bi = 1.8947e-5f;   // avg(1.6441e-05, 2.8196e-05, 1.2203e-05) [rad/s]
 
     Q_diag_.setZero();
     // Velocity Error driven by VRW

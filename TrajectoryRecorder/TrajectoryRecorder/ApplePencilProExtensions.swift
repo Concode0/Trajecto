@@ -16,11 +16,13 @@ extension EnhancedPKCanvasView {
     /// Configures the canvas to handle Apple Pencil Pro interactions, such as the squeeze gesture.
     func setupPencilProFeatures() {
         if #available(iOS 18.0, *) {
-            // Apple Pencil Pro squeeze gesture setup
-            let squeezeGesture = UIPencilInteraction()
-            squeezeGesture.delegate = self
-            addInteraction(squeezeGesture)
-        }
+                let squeezeGesture = UIPencilInteraction()
+                squeezeGesture.delegate = self
+                
+                squeezeGesture.isEnabled = false
+                
+                addInteraction(squeezeGesture)
+            }
     }
 }
 

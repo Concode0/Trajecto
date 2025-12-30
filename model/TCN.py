@@ -138,7 +138,7 @@ class TCN(nn.Module):
         # Batch Normalization applied to the input features across the time dimension.
         # This replaces the LayerNorm that was previously in the wrapper class.
         # BatchNorm is more efficient for inference (can be fused) and treats features independently.
-        self.input_bn = nn.GroupNorm(num_groups=8, num_channels=input_size)
+        self.input_bn = nn.GroupNorm(num_groups=20, num_channels=input_size, affine=True)
 
         self.tcn_layers = nn.ModuleList()  # Stores the sequential TCN blocks.
         in_channels = input_size

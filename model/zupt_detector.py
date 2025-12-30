@@ -228,7 +228,7 @@ if __name__ == "__main__":
     print("\n--- Test Case 1: Stationary scenario ---")
     # Simulate accelerometer data that is very stable (low variance) and close to gravity.
     # Simulate stable force data.
-    accel_static_template = torch.tensor([0.0, 0.0, 9.81], device=device).unsqueeze(0)
+    accel_static_template = torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device).unsqueeze(0)
     accel_static_data = (
         accel_static_template.repeat(batch_size, window_size, 1)
         + torch.randn(batch_size, window_size, 3, device=device) * 0.001

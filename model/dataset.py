@@ -35,7 +35,7 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         self,
         preprocessed_file: str,
         augment_multiplier: int = 1,
-        subsample_step: int = 4,
+        subsample_step: int = 1,
         do_augment: bool = False,
         noise_std: float = 0.01,
         scale_range: tuple = (0.9, 1.1),
