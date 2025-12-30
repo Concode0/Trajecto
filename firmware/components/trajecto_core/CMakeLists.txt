@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS 
+        "src/eskf.cpp"
+        "src/tcn_wrapper.cpp"
+        "src/tcn_model.cc"
+        "src/fast_math_lut.cpp"
+    INCLUDE_DIRS 
+        "include"
+        "../../managed_components/espressif__eigen/eigen"
+    REQUIRES 
+        espressif__eigen 
+        espressif__esp-tflite-micro
+)

@@ -2,6 +2,7 @@
 
 #include "eskf.hpp"
 #include "tcn_wrapper.hpp"
+#include "fast_math_lut.hpp"
 #include <iostream>
 #include <cmath>
 
@@ -32,7 +33,7 @@ public:
         // 1. ZUPT Detection (Heuristic)
         bool is_zupt_heuristic = eskf_.check_zupt(accel);
         bool is_zupt = is_zupt_heuristic;
-        float zupt_prob = -1.0f;
+        float current_step_prob = 0.0f; // Default for visualization
 
         // 2. Predict (Propagate State)
         eskf_.predict(gyro, accel);
@@ -50,7 +51,7 @@ public:
             if (tcn_out.zupt_prob > 0.5f) {
                 is_zupt = true;
             }
-            zupt_prob = tcn_out.zupt_prob;
+            current_step_prob = tcn_out.zupt_prob;
 
             // Apply TCN Velocity Correction (if not ZUPT)
             if (!is_zupt) {
@@ -59,17 +60,25 @@ public:
 
             // Parse R from TCN for IMU Update
             for(int i=0; i<6; i++) {
-                 float x = tcn_out.R_params[i];
-                 // Softplus approximation: log(1 + exp(x))
-                 // Use simple check to avoid overflow for large x
-                 float val = (x > 20.0f) ? x : std::log(1.0f + std::exp(x));
+                 // Softplus approximation using LUT
+                 float val = fast_softplus(tcn_out.R_params[i]);
                  R_diag[i] = val + 1e-6f;
             }
+        } else {
+             // If TCN not running (e.g. buffer filling), rely on heuristic
+             current_step_prob = is_zupt ? 1.0f : 0.0f;
         }
+        
+        // Store for Getter
+        zupt_prob_ = current_step_prob;
 
         // 4. ZUPT Update
+        // Note: ESKF::update_zupt expects a probability if available, or uses default high confidence if -1
+        // We pass -1 if we just want "hard" ZUPT, or pass the probability if we have one.
+        // If it was TCN ZUPT, we have a prob. If heuristic, we treat it as 1.0.
         if (is_zupt) {
-            eskf_.update_zupt(zupt_prob);
+            float prob_to_pass = (tcn_out.valid && tcn_out.zupt_prob > 0.5f) ? tcn_out.zupt_prob : -1.0f;
+            eskf_.update_zupt(prob_to_pass);
         }
 
         // 5. Standard IMU Update
@@ -81,12 +90,14 @@ public:
 
     const NominalState& get_state() const { return eskf_.get_state(); }
     const TCNWrapper& get_tcn() const { return tcn_; }
+    float get_zupt_prob() const { return zupt_prob_; }
 
 private:
     ESKF eskf_;
     TCNWrapper tcn_;
     Eigen::Matrix<float, 6, 1> last_innovation_;
     bool initialized_ = false;
+    float zupt_prob_ = 0.0f;
 };
 
 } // namespace trajecto

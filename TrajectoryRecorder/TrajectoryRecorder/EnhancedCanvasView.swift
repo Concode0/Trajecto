@@ -104,7 +104,7 @@ class EnhancedPKCanvasView: PKCanvasView {
     @available(iOS 13.4, *)
     @objc private func handleHover(_ gesture: UIHoverGestureRecognizer) {
         let location = gesture.location(in: self)
-        let timestamp = Date().timeIntervalSince1970
+        let timestamp = ProcessInfo.processInfo.systemUptime
         
         let hoverDistance: CGFloat
         if #available(iOS 17.5, *) {
@@ -140,7 +140,6 @@ class EnhancedPKCanvasView: PKCanvasView {
     
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
-        handleTouches(touches, with: event)
         
         // Handle coalesced touches for high-frequency (e.g., 240Hz) data collection
         if let coalescedTouches = event?.coalescedTouches(for: touches.first!) {
@@ -171,7 +170,7 @@ class EnhancedPKCanvasView: PKCanvasView {
         let force = touch.force
         let azimuth = touch.azimuthAngle(in: self)
         let altitude = touch.altitudeAngle
-        let timestamp = Date().timeIntervalSince1970
+        let timestamp = touch.timestamp
         
         var rollAngle: CGFloat = 0
         if #available(iOS 18.0, *) {

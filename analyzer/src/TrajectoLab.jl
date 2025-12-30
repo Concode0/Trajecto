@@ -37,6 +37,6 @@ export CRLBConfig, compute_crlb
 # Application Plugins
 include("Application/Dashboard.jl")
 using .Dashboard
-export MakieDashboard
+export MakieDashboard, run_app_comparison
 
 end

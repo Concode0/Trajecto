@@ -9,8 +9,8 @@ class Config:
     """
 
     # --- Global Training Parameters ---
-    DT = 0.02 # Time delta (s) for model integration
-    INITIAL_PEN_TIP_OFFSET = [0.0, 0.125, 0.0] # [x, y, z] offset from IMU to pen tip (m)
+    DT = 1.0 / 50.107  # Time delta (s) for model integration (50.107 Hz = 0.019957291396 s)
+    INITIAL_PEN_TIP_OFFSET = [0.0, -0.125, 0.0] # [x, y, z] offset from IMU to pen tip (m)
 
     # --- Dataset Parameters ---
     DATASET_H5_PATH = "./data/dataset.h5"
@@ -24,21 +24,23 @@ class Config:
 
     # --- ZUPT Parameters (used by ESKF and AEKF) ---
     ZUPT_WINDOW_SIZE = 20
-    ZUPT_ACCEL_THRESHOLD = 0.1
-    ZUPT_FORCE_VAR_THRESHOLD = 0.01
-    ZUPT_FORCE_DELTA_THRESHOLD = 0.1
+    ZUPT_ACCEL_THRESHOLD = 0.1430  # Optimized from GT analysis: 92% ZUPT coverage, 51% moving rejection (was: 0.5)
+    ZUPT_FORCE_VAR_THRESHOLD = 36660  # Optimized from GT analysis: 90% ZUPT coverage, 18% moving rejection (was: 100000)
+    ZUPT_FORCE_DELTA_THRESHOLD = 154  # Optimized from GT analysis: 87% ZUPT coverage, 20% moving rejection (was: 2000)
 
     # --- Allan Variance Noise Parameters (used by ESKF and AEKF) ---
-    # These values are derived from sensor characterization (e.g., Allan Variance plots).
+    # These values are derived from sensor characterization (Allan Variance analysis).
+    # Updated with measured BMI270 Allan Variance results (2025-12-29)
+    # SCALED UP 3× for better Q matrix calibration (10× was too aggressive)
     # Gyroscope
-    ARW_X, ARW_Y, ARW_Z = 4.6726e-03, 5.0027e-03, 4.7839e-03 # Angle Random Walk (ARW)
-    GYRO_BI_X, GYRO_BI_Y, GYRO_BI_Z = 1.0330e-03, 1.5368e-03, 9.9458e-04 # Bias Instability (BI)
+    ARW_X, ARW_Y, ARW_Z = 2.1499e-04, 2.3785e-04, 2.2601e-04 # Angle Random Walk (ARW) [rad/s√s]
+    GYRO_BI_X, GYRO_BI_Y, GYRO_BI_Z = 4.9323e-05, 8.4588e-05, 3.6609e-05 # Bias Instability (BI) [rad/s]
     # Accelerometer
-    VRW_X, VRW_Y, VRW_Z = 1.1339e-03, 8.3872e-04, 1.0075e-03 # Velocity Random Walk (VRW)
-    ACCEL_BI_X, ACCEL_BI_Y, ACCEL_BI_Z = 5.4210e-04, 2.8454e-04, 3.4573e-04 # Bias Instability (BI)
+    VRW_X, VRW_Y, VRW_Z = 2.4989e-03, 2.0159e-03, 2.7981e-03 # Velocity Random Walk (VRW) [m/s²√s]
+    ACCEL_BI_X, ACCEL_BI_Y, ACCEL_BI_Z = 1.3117e-03, 5.3091e-04, 8.4297e-04 # Bias Instability (BI) [m/s²]
 
     # --- Physical Constants ---
-    GRAVITY_MAGNITUDE = 9.81 # Magnitude of gravity (m/s^2)
+    GRAVITY_MAGNITUDE = 9.80665  # Standard gravity (m/s²) - CODATA 2018
 
     # --- Model Specific Parameters ---
     class ESKFTCN:

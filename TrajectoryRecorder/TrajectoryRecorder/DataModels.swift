@@ -60,7 +60,7 @@ class PencilDataRecorder: ObservableObject {
         guard !isRecording else { return }
         isRecording = true
         
-        recordingStartTime = Date().timeIntervalSince1970
+        recordingStartTime = ProcessInfo.processInfo.systemUptime
         currentSample = Sample(startTime: recordingStartTime)
     }
     

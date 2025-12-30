@@ -140,7 +140,7 @@ class ESKFTCN_model(BaseFilterTCNModel):
             accel_norm = torch.norm(accel_init, p=2, dim=-1)  # Magnitude of initial acceleration
 
             # `reliable_mask` identifies samples where the initial accelerometer reading
-            # is close to the magnitude of gravity (approx 9.81 m/s^2). This helps to
+            # is close to the magnitude of gravity (approx 9.80665 m/s²). This helps to
             # filter out cases where the sensor might be in free-fall (low accel_norm)
             # or experiencing strong external forces (high accel_norm), which would
             # make gravity-based leveling unreliable.

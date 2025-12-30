@@ -487,10 +487,10 @@ def main() -> None:
     """Main function to parse arguments, set up training, and start the training process."""
     parser = argparse.ArgumentParser(description="Train various trajectory estimation models.")
     parser.add_argument("--model", type=str, default="eskf_tcn", choices=["eskf_tcn", "aekf_tcn", "only_tcn"], help="Type of model to train.")
-    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for physics loss warmup.") # Added arg
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training.")
+    parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate.")
+    parser.add_argument("--batch_size", type=int, default=30, help="Batch size for training.")
     parser.add_argument("--device", type=str, default="mps" if torch.cuda.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
     args, _ = parser.parse_known_args()
 
@@ -532,13 +532,13 @@ def main() -> None:
 
     # Load Validation Dataset (No augmentation)
     val_dataset = TrajectoryDataset(
-        preprocessed_file=Config.VALIDATION_DATASET_H5_PATH,
+        preprocessed_file=Config.DATASET_H5_PATH,
         augment_multiplier=1,
         subsample_step=Config.SUBSAMPLE_STEP,
         do_augment=False,
     )
 
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=6)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
     with h5py.File(Config.SCALER_STATS_H5_PATH, "r") as f:

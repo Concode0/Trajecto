@@ -7,7 +7,7 @@ namespace trajecto {
 
     constexpr int TCN_INPUT_SIZE = 20;
     constexpr int TCN_NUM_LAYERS = 4;
-    constexpr float DT = 0.02;
+    constexpr float DT = 0.019957245f; // 50.107 Hz measured from stationary data
 
     // State Buffer Dimensions {Channels, HistoryLength}
     struct StateDim { int channels; int history; };
