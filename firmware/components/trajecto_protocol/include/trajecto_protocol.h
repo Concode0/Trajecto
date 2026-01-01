@@ -43,9 +43,10 @@ struct Header {
 
 // -- Config --
 struct ConfigPayload {
-    uint8_t mode;      // 0: Raw, 1: Inference
-    uint8_t odr_hz;    // e.g., 50
-    uint8_t reserved[2];
+    uint8_t mode;           // 0: Raw, 1: Inference
+    uint8_t odr_hz;         // e.g., 50
+    uint8_t enable_sda;     // 0: Disabled, 1: Enabled (Swinging Door compression)
+    uint8_t reserved[1];
 };
 
 // -- Data: Raw IMU --
@@ -60,10 +61,10 @@ struct RawImuPacket {
 // -- Data: Trajectory --
 struct TrajectoryPacket {
     uint32_t timestamp_us;
-    float pos[3];   // x, y, z (m)
-    float vel[3];   // x, y, z (m/s)
-    float quat[4];  // w, x, y, z
-    float prob_zupt;
+    float pos[3];       // x, y, z (m)
+    float vel[3];       // x, y, z (m/s)
+    float quat[4];      // w, x, y, z (orientation)
+    uint8_t pen_state;  // 0: pen up, 1: pen down (threshold-based for now)
 };
 
 #pragma pack(pop)

@@ -73,7 +73,7 @@ class CalibDataCollector:
         # Normalize
         norm_imu = (raw_imu - self.mean) / (self.std + 1e-6)
 
-        # TODO: Build full 20D feature vector for TCN
+        # TODO: Build full 19D feature vector for TCN
         # This would require maintaining ESKF state, which is complex
         # For basic calibration, we can use a simplified approach or just raw IMU
 
@@ -88,7 +88,7 @@ class CalibDataCollector:
             for i, state in enumerate(self.state_buffers):
                 np.save(f"{CALIB_DIR}/state_in_{i}_{self.sample_count}.npy", state.numpy())
 
-            # Note: You'd need to pass the full 20D feature vector here
+            # Note: You'd need to pass the full 19D feature vector here
             # outputs = self.stateful_tcn(full_feature_vector, *self.state_buffers)
             # self.state_buffers = list(outputs[1:])
 

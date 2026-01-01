@@ -32,11 +32,18 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+# Add parent directory to sys.path for model imports
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 try:
     from receive import TrajectoDriver, RawImuPacket
 except ImportError:
     print("Error: Could not import 'receive.py'. Ensure it is in the 'utils/' directory.")
     sys.exit(1)
+
+from model.config import Config
 
 
 # --- Constants & Configuration ---
@@ -70,25 +77,25 @@ WORD_LIST = [
 ]
 
 # Preprocessing Config
-TARGET_SAMPLING_RATE_HZ = 50.107
-GRAVITY = 9.80665  # Standard gravity (m/s²) - CODATA 2018
+TARGET_SAMPLING_RATE_HZ = Config.TARGET_SAMPLING_RATE_HZ
+GRAVITY = Config.GRAVITY_MAGNITUDE  # Standard gravity (m/s²) - CODATA 2018
 CUTOFF_FREQ_HZ = 5.0  # Reduced from 20.0 for better noise reduction (see optimize_fsr_zero_phase.py)
 FILTER_ORDER = 4
 SEGMENTATION_THRESHOLD = 0.01  # GT iPad screen force (0-1 normalized): exclude true zeros, keep actual writing (was: 0)
 SEGMENTATION_MARGIN = 30
 PIXEL_TO_METER = 0.0254 / 132.0  # iPad Retina display: 264 PPI ( 132 )
-MAX_SEQUENCE_LENGTH = int(TARGET_SAMPLING_RATE_HZ * 35.0)
+MAX_SEQUENCE_LENGTH = int(TARGET_SAMPLING_RATE_HZ * 6.0)
 TRAIN_VAL_SPLIT = 1.0
 
 # Parameters for synchronization and segmentation
-SYNC_WINDOW_S = 5.0  # Window for correlation in estimate_time_alignment_two_taps
-ROI_TAP_SEARCH_WINDOW_S = 5.0  # Initial search window for taps to define ROI in preprocess_single
+SYNC_WINDOW_S = 3.0  # Window for correlation in  (reduced from 5.0 to support sequences ≥6s)
+ROI_TAP_SEARCH_WINDOW_S = 2.0  # Initial search window for taps to define ROI in preprocess_single
 ROI_MARGIN_S = 0.5  # Margin around taps to define writing ROI
 MIN_SEGMENT_LENGTH_S = 1.0 # Minimum length for a valid segment (after margin)
-STATIC_BUFFER_S = 2 # Static buffer duration to include before the segment
+STATIC_BUFFER_S = 3 # Static buffer duration to include before the segmeestimate_time_alignment_two_tapsnt
 
 # Digitizer Error Detection
-DIGITIZER_JUMP_THRESHOLD_M = 0.010  # 10mm - Maximum plausible single-frame position jump
+DIGITIZER_JUMP_THRESHOLD_M = 0.020  # 10mm - Maximum plausible single-frame position jump
 DIGITIZER_JUMP_MIN_VELOCITY = 0.5  # m/s - Minimum velocity threshold to trigger jump detection (ignore static regions)
 
 
@@ -784,13 +791,40 @@ class AcquisitionManager:
         gt_f = df_gt_aligned["force"].to_numpy() if "force" in df_gt_aligned.columns else np.zeros(len(df_gt_aligned))
         roi_start, roi_end = 0, len(gt_f)
 
-        # Simple heuristic: Taps are high peaks at start/end
+        # Improved tap detection: Use expanded search windows
+        # Protocol: [Tap1] -> [Static ~2s] -> [Write] -> [Static ~1s] -> [Tap2]
         window = int(ROI_TAP_SEARCH_WINDOW_S * TARGET_SAMPLING_RATE_HZ)
+        margin_samples = int(ROI_MARGIN_S * TARGET_SAMPLING_RATE_HZ)
+
         if len(gt_f) > 2 * window:
-             start_tap = np.argmax(gt_f[:window])
-             end_tap = len(gt_f) - window + np.argmax(gt_f[-window:])
-             roi_start = start_tap + int(ROI_MARGIN_S * TARGET_SAMPLING_RATE_HZ)
-             roi_end = end_tap - int(ROI_MARGIN_S * TARGET_SAMPLING_RATE_HZ)
+             # Find start tap: Search first ROI_TAP_SEARCH_WINDOW_S seconds
+             # Use force derivative to find sharp tap (sudden rise)
+             start_search_region = gt_f[:window]
+             start_tap_idx = np.argmax(start_search_region)
+
+             # Find end tap: Search in LAST window, but ensure we search far enough back
+             # If sequence is long, the end tap might be further from the end than expected
+             # Search the last ROI_TAP_SEARCH_WINDOW_S seconds
+             end_search_region = gt_f[-window:]
+             end_tap_local = np.argmax(end_search_region)
+             end_tap_idx = len(gt_f) - window + end_tap_local
+
+             # Set ROI: Start AFTER first tap (skip tap + static period)
+             # End BEFORE second tap (skip tap + trailing static)
+             # NOTE: roi_start will have static buffer subtracted later for ESKF init
+             roi_start = start_tap_idx + margin_samples
+             roi_end = end_tap_idx - margin_samples
+
+             # Sanity check: ensure roi_end > roi_start
+             if roi_end <= roi_start:
+                 roi_start = 0
+                 roi_end = len(gt_f)
+
+             # Debug output for tap detection
+             print(f"\nTap Detection Debug:")
+             print(f"  Start tap at: {start_tap_idx} samples ({start_tap_idx/TARGET_SAMPLING_RATE_HZ:.2f}s), force={start_search_region[start_tap_idx]:.3f}")
+             print(f"  End tap at:   {end_tap_idx} samples ({end_tap_idx/TARGET_SAMPLING_RATE_HZ:.2f}s), force={gt_f[end_tap_idx]:.3f}")
+             print(f"  ROI: [{roi_start}:{roi_end}] = [{roi_start/TARGET_SAMPLING_RATE_HZ:.2f}s:{roi_end/TARGET_SAMPLING_RATE_HZ:.2f}s]")
 
         segments = []
         raw_segs = find_force_segments(df_gt_aligned, SEGMENTATION_THRESHOLD, SEGMENTATION_MARGIN)
@@ -812,7 +846,16 @@ class AcquisitionManager:
         final_start, final_end = segments[0][0], segments[-1][1]
 
         static_buffer_samples = int(STATIC_BUFFER_S * TARGET_SAMPLING_RATE_HZ)
+        final_start_before_buffer = final_start
         final_start = max(0, final_start - static_buffer_samples)
+
+        # Debug output for segmentation
+        print(f"\nSegmentation Debug:")
+        print(f"  Found {len(raw_segs)} raw segments, {len(segments)} after ROI clipping")
+        print(f"  Final segment before static buffer: [{final_start_before_buffer}:{final_end}] = [{final_start_before_buffer/TARGET_SAMPLING_RATE_HZ:.2f}s:{final_end/TARGET_SAMPLING_RATE_HZ:.2f}s]")
+        print(f"  Static buffer: {static_buffer_samples} samples ({STATIC_BUFFER_S}s)")
+        print(f"  Final segment after static buffer:  [{final_start}:{final_end}] = [{final_start/TARGET_SAMPLING_RATE_HZ:.2f}s:{final_end/TARGET_SAMPLING_RATE_HZ:.2f}s]")
+        print(f"  Total duration: {(final_end - final_start)/TARGET_SAMPLING_RATE_HZ:.2f}s")
 
         debug_info["segment"] = (final_start, final_end)
 

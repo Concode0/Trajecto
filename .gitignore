@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+data/
+.vscode/
+*.egg-info
+acquired_data/
+firmware/
+results/
+plots/
+TrajectoFW/
+
+# Virtual environments
+.venv

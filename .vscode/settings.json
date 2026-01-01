@@ -1,0 +1,10 @@
+{
+    {
+    "pasteImage.path": "${currentFileDir}/assets",
+    "pasteImage.prefix": "./assets/",
+    "pasteImage.namePrefix": "img_",
+
+
+    "files.trimTrailingWhitespace": true
+    }
+}

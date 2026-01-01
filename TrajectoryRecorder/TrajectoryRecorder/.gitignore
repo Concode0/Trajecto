@@ -1,0 +1,29 @@
+# Xcode
+.DS_Store
+*/build/
+*.generated.swift
+*.lproj/
+*.xcassets/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/
+*.xccheckout
+*.derivedData/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# Temporary files
+*.swp
+*~

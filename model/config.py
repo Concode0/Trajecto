@@ -9,13 +9,14 @@ class Config:
     """
 
     # --- Global Training Parameters ---
-    DT = 1.0 / 50.107  # Time delta (s) for model integration (50.107 Hz = 0.019957291396 s)
-    INITIAL_PEN_TIP_OFFSET = [0.0, -0.125, 0.0] # [x, y, z] offset from IMU to pen tip (m)
+    TARGET_SAMPLING_RATE_HZ = 50.107  # Target sampling rate (Hz) for data acquisition and model
+    DT = 1.0 / TARGET_SAMPLING_RATE_HZ  # Time delta (s) for model integration (50.107 Hz = 0.019957291396 s)
+    INITIAL_PEN_TIP_OFFSET = [0.0, -0.06, 0.0] # [x, y, z] offset from IMU to pen tip (m)
 
     # --- Dataset Parameters ---
     DATASET_H5_PATH = "./data/dataset.h5"
     VALIDATION_DATASET_H5_PATH = "./data/validation_dataset.h5"
-    AUGMENT_MULTIPLIER = 1
+    AUGMENT_MULTIPLIER = 2
     SUBSAMPLE_STEP = 1
     DO_AUGMENT = False
     YAW_ANGLE = (-0.78, 0.78)   # Set small angle in first and increase when fine tunning.
@@ -29,28 +30,25 @@ class Config:
     ZUPT_FORCE_DELTA_THRESHOLD = 154  # Optimized from GT analysis: 87% ZUPT coverage, 20% moving rejection (was: 2000)
 
     # --- Allan Variance Noise Parameters (used by ESKF and AEKF) ---
-    # These values are derived from sensor characterization (Allan Variance analysis).
-    # Updated with measured BMI270 Allan Variance results (2025-12-29)
-    # SCALED UP 3× for better Q matrix calibration (10× was too aggressive)
-    # Gyroscope
-    ARW_X, ARW_Y, ARW_Z = 2.1499e-04, 2.3785e-04, 2.2601e-04 # Angle Random Walk (ARW) [rad/s√s]
-    GYRO_BI_X, GYRO_BI_Y, GYRO_BI_Z = 4.9323e-05, 8.4588e-05, 3.6609e-05 # Bias Instability (BI) [rad/s]
-    # Accelerometer
-    VRW_X, VRW_Y, VRW_Z = 2.4989e-03, 2.0159e-03, 2.7981e-03 # Velocity Random Walk (VRW) [m/s²√s]
-    ACCEL_BI_X, ACCEL_BI_Y, ACCEL_BI_Z = 1.3117e-03, 5.3091e-04, 8.4297e-04 # Bias Instability (BI) [m/s²]
+
+    # Base values from Allan variance analysis (empirical measurements)
+    ARW_X, ARW_Y, ARW_Z = 7.1664e-05, 7.9283e-05, 7.5335e-05
+    GYRO_BI_X, GYRO_BI_Y, GYRO_BI_Z = 1.6441e-05, 2.8196e-05, 1.2203e-05
+    VRW_X, VRW_Y, VRW_Z = 8.3297e-04, 6.7196e-04, 9.3271e-04
+    ACCEL_BI_X, ACCEL_BI_Y, ACCEL_BI_Z = 4.3723e-04, 1.7697e-04, 2.8099e-04
 
     # --- Physical Constants ---
     GRAVITY_MAGNITUDE = 9.80665  # Standard gravity (m/s²) - CODATA 2018
 
     # --- Model Specific Parameters ---
     class ESKFTCN:
-        TCN_INPUT_SIZE = 20
+        TCN_INPUT_SIZE = 19  # Reduced from 20: removed zupt_flag to avoid circular dependency with TCN ZUPT
         TCN_CHANNELS = [64, 64, 64, 64]
         KERNEL_SIZE = 5
         DROPOUT = 0.1
         TCN_DILATION_FACTORS = [1, 4, 8, 16] # Added TCN Dilation Factors
-        USE_ZUPT = False
-        USE_TCN_ZUPT = True
+        USE_ZUPT = False  # Classic threshold-based ZUPT disabled (TCN handles ZUPT detection)
+        USE_TCN_ZUPT = True  # TCN predicts zupt_prob directly from physics features
         ADAPTIVE_GAIN_ESKF = 0.5 # Specific to ESKF's R adaptivity
         # Initial standard deviation for ZUPT measurement noise in ESKF.
         ZUPT_NOISE_STD_ESKF = [0.01, 0.01, 0.01]
@@ -60,7 +58,7 @@ class Config:
         MAHALANOBIS_GATE_THRESHOLD = 16.8
 
     class AEKFTCN:
-        TCN_INPUT_SIZE = 20
+        TCN_INPUT_SIZE = 19  # Reduced from 20: removed zupt_flag to avoid circular dependency
         TCN_OUTPUT_SIZE = 3 # Only predict 3D velocity residual
         TCN_NUM_CHANNELS = [64, 64, 64, 64]
         TCN_KERNEL_SIZE = 3

@@ -13,7 +13,7 @@ from .rotation_utils import quaternion_from_two_vectors, quaternion_to_rotation_
 
 # Define a constant for static initialization duration
 # Must match STATIC_BUFFER_S from acquire.py (2 seconds)
-STATIC_INIT_S = 0.5 # Seconds of static data to use for initial alignment
+STATIC_INIT_S = 2.0  # Seconds of static data to use for initial alignment (FIXED: use full buffer)
 
 
 class PureESKFModel(nn.Module):
@@ -87,33 +87,66 @@ class PureESKFModel(nn.Module):
             gyro_bias_b = torch.zeros(batch_size, 3, device=self.device)
         else:
             # Detect static period by checking gyro variance in sliding windows
-            window_size = 10  # 0.2s @ 50Hz
+            # FIXED: Per-sample detection instead of batch-averaged
+            window_size = Config.ZUPT_WINDOW_SIZE  # Window size for variance calculation
             gyro_data = imu_raw[:, :max_static_samples, 3:6]  # (batch, time, 3)
 
-            # Compute variance over time for all batches
-            # Use a conservative approach: stop at first window with high variance
-            static_samples = 20  # Default minimum
-            for t in range(window_size, max_static_samples - window_size, window_size):
-                # Check variance across the batch
-                window = gyro_data[:, t:t+window_size, :]  # (batch, window, 3)
-                gyro_var = torch.var(window, dim=1).mean()  # Average across batch and axes
+            # Initialize per-sample static counts (CRITICAL FIX!)
+            static_samples = torch.full((batch_size,), max_static_samples,
+                                       dtype=torch.long, device=self.device)
+            still_searching = torch.ones(batch_size, dtype=torch.bool, device=self.device)
 
-                # If variance exceeds threshold, motion has started
-                if gyro_var.item() > 0.002:  # rad²/s² threshold
-                    static_samples = t
+            # Loop through time windows
+            # CRITICAL FIX: Loop must go UP TO max_static_samples to catch late motion!
+            # Original bug: range(10, 90, 10) stops at 80, missing motion at 90!
+            for t in range(window_size, max_static_samples, window_size):
+                # Skip if all samples have been assigned
+                if not still_searching.any():
                     break
-            else:
-                static_samples = max_static_samples  # All samples are static
 
-            # Ensure we have at least 20 samples (0.4s) for stable estimate
-            static_samples = max(20, min(static_samples, max_static_samples))
+                # Extract window for all samples
+                window = gyro_data[:, t:t+window_size, :]  # (batch, window_size, 3)
+
+                # Compute variance PER SAMPLE (not averaged across batch!)
+                gyro_var_per_sample = torch.var(window, dim=1)  # (batch, 3)
+                gyro_var_mean = gyro_var_per_sample.mean(dim=1)  # (batch,) - one per sample
+
+                # Check threshold for EACH sample independently
+                # CRITICAL: Use 0.002 threshold (same as original), NOT 0.005!
+                motion_detected = gyro_var_mean > 0.002  # (batch,) boolean tensor
+
+                # Update static_samples only for samples that just detected motion
+                newly_detected = motion_detected & still_searching
+                static_samples[newly_detected] = t
+
+                # Mark these samples as no longer searching
+                still_searching[newly_detected] = False
+
+            # Ensure minimum of 20 samples for all
+            static_samples = torch.maximum(static_samples,
+                                           torch.full_like(static_samples, 20))
 
             # Average accelerometer reading during TRUE static period
-            avg_accel_b = imu_raw[:, :static_samples, 0:3].mean(dim=1)
+            # Use per-sample static period (different for each sample)
+            avg_accel_b = torch.zeros(batch_size, 3, device=self.device)
+            for b in range(batch_size):
+                avg_accel_b[b] = imu_raw[b, :static_samples[b], 0:3].mean(dim=0)
+
+            # DEBUG: Calculate accelerometer scale factor from gravity magnitude
+            accel_norm = torch.norm(avg_accel_b, p=2, dim=-1)  # (batch_size,)
+            expected_gravity = Config.GRAVITY_MAGNITUDE  # Standard gravity (CODATA 2018)
+            accel_scale_factor = accel_norm / expected_gravity  # (batch_size,)
+
+            # Print scale factors for debugging (5% of batches to avoid spam)
+            if torch.rand(1).item() < 0.05:
+                print(f"[DEBUG] Accel scale factors in static period:")
+                for b in range(min(4, batch_size)):  # Print first 4 samples
+                    print(f"  Sample {b}: measured_g={accel_norm[b].item():.4f} m/s², "
+                          f"scale_factor={accel_scale_factor[b].item():.4f}, "
+                          f"static_samples={static_samples[b].item()}")
 
             # Reliability check: verify average acceleration magnitude is close to gravity
             # This filters out cases of free-fall, strong external forces, or sensor errors
-            accel_norm = torch.norm(avg_accel_b, p=2, dim=-1)  # (batch_size,)
             reliable_mask = (accel_norm > 4.9) & (accel_norm < 14.7)  # ~[0.5g, 1.5g]
 
             # Initialize quaternion with identity (fallback for unreliable samples)
@@ -152,8 +185,10 @@ class PureESKFModel(nn.Module):
                 self.eskf.gravity_w = measured_g_mean.detach()  # Update for current batch
 
             # Initialize Gyro Bias from TRUE static period
-            # Average gyro readings during static period to estimate bias
-            gyro_bias_b = imu_raw[:, :static_samples, 3:6].mean(dim=1)
+            # Use per-sample static period (different for each sample)
+            gyro_bias_b = torch.zeros(batch_size, 3, device=self.device)
+            for b in range(batch_size):
+                gyro_bias_b[b] = imu_raw[b, :static_samples[b], 3:6].mean(dim=0)
 
         accel_bias_b = torch.zeros(batch_size, 3, device=self.device)
 

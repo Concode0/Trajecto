@@ -10,7 +10,6 @@ of training history, ultimately saving the trained model and loss plots.
 """
 
 import argparse
-import math
 import os
 import sys
 from typing import Any, Dict, List, Tuple, Optional
@@ -487,9 +486,9 @@ def main() -> None:
     """Main function to parse arguments, set up training, and start the training process."""
     parser = argparse.ArgumentParser(description="Train various trajectory estimation models.")
     parser.add_argument("--model", type=str, default="eskf_tcn", choices=["eskf_tcn", "aekf_tcn", "only_tcn"], help="Type of model to train.")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for physics loss warmup.") # Added arg
-    parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate.")
+    parser.add_argument("--lr", type=float, default=3e-3, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=30, help="Batch size for training.")
     parser.add_argument("--device", type=str, default="mps" if torch.cuda.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
     args, _ = parser.parse_known_args()

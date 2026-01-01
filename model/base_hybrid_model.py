@@ -380,6 +380,7 @@ class BaseFilterTCNModel(nn.Module):
             innovation_squashed = torch.tanh(raw_innovation)
 
             # Construct the comprehensive TCN input vector for this time step.
+            # Note: zupt_flag removed to avoid circular dependency when using TCN-based ZUPT
             tcn_input_vec = torch.cat(
                 [
                     gyro_b_norm_t,
@@ -387,7 +388,6 @@ class BaseFilterTCNModel(nn.Module):
                     force_norm_t,
                     pen_tip_vel_b_squashed,
                     gravity_b_norm,
-                    tcn_features_from_filter["zupt_flag"],
                     innovation_squashed,
                 ],
                 dim=-1,

@@ -96,7 +96,14 @@ firmware/            →  ESP32 Real-time Inference
    - Process Noise: Diagonal Q matrix tuned in `model/ESKF_TCN.py`
 
 2. **TCN Inference**: Multi-head network processes rich feature sequence
-   - Input Features (20D): [filter_vel_b(3), filter_innovation_b(3), accel_b(3), gyro_b(3), vel_norm(1), fsr(1), prev_vel_resid(3), prev_zupt_prob(1), heading_change(1), centripetal_acc(1)]
+   - Input Features (19D):
+     - `gyro_b_norm` (3): Normalized gyroscope in body frame
+     - `accel_b_norm` (3): Normalized accelerometer in body frame
+     - `force_norm` (1): Normalized force sensor
+     - `pen_tip_vel_b_squashed` (3): Pen tip velocity (tanh-squashed)
+     - `gravity_b_norm` (3): Gravity vector in body frame
+     - `innovation_squashed` (6): Measurement innovation (tanh-squashed)
+     - **Note**: zupt_flag removed to avoid circular dependency
    - Outputs:
      - `vel_corr` (3D): Velocity correction in body frame
      - `covariance_R` (6D): Log-variance for adaptive measurement noise
@@ -201,7 +208,7 @@ idf.py build
 
 - **Main Loop** (`firmware/main/main.cpp`):
   1. Read IMU @ 50Hz (interrupt-driven)
-  2. Build feature vector (20D)
+  2. Build feature vector (19D)
   3. TCN inference via TFLite Micro
   4. ESKF predict + TCN update + ZUPT update
   5. Stream via BLE (position, velocity, quaternion)
@@ -221,11 +228,11 @@ All constants centralized in `model/config.py`:
 - `MAX_SEQUENCE_LENGTH = 1750` (35 seconds @ 50Hz)
 
 **ESKF-TCN**:
-- `TCN_INPUT_SIZE = 20` (feature dimension)
+- `TCN_INPUT_SIZE = 19` (feature dimension, removed zupt_flag to avoid circular dependency)
 - `TCN_CHANNELS = [64, 64, 64, 64]` (4 layers)
-- `KERNEL_SIZE = 3`
-- `USE_ZUPT = True`
-- `USE_TCN_ZUPT = True` (use TCN's zupt prediction vs threshold-based)
+- `KERNEL_SIZE = 5`
+- `USE_ZUPT = False` (classic threshold-based ZUPT disabled)
+- `USE_TCN_ZUPT = True` (TCN predicts zupt_prob directly from physics features)
 
 **Loss Weights** (learnable via uncertainty):
 - `REG_WEIGHT_ESKF_TCN = 1e-4` (fixed L2 regularization)
@@ -239,9 +246,9 @@ All constants centralized in `model/config.py`:
 
 ### Adding New Features to TCN
 
-1. Modify feature construction in `model/ESKF_TCN.py:forward()`
-2. Update `TCN_INPUT_SIZE` in `model/config.py`
-3. Adjust `input_bn` in `model/TCN.py` (GroupNorm num_groups)
+1. Modify feature construction in `model/base_hybrid_model.py:forward()` (lines 382-394)
+2. Update `TCN_INPUT_SIZE` in `model/config.py` for both ESKFTCN and AEKFTCN
+3. Adjust `input_bn` in `model/TCN.py` (GroupNorm num_groups) if needed
 4. Retrain model
 5. Port feature logic to `firmware/components/trajecto_core/trajecto_system.hpp`
 

@@ -5,14 +5,14 @@
 
 namespace trajecto {
 
-    constexpr int TCN_INPUT_SIZE = 20;
+    constexpr int TCN_INPUT_SIZE = 19;  // Reduced from 20: removed zupt_flag to avoid circular dependency
     constexpr int TCN_NUM_LAYERS = 4;
     constexpr float DT = 0.019957245f; // 50.107 Hz measured from stationary data
 
     // State Buffer Dimensions {Channels, HistoryLength}
     struct StateDim { int channels; int history; };
     constexpr StateDim TCN_STATE_DIMS[] = {
-        { 20, 2 },
+        { 19, 2 },  // First layer input matches TCN_INPUT_SIZE
         { 64, 4 },
         { 64, 8 },
         { 64, 16 },

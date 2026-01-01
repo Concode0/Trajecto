@@ -80,8 +80,8 @@ class PureIntegrationModel(nn.Module):
         Returns:
             Number of static samples detected
         """
-        window_size = 10
-        static_samples = 20  # Default minimum
+        window_size = Config.ZUPT_WINDOW_SIZE
+        static_samples = Config.ZUPT_WINDOW_SIZE  # Default minimum
 
         for t in range(window_size, max_samples - window_size, window_size):
             window = gyro_data[:, t:t+window_size, :]
@@ -209,7 +209,7 @@ if __name__ == "__main__":
     device = "cpu"
     batch_size = 2
     seq_len = 100
-    dt = 0.02
+    dt = Config.DT
 
     # Create dummy IMU data
     # Static period: first 50 samples with near-zero gyro and gravity-aligned accel

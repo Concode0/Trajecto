@@ -14,13 +14,19 @@ process noise covariance matrix (Q) of a Kalman filter:
 """
 
 import argparse
+import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import allantools
 
+# Add parent directory to sys.path for relative imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model.config import Config
+
 # Standard gravity constant for unit conversion
-GRAVITY = 9.81
+GRAVITY = Config.GRAVITY_MAGNITUDE
 
 def analyze_sensor(data: np.ndarray, rate: float, sensor_name: str, unit: str) -> None:
     """

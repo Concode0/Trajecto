@@ -29,15 +29,22 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+# Add parent directory to sys.path for model imports
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 try:
     from receive import TrajectoDriver, RawImuPacket
 except ImportError:
     print("Error: Could not import 'receive.py'. Ensure it is in the 'utils/' directory.")
     sys.exit(1)
 
+from model.config import Config
+
 
 # Constants
-GRAVITY = 9.80665  # Standard gravity (m/s²) - CODATA 2018
+GRAVITY = Config.GRAVITY_MAGNITUDE  # Standard gravity (m/s²) - CODATA 2018
 DEFAULT_DURATION_S = 5  # 2 hour default
 DEFAULT_OUTPUT_DIR = "acquired_data/stationary"
 

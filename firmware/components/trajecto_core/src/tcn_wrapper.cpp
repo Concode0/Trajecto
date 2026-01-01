@@ -122,7 +122,7 @@ void TCNWrapper::extract_features(
     out_features[idx++] = gravity_b[0];
     out_features[idx++] = gravity_b[1];
     out_features[idx++] = gravity_b[2];
-    out_features[idx++] = is_zupt ? 1.0f : 0.0f;
+    // Note: zupt_flag removed to avoid circular dependency (TCN predicts zupt_prob)
     for (int i=0; i<6; i++) out_features[idx++] = inn_squashed[i];
 }
 
