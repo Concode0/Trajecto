@@ -1,4 +1,4 @@
-firmware/components/** linguist-vendored
+firmware/components/BMI270_SensorAPI/** linguist-vendored
 firmware/managed_components/** linguist-vendored
 firmware/build/** linguist-vendored
 
