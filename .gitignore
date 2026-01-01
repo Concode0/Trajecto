@@ -13,6 +13,9 @@ plots/
 docs/
 .gemini/
 .vscode/
+.DS_Store
+CLAUDE.md
+GEMINI.md
 
 # Virtual environments
 .venv
