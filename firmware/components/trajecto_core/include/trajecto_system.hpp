@@ -30,60 +30,42 @@ public:
             return;
         }
 
-        // 1. ZUPT Detection (Heuristic)
         bool is_zupt_heuristic = eskf_.check_zupt(accel);
         bool is_zupt = is_zupt_heuristic;
-        float current_step_prob = 0.0f; // Default for visualization
+        float current_step_prob = 0.0f;
 
-        // 2. Predict (Propagate State)
         eskf_.predict(gyro, accel);
 
-        // 3. TCN Inference
-        // TCN needs features which depend on current state and *last* innovation
         TCNOutput tcn_out = tcn_.process_step(accel, gyro, force, eskf_, last_innovation_, is_zupt_heuristic);
 
-        // Prepare Measurement Noise R
         Eigen::Matrix<float, 6, 1> R_diag;
-        R_diag.setConstant(1e-4f); // Default baseline
+        R_diag.setConstant(1e-4f);
 
         if (tcn_out.valid) {
-            // TCN Override for ZUPT
             if (tcn_out.zupt_prob > 0.5f) {
                 is_zupt = true;
             }
             current_step_prob = tcn_out.zupt_prob;
 
-            // Apply TCN Velocity Correction (if not ZUPT)
             if (!is_zupt) {
                 eskf_.update_tcn_vel(tcn_out.vel_corr, tcn_out.R_params);
             }
 
-            // Parse R from TCN for IMU Update
             for(int i=0; i<6; i++) {
-                 // Softplus approximation using LUT
                  float val = fast_softplus(tcn_out.R_params[i]);
                  R_diag[i] = val + 1e-6f;
             }
         } else {
-             // If TCN not running (e.g. buffer filling), rely on heuristic
              current_step_prob = is_zupt ? 1.0f : 0.0f;
         }
-        
-        // Store for Getter
+
         zupt_prob_ = current_step_prob;
 
-        // 4. ZUPT Update
-        // Note: ESKF::update_zupt expects a probability if available, or uses default high confidence if -1
-        // We pass -1 if we just want "hard" ZUPT, or pass the probability if we have one.
-        // If it was TCN ZUPT, we have a prob. If heuristic, we treat it as 1.0.
         if (is_zupt) {
             float prob_to_pass = (tcn_out.valid && tcn_out.zupt_prob > 0.5f) ? tcn_out.zupt_prob : -1.0f;
             eskf_.update_zupt(prob_to_pass);
         }
 
-        // 5. Standard IMU Update
-        // This estimates biases and generates innovation for the next TCN step.
-        // It now includes Mahalanobis Gating logic inside.
         float mahalanobis_sq = 0.0f;
         last_innovation_ = eskf_.update_imu(accel, gyro, R_diag, &mahalanobis_sq);
     }

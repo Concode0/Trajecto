@@ -1,12 +1,10 @@
 #pragma once
 
 #include <vector>
-#include <vector> // Redundant but harmless
 #include <Eigen/Dense>
 #include "eskf.hpp"
 #include "model_params.hpp"
 
-// Forward declarations for TFLite
 namespace tflite {
     class MicroInterpreter;
     class Model;
@@ -28,9 +26,6 @@ public:
 
     bool setup();
 
-    /**
-     * @brief Process a new data point (Stateful Step).
-     */
     TCNOutput process_step(
         const Eigen::Vector3f& accel_raw,
         const Eigen::Vector3f& gyro_raw,
@@ -51,14 +46,10 @@ private:
         std::vector<float>& out_features
     );
 
-    // TFLite Micro components
     const tflite::Model* model_ = nullptr;
     tflite::MicroInterpreter* interpreter_ = nullptr;
     uint8_t* tensor_arena_ = nullptr;
-    
-    // Persistent State Buffers
-    // Each element corresponds to a layer's state buffer.
-    // We store them as flat vectors.
+
     std::vector<std::vector<float>> state_buffers_;
     
     static constexpr int kTensorArenaSize = 60 * 1024; 
