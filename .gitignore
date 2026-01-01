@@ -8,10 +8,8 @@ data/
 .vscode/
 *.egg-info
 acquired_data/
-firmware/
 results/
 plots/
-TrajectoFW/
 
 # Virtual environments
 .venv
