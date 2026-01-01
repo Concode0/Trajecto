@@ -1,15 +1,6 @@
-"""
-Trajecto BLE Driver - Protocol-Compliant Implementation
+"""BLE driver for Trajecto device implementing firmware packet protocol.
 
-This module implements the `TrajectoDriver` class for BLE communication with the
-Trajecto hardware device. It follows the structured packet protocol defined in
-firmware/components/trajecto_protocol/include/trajecto_protocol.h
-
-The driver supports:
-- Handshake on connection (Ping/Pong)
-- Mode configuration (Raw IMU vs Trajectory)
-- Calibration control (CRT + FOC)
-- Dual streaming modes with proper packet parsing
+Supports handshake, mode config (Raw/Trajectory), calibration (CRT+FOC), and dual streaming.
 """
 
 import asyncio
@@ -22,17 +13,14 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from bleak import BleakClient, BleakScanner
 
-# --- BLE Service and Characteristic UUIDs ---
 SERVICE_UUID: str = "ad43434e-c549-4594-b474-543153544557"
 DATA_CHAR_UUID: str = "ad43434f-c549-4594-b474-543153544557"  # Notify
 CMD_CHAR_UUID: str = "ad43434d-c549-4594-b474-543153544557"   # Write
 DEVICE_NAME: str = "Trajecto"
 
 
-# --- Protocol Definitions (matching trajecto_protocol.h) ---
-
 class PacketType(IntEnum):
-    """Packet type identifiers matching firmware enum"""
+    """Packet type identifiers from firmware protocol"""
     CMD_PING = 0x01
     RSP_PONG = 0x02
 
@@ -55,7 +43,7 @@ class PacketType(IntEnum):
 
 @dataclass
 class Header:
-    """Packet header: type (1 byte) + length (1 byte)"""
+    """Packet header: type (1B) + length (1B)"""
     type: PacketType
     length: int
 
@@ -71,7 +59,7 @@ class Header:
 
 @dataclass
 class ConfigPayload:
-    """Configuration payload: mode, odr_hz, reserved[2]"""
+    """Config payload: mode (Raw=0/Trajectory=1), ODR, reserved"""
     mode: int      # 0: Raw, 1: Trajectory
     odr_hz: int    # Sampling rate (fixed at 50Hz)
     reserved: tuple = (0, 0)
@@ -94,7 +82,7 @@ class ConfigPayload:
 
 @dataclass
 class RawImuPacket:
-    """Raw IMU data packet"""
+    """Raw IMU packet (accel in m/s², gyro in rad/s)"""
     timestamp_us: int
     accel: tuple  # (x, y, z) in m/s^2
     gyro: tuple   # (x, y, z) in rad/s
@@ -117,7 +105,7 @@ class RawImuPacket:
 
 @dataclass
 class TrajectoryPacket:
-    """Trajectory estimation packet (ESKF-TCN output)"""
+    """Trajectory packet (ESKF-TCN output)"""
     timestamp_us: int
     pos: tuple    # (x, y, z) in meters
     vel: tuple    # (x, y, z) in m/s
@@ -138,18 +126,8 @@ class TrajectoryPacket:
         )
 
 
-# --- Driver Class ---
-
 class TrajectoDriver:
-    """
-    BLE driver for Trajecto device with full protocol support.
-
-    Features:
-    - Automatic handshake on connection
-    - Mode selection (Raw/Trajectory)
-    - Runtime calibration trigger
-    - Dual-mode data streaming
-    """
+    """BLE driver for Trajecto with handshake, mode selection, calibration, and streaming."""
 
     def __init__(
         self,
@@ -158,49 +136,31 @@ class TrajectoDriver:
         trajectory_callback: Optional[Callable[[TrajectoryPacket], None]] = None,
         verbose: bool = True
     ):
-        """
-        Initialize Trajecto BLE driver.
-
-        Args:
-            device_name: BLE device name to scan for
-            raw_callback: Callback for raw IMU data packets
-            trajectory_callback: Callback for trajectory packets
-            verbose: Enable debug output
-        """
+        """Initializes BLE driver with optional packet callbacks."""
         self.device_name = device_name
         self.client: Optional[BleakClient] = None
         self.verbose = verbose
 
-        # Callbacks
         self.raw_callback = raw_callback
         self.trajectory_callback = trajectory_callback
 
-        # Internal state
         self._connected_event = asyncio.Event()
         self._handshake_done = asyncio.Event()
         self._response_queue: asyncio.Queue = asyncio.Queue()
 
-        # Current config
         self.current_config: Optional[ConfigPayload] = None
-        self.streaming_mode: Optional[int] = None  # 0: Raw, 1: Trajectory
+        self.streaming_mode: Optional[int] = None
 
-        # Data buffers (if no callbacks provided)
         self.raw_data: List[RawImuPacket] = []
         self.trajectory_data: List[TrajectoryPacket] = []
 
     def _log(self, msg: str):
-        """Print log message if verbose enabled"""
+        """Prints log if verbose enabled"""
         if self.verbose:
             print(f"[TrajectoDriver] {msg}")
 
     async def connect(self) -> bool:
-        """
-        Scan for and connect to Trajecto device.
-        Performs handshake after connection.
-
-        Returns:
-            True if connection and handshake successful
-        """
+        """Scans, connects, and performs handshake. Returns True on success."""
         self._log(f"Scanning for '{self.device_name}'...")
         device = await BleakScanner.find_device_by_name(self.device_name)
 
@@ -216,12 +176,9 @@ class TrajectoDriver:
             self._log("Connected!")
             self._connected_event.set()
 
-            # Start listening for notifications
             await self.client.start_notify(DATA_CHAR_UUID, self._notification_handler)
             self._log("Notifications enabled.")
 
-            # Wait for initial handshake from firmware
-            # Firmware sends RSP_STREAM_STOPPED on connection (line 566 in main.cpp)
             self._log("Waiting for initial status from device...")
             try:
                 header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
@@ -232,11 +189,9 @@ class TrajectoDriver:
                 self._log("No initial status received (continuing anyway)")
                 self._handshake_done.set()
 
-            # Perform ping-pong handshake
             if await self._ping():
                 self._log("Handshake complete!")
 
-                # Query current configuration
                 config = await self.get_config()
                 if config:
                     self._log(f"Device Config: Mode={config.mode}, ODR={config.odr_hz}Hz")
@@ -253,7 +208,7 @@ class TrajectoDriver:
             return False
 
     async def disconnect(self):
-        """Disconnect from device"""
+        """Disconnects from device"""
         if self.client and self.client.is_connected:
             try:
                 await self.client.stop_notify(DATA_CHAR_UUID)
@@ -267,10 +222,7 @@ class TrajectoDriver:
         self._handshake_done.clear()
 
     def _notification_handler(self, sender: int, data: bytearray):
-        """
-        Handle incoming BLE notifications.
-        Parses packets according to protocol and dispatches to callbacks.
-        """
+        """Parses incoming BLE packets and dispatches to callbacks."""
         if len(data) < 2:
             return
 
@@ -281,11 +233,9 @@ class TrajectoDriver:
 
         payload = data[2:2+header.length]
 
-        # Response packets → queue for async handlers (with payload)
         if header.type in [PacketType.RSP_PONG, PacketType.RSP_CONFIG,
                           PacketType.RSP_CONFIG_OK, PacketType.RSP_STREAM_STARTED,
                           PacketType.RSP_STREAM_STOPPED, PacketType.RSP_CALIB_STATUS]:
-            # Store tuple of (header, payload) so we can parse response data
             asyncio.create_task(self._response_queue.put((header, payload)))
 
             if header.type == PacketType.RSP_CALIB_STATUS and len(payload) >= 1:
@@ -293,7 +243,6 @@ class TrajectoDriver:
                 status_str = {0: "In Progress", 1: "Success", 2: "Failed"}
                 self._log(f"Calibration Status: {status_str.get(status, 'Unknown')}")
 
-        # Data packets → parse and callback
         elif header.type == PacketType.DATA_RAW_IMU:
             packet = RawImuPacket.parse(payload)
             if packet:
@@ -311,7 +260,7 @@ class TrajectoDriver:
                     self.trajectory_data.append(packet)
 
     async def _send_command(self, packet_type: PacketType, payload: bytes = b'') -> bool:
-        """Send command packet to device"""
+        """Sends command packet to device"""
         if not self.client or not self.client.is_connected:
             self._log("Not connected")
             return False
@@ -327,7 +276,7 @@ class TrajectoDriver:
             return False
 
     async def _ping(self) -> bool:
-        """Send ping and wait for pong"""
+        """Sends ping and waits for pong"""
         self._log("Sending PING...")
         if not await self._send_command(PacketType.CMD_PING):
             return False
@@ -343,7 +292,7 @@ class TrajectoDriver:
         return False
 
     async def get_config(self) -> Optional[ConfigPayload]:
-        """Query current device configuration"""
+        """Queries current device config"""
         self._log("Querying config...")
         if not await self._send_command(PacketType.CMD_GET_CONFIG):
             return None
@@ -351,7 +300,6 @@ class TrajectoDriver:
         try:
             header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
             if header.type == PacketType.RSP_CONFIG:
-                # Parse config from response payload
                 config = ConfigPayload.parse(payload)
                 if config:
                     self.current_config = config
@@ -365,16 +313,7 @@ class TrajectoDriver:
         return None
 
     async def set_config(self, mode: int, odr_hz: int = 50) -> bool:
-        """
-        Set device configuration.
-
-        Args:
-            mode: 0 for Raw IMU, 1 for Trajectory
-            odr_hz: Sampling rate (typically 50Hz)
-
-        Returns:
-            True if config accepted
-        """
+        """Sets device config (mode: 0=Raw, 1=Trajectory; ODR typically 50Hz)."""
         config = ConfigPayload(mode=mode, odr_hz=odr_hz)
         self._log(f"Setting config: Mode={mode}, ODR={odr_hz}Hz")
 
@@ -394,16 +333,7 @@ class TrajectoDriver:
         return False
 
     async def start_streaming(self, mode: Optional[int] = None) -> bool:
-        """
-        Start data streaming.
-
-        Args:
-            mode: Optional mode override (0: Raw, 1: Trajectory)
-                 If None, uses current config
-
-        Returns:
-            True if streaming started
-        """
+        """Starts streaming (optionally sets mode first)."""
         if mode is not None:
             if not await self.set_config(mode):
                 return False
@@ -424,7 +354,7 @@ class TrajectoDriver:
         return False
 
     async def stop_streaming(self) -> bool:
-        """Stop data streaming"""
+        """Stops streaming"""
         self._log("Stopping stream...")
         if not await self._send_command(PacketType.CMD_STOP_STREAM):
             return False
@@ -440,23 +370,15 @@ class TrajectoDriver:
         return False
 
     async def calibrate(self) -> bool:
-        """
-        Trigger CRT + FOC calibration.
-        Device must be stationary on a table.
-
-        Returns:
-            True if calibration initiated (check status via notifications)
-        """
+        """Triggers CRT+FOC calibration (device must be stationary)."""
         self._log("Starting calibration - KEEP DEVICE STILL!")
         if not await self._send_command(PacketType.CMD_CALIBRATE):
             return False
 
-        # Initial status should arrive immediately
         try:
             header, payload = await asyncio.wait_for(self._response_queue.get(), timeout=2.0)
             if header.type == PacketType.RSP_CALIB_STATUS:
                 self._log("Calibration started, waiting for completion...")
-                # Final status will arrive via notification handler
                 return True
         except asyncio.TimeoutError:
             self._log("Calibration start timeout")
@@ -464,10 +386,8 @@ class TrajectoDriver:
         return False
 
 
-# --- Example Usage ---
-
 async def example_raw_stream():
-    """Example: Stream raw IMU data"""
+    """Example: streams raw IMU data"""
 
     def on_raw_data(packet: RawImuPacket):
         print(f"[{packet.timestamp_us/1e6:.3f}s] "
@@ -479,15 +399,14 @@ async def example_raw_stream():
     driver = TrajectoDriver(raw_callback=on_raw_data)
 
     if await driver.connect():
-        # Stream raw data for 5 seconds
-        await driver.start_streaming(mode=0)  # 0 = Raw
+        await driver.start_streaming(mode=0)
         await asyncio.sleep(5)
         await driver.stop_streaming()
         await driver.disconnect()
 
 
 async def example_trajectory_stream():
-    """Example: Stream trajectory estimates"""
+    """Example: streams trajectory estimates"""
 
     def on_trajectory(packet: TrajectoryPacket):
         print(f"[{packet.timestamp_us/1e6:.3f}s] "
@@ -497,15 +416,14 @@ async def example_trajectory_stream():
     driver = TrajectoDriver(trajectory_callback=on_trajectory)
 
     if await driver.connect():
-        # Stream trajectory for 5 seconds
-        await driver.start_streaming(mode=1)  # 1 = Trajectory
+        await driver.start_streaming(mode=1)
         await asyncio.sleep(5)
         await driver.stop_streaming()
         await driver.disconnect()
 
 
 async def example_calibration():
-    """Example: Trigger device calibration"""
+    """Example: triggers device calibration"""
 
     driver = TrajectoDriver(verbose=True)
 
@@ -520,7 +438,6 @@ async def example_calibration():
 
         await driver.calibrate()
 
-        # Wait for calibration to complete (listen for status notifications)
         print("\nCalibrating... (Check logs for status)")
         await asyncio.sleep(8)
 
@@ -528,7 +445,7 @@ async def example_calibration():
 
 
 async def main():
-    """Interactive menu for testing driver"""
+    """Interactive test menu"""
 
     print("\n" + "="*60)
     print("Trajecto BLE Driver - Test Interface")
