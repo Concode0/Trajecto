@@ -10,6 +10,9 @@ data/
 acquired_data/
 results/
 plots/
+docs/
+.gemini/
+.vscode/
 
 # Virtual environments
 .venv
