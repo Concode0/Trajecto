@@ -86,7 +86,9 @@ class ErrorStateKalmanFilter(nn.Module):
         Q_diag_tensor[12:15] = torch.tensor([accel_bi_x**2, accel_bi_y**2, accel_bi_z**2], device=device)  # Accel bias: BI
         self.register_buffer("Q_diag", Q_diag_tensor)
 
-        self.zupt_noise_std = nn.Parameter(torch.tensor(Config.ESKFTCN.ZUPT_NOISE_STD_ESKF, device=device))
+        if use_zupt:
+            self.zupt_noise_std = nn.Parameter(torch.tensor(Config.ESKFTCN.ZUPT_NOISE_STD_ESKF, device=device))
+
         self.register_buffer("R_diag", torch.ones(self.obs_dim, device=device) * 1e-4)
 
         self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device))
@@ -327,65 +329,102 @@ class ErrorStateKalmanFilter(nn.Module):
 
         return delta_x, P_error_new, innovation, mahalanobis_sq
 
-    def _calculate_zupt_update(
+    def _calculate_stationary_update(
         self,
         vel_w_pred: torch.Tensor,
         P_error_pred: torch.Tensor,
+        gyro_pred: torch.Tensor,
         tcn_zupt_prob: Optional[torch.Tensor] = None,
+        use_zaru: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Applies Zero-Velocity Update pseudo-measurement (z_ZUPT = 0).
+        """Applies stationary update: ZUPT (Zero-Velocity) and optionally ZARU (Zero Angular Rate).
+
+        For ESKF-TCN: Applies both ZUPT and ZARU constraints when stationary.
+        For classical ZUPT: Only applies velocity constraint.
 
         Args:
             vel_w_pred: Predicted velocity in world frame.
             P_error_pred: Predicted 15x15 error covariance.
+            gyro_pred: Predicted gyroscope (bias estimate) in body frame.
             tcn_zupt_prob: Optional TCN-predicted zero-velocity probability [0,1].
+            use_zaru: If True, also applies zero angular rate constraint (ESKF-TCN only).
 
         Returns:
-            Tuple of (delta_x_zupt, P_error_new).
+            Tuple of (delta_x_stationary, P_error_new).
         """
         batch_size = P_error_pred.shape[0]
 
-        # H: selects velocity error δv
-        H_zupt = torch.zeros(batch_size, 3, self.error_state_dim, device=self.device, dtype=P_error_pred.dtype)
-        H_zupt[:, :, 3:6] = torch.eye(3, device=self.device)
+        if use_zaru:
+            # ZUPT + ZARU: Constrain both velocity and angular rate
+            meas_dim = 6
+            H_stationary = torch.zeros(batch_size, meas_dim, self.error_state_dim, device=self.device, dtype=P_error_pred.dtype)
+            H_stationary[:, 0:3, 3:6] = torch.eye(3, device=self.device)  # Velocity error δv
+            H_stationary[:, 3:6, 9:12] = torch.eye(3, device=self.device)  # Gyro bias error δω_bias
 
-        # R_ZUPT: adaptive via TCN probability (high prob → low R)
-        if tcn_zupt_prob is not None:
-            if tcn_zupt_prob.ndim == 1:
-                tcn_zupt_prob = tcn_zupt_prob.unsqueeze(-1)
-            min_R_val = self.zupt_noise_std**2
-            max_R_val = min_R_val * 100
-            clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
-            R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
-            if R_zupt_scaled_diag.shape[-1] == 1:
-                R_zupt_scaled_diag = R_zupt_scaled_diag.repeat(1, 3)
-            R_zupt_matrix = torch.diag_embed(R_zupt_scaled_diag)
+            # Innovation: [velocity_error; gyro_error]
+            innovation_stationary = torch.cat([-vel_w_pred, -gyro_pred], dim=-1)
+
+            # R: adaptive via TCN probability for both velocity and gyro
+            if tcn_zupt_prob is not None:
+                if tcn_zupt_prob.ndim == 1:
+                    tcn_zupt_prob = tcn_zupt_prob.unsqueeze(-1)
+                min_R_val = self.zupt_noise_std**2
+                max_R_val = min_R_val * 100
+                clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
+                R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
+                if R_zupt_scaled_diag.shape[-1] == 1:
+                    R_zupt_scaled_diag = R_zupt_scaled_diag.repeat(1, 3)
+
+                # ZARU noise: slightly higher than ZUPT (gyro bias has more uncertainty)
+                R_zaru_scaled_diag = R_zupt_scaled_diag * 2.0
+                R_combined_diag = torch.cat([R_zupt_scaled_diag, R_zaru_scaled_diag], dim=-1)
+                R_stationary_matrix = torch.diag_embed(R_combined_diag)
+            else:
+                R_zupt_base = self.get_R_zupt()
+                R_zaru_base = R_zupt_base * 2.0
+                R_combined = torch.cat([torch.diag(R_zupt_base), torch.diag(R_zaru_base)], dim=0)
+                R_stationary_matrix = torch.diag(R_combined).unsqueeze(0).expand(batch_size, -1, -1)
         else:
-            R_zupt_matrix = self.get_R_zupt().unsqueeze(0).expand(batch_size, -1, -1)
+            # ZUPT only: Constrain velocity
+            meas_dim = 3
+            H_stationary = torch.zeros(batch_size, meas_dim, self.error_state_dim, device=self.device, dtype=P_error_pred.dtype)
+            H_stationary[:, :, 3:6] = torch.eye(3, device=self.device)
 
-        innovation_zupt = -vel_w_pred
+            innovation_stationary = -vel_w_pred
 
-        S_zupt_matrix = H_zupt @ P_error_pred @ H_zupt.transpose(-2, -1) + R_zupt_matrix
-        S_zupt_matrix += torch.eye(3, device=self.device) * 1e-6
+            # R_ZUPT: adaptive via TCN probability (high prob → low R)
+            if tcn_zupt_prob is not None:
+                if tcn_zupt_prob.ndim == 1:
+                    tcn_zupt_prob = tcn_zupt_prob.unsqueeze(-1)
+                min_R_val = self.zupt_noise_std**2
+                max_R_val = min_R_val * 100
+                clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
+                R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
+                if R_zupt_scaled_diag.shape[-1] == 1:
+                    R_zupt_scaled_diag = R_zupt_scaled_diag.repeat(1, 3)
+                R_stationary_matrix = torch.diag_embed(R_zupt_scaled_diag)
+            else:
+                R_stationary_matrix = self.get_R_zupt().unsqueeze(0).expand(batch_size, -1, -1)
 
-        K_zupt_gain = torch.linalg.solve(
-            S_zupt_matrix, H_zupt @ P_error_pred.transpose(-2, -1)
+        S_stationary_matrix = H_stationary @ P_error_pred @ H_stationary.transpose(-2, -1) + R_stationary_matrix
+        S_stationary_matrix += torch.eye(meas_dim, device=self.device) * 1e-6
+
+        K_stationary_gain = torch.linalg.solve(
+            S_stationary_matrix, H_stationary @ P_error_pred.transpose(-2, -1)
         ).transpose(-2, -1)
 
-        delta_x_zupt = (K_zupt_gain @ innovation_zupt.unsqueeze(-1)).squeeze(-1)
-
-        # NOTE: ZUPT coupling to δθ/δb via K is correct - use ESKF-TCN for better performance
+        delta_x_stationary = (K_stationary_gain @ innovation_stationary.unsqueeze(-1)).squeeze(-1)
 
         # P: Joseph form
         I_matrix = torch.eye(self.error_state_dim, device=self.device)
-        ImKH_zupt = I_matrix - K_zupt_gain @ H_zupt
+        ImKH_stationary = I_matrix - K_stationary_gain @ H_stationary
         P_error_new = (
-            ImKH_zupt @ P_error_pred @ ImKH_zupt.transpose(-2, -1)
-            + K_zupt_gain @ R_zupt_matrix @ K_zupt_gain.transpose(-2, -1)
+            ImKH_stationary @ P_error_pred @ ImKH_stationary.transpose(-2, -1)
+            + K_stationary_gain @ R_stationary_matrix @ K_stationary_gain.transpose(-2, -1)
         )
         P_error_new = self._make_symmetric(P_error_new)
 
-        return delta_x_zupt, P_error_new
+        return delta_x_stationary, P_error_new
 
     def _apply_tcn_velocity_correction(
         self,
@@ -549,18 +588,28 @@ class ErrorStateKalmanFilter(nn.Module):
         else:
             is_zupt = torch.zeros(accel_b_raw.shape[0], dtype=torch.bool, device=self.device)
 
-        # Apply ZUPT correction where applicable.
+        # Apply stationary update (ZUPT + ZARU) where applicable.
         if torch.any(is_zupt):
             zupt_mask = is_zupt
             zupt_prob_to_pass = None
             if self.use_tcn_zupt and tcn_output is not None:
                 zupt_prob_to_pass = tcn_output["zupt_prob"][zupt_mask]
 
-            delta_x_zupt, P_after_zupt = self._calculate_zupt_update(
-                vel_w_pred[zupt_mask], P_error_pred[zupt_mask], tcn_zupt_prob=zupt_prob_to_pass
+            # Compute gyro prediction (bias estimate)
+            gyro_pred = gyro_bias_b_pred
+
+            # Enable ZARU only for ESKF-TCN (when using TCN-based ZUPT)
+            use_zaru = self.use_tcn_zupt
+
+            delta_x_stationary, P_after_stationary = self._calculate_stationary_update(
+                vel_w_pred[zupt_mask],
+                P_error_pred[zupt_mask],
+                gyro_pred[zupt_mask],
+                tcn_zupt_prob=zupt_prob_to_pass,
+                use_zaru=use_zaru
             )
-            total_delta_x[zupt_mask] += delta_x_zupt
-            P_error_final[zupt_mask] = P_after_zupt
+            total_delta_x[zupt_mask] += delta_x_stationary
+            P_error_final[zupt_mask] = P_after_stationary
 
         # Apply TCN-based corrections or standard measurement update.
         if tcn_output is not None:
@@ -575,6 +624,7 @@ class ErrorStateKalmanFilter(nn.Module):
             # Standard Measurement Update (with TCN-provided adaptive R)
             # TCN now predicts log(R), so use exp to get R
             tcn_cov_diag = torch.exp(tcn_output["covariance_R"])
+            tcn_cov_diag = torch.clamp(tcn_cov_diag, min=1e-8, max=3.0)
             R_tcn_override = torch.diag_embed(tcn_cov_diag)
 
             # Pass gating threshold from Config
@@ -667,6 +717,19 @@ class ErrorStateKalmanFilter(nn.Module):
             )
         else:
             pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new, accel_bias_b_new = (pos_w_pred, vel_w_pred, quat_b_to_w_pred, gyro_bias_b_pred, accel_bias_b_pred)
+
+        # --- 3.5. Hard Velocity Reset ---
+        # When TCN is very confident about stationary state (zupt_prob >= threshold),
+        # directly reset velocity to zero instead of relying on soft Kalman correction
+        if self.use_tcn_zupt and tcn_output is not None:
+            zupt_prob = tcn_output["zupt_prob"].squeeze(-1)
+            hard_reset_mask = zupt_prob >= Config.ESKFTCN.ZUPT_HARD_RESET_THRESHOLD
+            if torch.any(hard_reset_mask):
+                vel_w_new = torch.where(
+                    hard_reset_mask.unsqueeze(-1),
+                    torch.zeros_like(vel_w_new),
+                    vel_w_new
+                )
 
         # --- 4. Assemble Features for next TCN step ---
         rot_mat_world_to_body = quaternion_to_rotation_matrix(quat_b_to_w_new).transpose(-2, -1)
