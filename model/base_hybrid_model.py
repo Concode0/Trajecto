@@ -1,12 +1,8 @@
 """
-This module provides a base class for hybrid models that combine a Kalman Filter
-(such as ESKF or AEKF) with a Temporal Convolutional Network (TCN).
+Base class for hybrid Kalman Filter-TCN models.
 
-It defines the common architecture and forward pass logic for such hybrid systems,
-allowing subclasses to implement specific filter dynamics and state management.
-The TCN component typically processes filter-derived features to provide corrections
-or adaptive parameters back to the filter, operating in either a closed-loop
-or open-loop configuration.
+Defines common architecture for ESKF/AEKF-TCN hybrid systems with
+configurable closed-loop or open-loop TCN correction integration.
 """
 
 import os
@@ -16,7 +12,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-# Add parent directory to sys.path for relative imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from TCN import TCN
@@ -60,7 +55,7 @@ class BaseFilterTCNModel(nn.Module):
         tcn_dilation_factors: Optional[List[int]] = None,
         dt: float = 0.01,
         loop_type: str = "closed",
-        separable: bool = False, # Added this line
+        separable: bool = False,
     ):
         """Initializes the BaseFilterTCNModel.
 
@@ -78,7 +73,7 @@ class BaseFilterTCNModel(nn.Module):
             loop_type: Defines how TCN corrections are applied.
                 'closed': TCN outputs directly influence the filter's state/covariance updates.
                 'open': TCN outputs are used for post-correction of the filter's trajectory.
-            separable: Whether to use Depthwise Separable Convolutions in TCN. # Added this line
+            separable: Whether to use Depthwise Separable Convolutions in TCN.
         """
         super().__init__()
         self.device = device
@@ -86,55 +81,37 @@ class BaseFilterTCNModel(nn.Module):
         self.tcn_input_size = tcn_input_size
         self.loop_type = loop_type
 
-        # The specific Kalman filter (ESKF/AEKF) must be instantiated by a subclass.
         self.filter: Optional[nn.Module] = None
 
-        # --- TCN for Closed-Loop Correction or Post-processing ---
-        # The TCN takes a sequence of features derived from the filter's operation
-        # and outputs corrections or adaptive parameters.
         self.tcn = TCN(
             input_size=tcn_input_size,
             tcn_channels=tcn_channels,
             kernel_size=kernel_size,
             dropout=dropout,
             tcn_dilation_factors=tcn_dilation_factors,
-            separable=separable, # Passed to TCN constructor
-            # TCN in this context primarily predicts corrections, not state directly.
-            # Its dt is often implicitly handled by feature sampling rate.
+            separable=separable,
         )
 
-        # --- Normalization Layer for TCN Input ---
-        # Layer normalization helps stabilize TCN training by normalizing its input features.
-        # self.input_norm_layer = nn.LayerNorm(tcn_input_size) # Removed in favor of BatchNorm in TCN
-
-        # --- Physical Constants ---
-        # Pen tip offset from the IMU's origin, expressed in the IMU's body frame.
-        # Made learnable to fine-tune the lever arm effect.
+        # r_pt: IMU→pen tip offset (learnable for lever arm correction)
         self.pen_tip_offset_b = nn.Parameter(
             torch.tensor(Config.INITIAL_PEN_TIP_OFFSET, device=device, dtype=torch.float32)
         )
-        
-        # Store initial value for regularization (keep it close to physical measurement)
+
         self.register_buffer(
             "initial_pen_tip_offset_b",
             torch.tensor(Config.INITIAL_PEN_TIP_OFFSET, device=device, dtype=torch.float32)
         )
 
-        # Gravity vector in the world frame (assuming +Z is up).
         self.register_buffer(
             "gravity_w",
             torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device)
         )
 
     def get_pen_tip_regularization_loss(self) -> torch.Tensor:
-        """Calculates regularization loss for the learnable pen tip offset.
-        
-        Penalizes deviation from the initial physical measurement to ensure
-        the learned offset remains physically plausible.
-        
+        """Regularizes pen tip offset to maintain physical plausibility.
+
         Returns:
-            torch.Tensor: The L2 norm of the difference between the current
-            learned offset and the initial configuration.
+            L2 norm of deviation from initial physical measurement.
         """
         return torch.norm(self.pen_tip_offset_b - self.initial_pen_tip_offset_b)
 

@@ -1,10 +1,17 @@
+"""
+Hybrid model combining Adaptive Extended Kalman Filter (AEKF) with
+Temporal Convolutional Network (TCN) in open-loop configuration.
+
+The AEKF provides physics-based state estimates while the TCN predicts
+residual velocity corrections for unmodeled dynamics and sensor errors.
+"""
+
 from typing import Dict, List, Optional, Tuple
 import sys, os
 
 import torch
 import torch.nn as nn
 
-# Add parent directory to sys.path for relative imports
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from model.AEKF import ExtendedKalmanFilter
@@ -13,12 +20,10 @@ from model.config import Config
 
 
 class AEKFTCN_model(BaseFilterTCNModel):
-    """A hybrid model combining an Analytically-linearized Extended Kalman Filter
-    (AEKF) with a Temporal Convolutional Network (TCN).
+    """Hybrid AEKF-TCN model for pen trajectory estimation.
 
-    The AEKF provides a physics-based state estimate, while the TCN learns to
-    predict the residual errors in the AEKF's velocity estimates, correcting
-    for unmodeled dynamics and sensor errors.
+    Combines physics-based AEKF state estimation with learned TCN velocity
+    corrections in open-loop configuration for improved trajectory accuracy.
     """
 
     def __init__(
@@ -99,16 +104,12 @@ class AEKFTCN_model(BaseFilterTCNModel):
 
     def _get_position_and_quaternion(self, filter_output):
         state = filter_output[0]
-
-        # Slicing based on AEKF state definition
         pos_w = state[..., 0:3]
         quat_b_to_w = state[..., 6:10]
-
         return pos_w, quat_b_to_w
 
     def _get_gyro_bias(self, filter_output):
         state = filter_output[0]
-        # Gyro bias is at indices 10:13
         return state[..., 10:13]
 
 if __name__ == "__main__":

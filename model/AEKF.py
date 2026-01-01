@@ -81,41 +81,34 @@ class ExtendedKalmanFilter(nn.Module):
         self.device = device
         self.use_zupt = use_zupt
 
-        # --- Noise Parameters ---
-        # Initial values are based on Allan Variance analysis of the sensor.
-        # Gyroscope
+        # Allan Variance parameters (sensor characterization)
         arw_x, arw_y, arw_z = Config.ARW_X, Config.ARW_Y, Config.ARW_Z
         gyro_bi_x, gyro_bi_y, gyro_bi_z = Config.GYRO_BI_X, Config.GYRO_BI_Y, Config.GYRO_BI_Z
-        # Accelerometer
         vrw_x, vrw_y, vrw_z = Config.VRW_X, Config.VRW_Y, Config.VRW_Z
         accel_bi_x, accel_bi_y, accel_bi_z = Config.ACCEL_BI_X, Config.ACCEL_BI_Y, Config.ACCEL_BI_Z
 
-        # --- Q Matrix (Process Noise Covariance) ---
-        # Defines the uncertainty introduced during the state prediction step.
+        # Q diagonal: [Pos(3), Vel(3), Quat(4), GyBias(3), AcBias(3)]
         Q_diag_tensor = torch.zeros(state_dim, device=device)
-        Q_diag_tensor[0:3] = 0.0  # Position noise (driven by velocity)
-        Q_diag_tensor[3:6] = torch.tensor([vrw_x**2, vrw_y**2, vrw_z**2], device=device) # Velocity noise (from accel VRW)
+        Q_diag_tensor[0:3] = 0.0  # Pos: driven by vel
+        Q_diag_tensor[3:6] = torch.tensor([vrw_x**2, vrw_y**2, vrw_z**2], device=device)  # Vel: accel VRW
         avg_arw_sq = (arw_x**2 + arw_y**2 + arw_z**2) / 3.0
-        Q_diag_tensor[6:10] = avg_arw_sq # Orientation noise (from gyro ARW)
-        Q_diag_tensor[10:13] = torch.tensor([gyro_bi_x**2, gyro_bi_y**2, gyro_bi_z**2], device=device) # Gyro bias random walk
-        Q_diag_tensor[13:16] = torch.tensor([accel_bi_x**2, accel_bi_y**2, accel_bi_z**2], device=device) # Accel bias random walk
+        Q_diag_tensor[6:10] = avg_arw_sq  # Quat: gyro ARW (averaged)
+        Q_diag_tensor[10:13] = torch.tensor([gyro_bi_x**2, gyro_bi_y**2, gyro_bi_z**2], device=device)  # Gyro bias: BI
+        Q_diag_tensor[13:16] = torch.tensor([accel_bi_x**2, accel_bi_y**2, accel_bi_z**2], device=device)  # Accel bias: BI
         self.register_buffer("Q_diag", Q_diag_tensor)
 
-        # --- R Matrix (Measurement Noise Covariance) ---
-        # Defines the uncertainty of the sensor measurements. Made a learnable parameter.
+        # R diagonal (learnable): [Accel(3), Gyro(3)]
         R_diag_tensor = torch.ones(obs_dim, device=device)
-        R_diag_tensor[0:3] = torch.tensor([vrw_x**2, vrw_y**2, vrw_z**2]) # Accel noise
-        R_diag_tensor[3:6] = torch.tensor([arw_x**2, arw_y**2, arw_z**2]) # Gyro noise
+        R_diag_tensor[0:3] = torch.tensor([vrw_x**2, vrw_y**2, vrw_z**2])  # Accel: VRW
+        R_diag_tensor[3:6] = torch.tensor([arw_x**2, arw_y**2, arw_z**2])  # Gyro: ARW
         self.raw_R_diag = nn.Parameter(R_diag_tensor)
 
         self.zupt_noise_std = nn.Parameter(
             torch.tensor(Config.AEKFTCN.ZUPT_NOISE_STD_AEKF, device=device)
         )
 
-        # --- Physical Constants ---
         self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device))
 
-        # --- ZUPT Detector ---
         self.zupt_detector = ZuptDetector(
             window_size=Config.ZUPT_WINDOW_SIZE,
             accel_var_threshold=Config.ZUPT_ACCEL_THRESHOLD,
@@ -124,7 +117,6 @@ class ExtendedKalmanFilter(nn.Module):
             device=device,
         )
 
-        # --- Tuning Factors for Adaptive and ZUPT Noise ---
         self.adaptive_R_factor = nn.Parameter(torch.tensor(Config.AEKFTCN.ADAPTIVE_R_FACTOR_AEKF, device=device))
         self.zupt_R_factor = Config.AEKFTCN.ZUPT_R_FACTOR_AEKF
 

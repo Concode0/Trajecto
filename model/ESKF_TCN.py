@@ -1,13 +1,9 @@
 """
-This module defines the ESKFTCN_model, a hybrid architecture that integrates an
-Error-State Kalman Filter (ESKF) with a Temporal Convolutional Network (TCN).
+Hybrid ESKF-TCN model integrating Error-State Kalman Filter with Temporal
+Convolutional Network for enhanced trajectory estimation.
 
-The ESKF is a robust method for estimating the full IMU state (position, velocity,
-orientation, and sensor biases) by propagating a nominal state and correcting an
-error state. The TCN component, in this hybrid model, processes features derived
-from the ESKF's operation and predicts corrections or adaptive parameters,
-particularly concerning Zero-Velocity Updates (ZUPT) and velocity corrections,
-to enhance the overall trajectory estimation accuracy.
+The TCN processes ESKF-derived features to predict velocity corrections,
+adaptive noise parameters, and ZUPT probabilities in closed-loop configuration.
 """
 
 import os
@@ -16,7 +12,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-# Adjust sys.path for relative imports to find ESKF, BaseFilterTCNModel, etc.
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from model.ESKF import ErrorStateKalmanFilter
@@ -26,15 +21,10 @@ from model.config import Config
 
 
 class ESKFTCN_model(BaseFilterTCNModel):
-    """A hybrid model combining a closed-loop Error-State Kalman Filter (ESKF)
-    with a multi-head Temporal Convolutional Network (TCN).
+    """Closed-loop hybrid ESKF-TCN model for trajectory estimation.
 
-    This class specializes the `BaseFilterTCNModel` by implementing the
-    ESKF-specific methods for state initialization and iterative filtering steps.
-    It leverages the ESKF's error-state formulation for precise state estimation
-    and integrates a TCN to refine ZUPT decisions and provide additional
-    velocity corrections, operating in a closed-loop fashion where TCN outputs
-    directly influence the filter's updates.
+    Combines ESKF error-state formulation with TCN-predicted corrections
+    for velocity, adaptive noise, and ZUPT detection in closed-loop fashion.
     """
 
     def __init__(
@@ -70,7 +60,6 @@ class ESKFTCN_model(BaseFilterTCNModel):
                 If False, the classic ZUPT detector in `ESKF` is used if `use_zupt` is True.
             separable: Whether to use Depthwise Separable Convolutions in TCN.
         """
-        # Call the constructor of the base class (BaseFilterTCNModel)
         super().__init__(
             tcn_input_size=tcn_input_size,
             tcn_channels=tcn_channels,
@@ -79,12 +68,9 @@ class ESKFTCN_model(BaseFilterTCNModel):
             device=device,
             tcn_dilation_factors=tcn_dilation_factors,
             dt=dt,
-            loop_type="closed",  # ESKF-TCN typically operates in a closed-loop fashion
+            loop_type="closed",
             separable=separable,
         )
-        # Instantiate the core Error-State Kalman Filter.
-        # This filter will manage the nominal state propagation, error state
-        # prediction and measurement updates, and error injection.
         self.filter = ErrorStateKalmanFilter(
             device=device, dt=dt, use_zupt=use_zupt, use_tcn_zupt=use_tcn_zupt
         )
@@ -95,94 +81,47 @@ class ESKFTCN_model(BaseFilterTCNModel):
         dtype: torch.dtype,
         imu_data_seq: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
-        """Initializes the nominal state vector and error covariance matrix for the ESKF.
-
-        For an Error-State Kalman Filter (ESKF), the filter tracks a nominal state
-        (p, v, q, bg, ba) and a separate 15-dimensional error state (δp, δv, δθ, δbg, δba).
-        This method initializes the *nominal* components and the initial *error covariance*.
-
-        Nominal State Components initialized:
-        - Position in the world frame (3)
-        - Velocity in the world frame (3)
-        - Body-to-world orientation quaternion (4)
-        - Gyroscope bias in body frame (3)
-        - Accelerometer bias in body frame (3)
+        """Initializes ESKF nominal state and error covariance.
 
         Args:
-            batch_size: The number of sequences in the current batch.
-            dtype: The desired data type for the state and covariance tensors.
-            imu_data_seq: Optional. A batch of IMU sequences (e.g., first few
-                samples) used to initialize the orientation through 'leveling'.
+            batch_size: Number of sequences in batch.
+            dtype: Data type for tensors.
+            imu_data_seq: Optional IMU data for orientation initialization via leveling.
 
         Returns:
-            A tuple containing:
-                - pos_w (torch.Tensor): Initial world-frame position.
-                - vel_w (torch.Tensor): Initial world-frame velocity.
-                - quat_b_to_w (torch.Tensor): Initial body-to-world quaternion.
-                - gyro_bias_b (torch.Tensor): Initial gyroscope bias.
-                - accel_bias_b (torch.Tensor): Initial accelerometer bias.
-                - P_error (torch.Tensor): The initial error covariance matrix (15x15).
+            Tuple of (pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error).
         """
-        # Initialize nominal state components to zeros or identity.
         pos_w = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
         vel_w = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
         gyro_bias_b = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
         accel_bias_b = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
-
         quat_b_to_w = torch.zeros(batch_size, 4, device=self.device, dtype=dtype)
 
         if imu_data_seq is not None:
-            # Use the first accelerometer reading to determine initial orientation (leveling).
-            # This assumes the device starts static or near-static, such that the dominant
-            # acceleration measured is gravity. The goal is to align the body frame's
-            # measured gravity vector with the world frame's known gravity vector.
-            accel_init = imu_data_seq[:, 0, :3]  # First 3 components are accelerometer data
-            accel_norm = torch.norm(accel_init, p=2, dim=-1)  # Magnitude of initial acceleration
+            # Orientation initialization via gravity leveling
+            accel_init = imu_data_seq[:, 0, :3]
+            accel_norm = torch.norm(accel_init, p=2, dim=-1)
 
-            # `reliable_mask` identifies samples where the initial accelerometer reading
-            # is close to the magnitude of gravity (approx 9.80665 m/s²). This helps to
-            # filter out cases where the sensor might be in free-fall (low accel_norm)
-            # or experiencing strong external forces (high accel_norm), which would
-            # make gravity-based leveling unreliable.
-            reliable_mask = (accel_norm > 4.9) & (
-                accel_norm < 14.7
-            )  # Thresholds [~0.5g, ~1.5g]
+            reliable_mask = (accel_norm > 4.9) & (accel_norm < 14.7)
 
             if reliable_mask.any():
-                # Target vector is gravity pointing up (or down depending on convention)
-                # along the Z-axis in the world frame. Here, we assume gravity is positive Z.
                 gravity_up_w = (
                     torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=dtype)
                     .unsqueeze(0)
                     .expand(reliable_mask.sum(), -1)
                 )
-
-                # `quaternion_from_two_vectors` computes the quaternion required to rotate
-                # the measured initial acceleration vector (which should be ~[-gx, -gy, -gz]
-                # in body frame due to gravity) to align with the world's positive Z-axis.
-                # This effectively "levels" the coordinate frame.
                 init_quat = quaternion_from_two_vectors(
                     accel_init[reliable_mask], gravity_up_w
                 )
                 quat_b_to_w[reliable_mask] = init_quat
 
-            # For unreliable measurements (where accel_norm is not near gravity),
-            # fall back to an identity quaternion [1, 0, 0, 0]. This represents no
-            # initial rotation and is a safe default, albeit less accurate.
             identity_quat = torch.tensor(
                 [1.0, 0.0, 0.0, 0.0], device=self.device, dtype=dtype
             )
             quat_b_to_w[~reliable_mask] = identity_quat.expand((~reliable_mask).sum(), -1)
         else:
-            # If no IMU data is provided for initialization, default to an identity quaternion.
-            quat_b_to_w[:, 0] = 1.0  # w component of quaternion
+            quat_b_to_w[:, 0] = 1.0
 
-        # Initialize the error covariance matrix `P_error`.
-        # The ESKF's error state is 15-dimensional (3 for δpos, 3 for δvel, 3 for δangle,
-        # 3 for δgyro_bias, 3 for δaccel_bias).
-        # `P_error` represents the uncertainty in the initial error state estimates.
-        # A diagonal matrix signifies uncorrelated initial errors. The `0.1` scalar
-        # provides a reasonable initial uncertainty.
         P_error = (
             torch.eye(15, device=self.device, dtype=dtype)
             .unsqueeze(0)
@@ -197,32 +136,21 @@ class ESKFTCN_model(BaseFilterTCNModel):
         imu_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         tcn_output: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, ...]:
-        """Performs a single predict-update step of the ESKF.
-
-        This method encapsulates the core ESKF operations (nominal state propagation,
-        error state prediction and update, and error injection) for one time step.
+        """Performs single ESKF predict-update cycle.
 
         Args:
-            state_tuple (Tuple[torch.Tensor, ...]): Current nominal state and covariance.
-                - Components: (pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error)
-            imu_data (Tuple[torch.Tensor, torch.Tensor, torch.Tensor]): Sensor data for current step.
-                - Components: (gyro_b_raw, accel_b_raw, force_raw)
-            tcn_output (Optional[Dict[str, torch.Tensor]]): TCN predictions.
-                - Keys: "vel_corr", "covariance_R", "zupt_prob"
+            state_tuple: Current state (pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error).
+            imu_data: Sensor data (gyro_b_raw, accel_b_raw, force_raw).
+            tcn_output: Optional TCN predictions (vel_corr, covariance_R, zupt_prob).
 
         Returns:
-            Tuple[torch.Tensor, ...]: Updated state tuple and features.
-                - Components: (pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new, accel_bias_b_new, P_error_final, tcn_features)
+            Updated state tuple and features.
         """
         gyro_b_raw, accel_b_raw, force_raw = imu_data
         pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error = state_tuple
 
-        # Construct the measurement vector from raw IMU data.
-        # In this ESKF setup, both accelerometer and gyroscope readings are
-        # used as measurements.
         measurement = torch.cat([accel_b_raw, gyro_b_raw], dim=-1)
 
-        # Call the ESKF's forward method to execute one full predict-update cycle.
         return self.filter(
             pos_w,
             vel_w,
@@ -241,19 +169,14 @@ class ESKFTCN_model(BaseFilterTCNModel):
         self,
         filter_output: Tuple[torch.Tensor, ...],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extracts world frame position and body-to-world orientation quaternion
-        from the ESKF's nominal state output.
+        """Extracts position and quaternion from ESKF output.
 
         Args:
-            filter_output: The full output tuple from the ESKF's step,
-                which contains the updated nominal state components.
+            filter_output: ESKF output tuple.
 
         Returns:
-            A tuple containing:
-                - pos_w (torch.Tensor): The 3D position in the world frame (index 0).
-                - quat_b_to_w (torch.Tensor): The 4-element body-to-world quaternion (index 2).
+            Tuple of (pos_w, quat_b_to_w).
         """
-        # Nominal state components are returned as separate tensors in the tuple.
         pos_w = filter_output[0]
         quat_b_to_w = filter_output[2]
         return pos_w, quat_b_to_w
@@ -262,16 +185,14 @@ class ESKFTCN_model(BaseFilterTCNModel):
         self,
         filter_output: Tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
-        """Extracts gyroscope bias (in body frame) from the ESKF's nominal state output.
+        """Extracts gyroscope bias from ESKF output.
 
         Args:
-            filter_output: The full output tuple from the ESKF's step,
-                which contains the updated nominal state components.
+            filter_output: ESKF output tuple.
 
         Returns:
-            gyro_bias_b (torch.Tensor): The 3D gyroscope bias in the body frame (index 3).
+            Gyroscope bias in body frame.
         """
-        # Nominal state components are returned as separate tensors in the tuple.
         gyro_bias_b = filter_output[3]
         return gyro_bias_b
 
