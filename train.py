@@ -13,6 +13,7 @@ import argparse
 import os
 import sys
 from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime
 
 import h5py
 import matplotlib.pyplot as plt
@@ -22,8 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from scipy.spatial.distance import cdist
 
 # Add parent directory to sys.path for relative imports to models
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -189,8 +190,9 @@ class UncertaintyLoss(nn.Module):
                 losses["w_zupt"] = loss_zupt.item()
 
             # --- Regularization Loss (fixed weight) ---
+            # Compute mean squared error instead of total norm to avoid scaling with sequence length
             masked_vel_resid = pred_vel_resid_b * mask_3d
-            loss_reg = torch.norm(masked_vel_resid)
+            loss_reg = (masked_vel_resid ** 2).sum() / (mask_3d.sum() + 1e-8)
             weighted_reg_loss = reg_weight * loss_reg
             total_loss += weighted_reg_loss
             losses["reg"] = loss_reg.item()
@@ -207,7 +209,11 @@ class UncertaintyLoss(nn.Module):
             if final_cov_mask.any():
                 innovation_valid = innovation[final_cov_mask]
                 pred_R_diag_valid = pred_R_diag[final_cov_mask]
+                # Note: Input is already clamped in TCN.py to [-10, 5]
+                # Apply softplus for positive variance
                 variance = F.softplus(pred_R_diag_valid) + 1e-4
+                # Clamp output variance to match ESKF measurement update behavior
+                variance = torch.clamp(variance, min=1e-4, max=3.0)
                 nll_elementwise = 0.5 * (torch.square(innovation_valid) / variance + torch.log(variance))
                 nll_cov = torch.mean(torch.sum(nll_elementwise, dim=-1))
 
@@ -220,49 +226,77 @@ class UncertaintyLoss(nn.Module):
         return total_loss, losses
 
 
-def calculate_metrics(gt_pos: np.ndarray, pred_pos: np.ndarray) -> Tuple[float, float]:
-    """Calculates ATE (RMSE after alignment) and DTW distance."""
-    # Alignment (Umeyama)
-    gt_mean = np.mean(gt_pos, axis=0)
-    pred_mean = np.mean(pred_pos, axis=0)
-    gt_centered = gt_pos - gt_mean
-    pred_centered = pred_pos - pred_mean
+def validate(
+    model: nn.Module,
+    val_dataloader: DataLoader,
+    criterion: UncertaintyLoss,
+    device: str,
+    reg_weight: float,
+    model_name: str,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> Dict[str, float]:
+    """Evaluates the model on the validation set."""
+    model.eval()
+    val_losses = {}
+    total_val_loss = 0.0
+    num_batches = 0
 
-    gt_std = np.linalg.norm(gt_centered)
-    pred_std = np.linalg.norm(pred_centered)
-    scale = gt_std / pred_std if pred_std > 1e-6 else 1.0
+    mean_gpu = mean.to(device)
+    std_gpu = std.to(device)
 
-    pred_scaled = pred_centered * scale
-    H = np.dot(pred_scaled.T, gt_centered)
-    U, S, Vt = np.linalg.svd(H)
-    R = np.dot(Vt.T, U.T)
+    with torch.no_grad():
+        for batch in val_dataloader:
+            sensor_raw = batch["imu_seq_raw"].to(device)
+            gt_pos_w = batch["gt_pos_w"].to(device)
+            gt_vel_w = batch["gt_vel_w"].to(device)
+            seq_lens = batch["len"].to(device)
 
-    if np.linalg.det(R) < 0:
-        Vt[2, :] *= -1
-        R = np.dot(Vt.T, U.T)
+            max_len = sensor_raw.shape[1]
+            mask = torch.arange(max_len, device=device)[None, :] < seq_lens[:, None]
 
-    pred_aligned = np.dot(pred_scaled, R.T)
+            gt_vel_norm = torch.norm(gt_vel_w, dim=-1, keepdim=True)
+            gt_zupt = (gt_vel_norm < 0.005).float()
 
-    # ATE (RMSE)
-    error = np.linalg.norm(gt_centered - pred_aligned, axis=1)
-    ate = np.sqrt(np.mean(error**2))
+            sensor_norm = (sensor_raw - mean_gpu) / (std_gpu + 1e-6)
 
-    # DTW
-    # Use cdist for pairwise distances
-    dist_matrix = cdist(gt_centered, pred_aligned, metric='euclidean')
-    n, m = len(gt_centered), len(pred_aligned)
-    dtw = np.full((n + 1, m + 1), np.inf)
-    dtw[0, 0] = 0
+            model_output = model(sensor_raw, sensor_norm)
 
-    # Dynamic programming for DTW
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = dist_matrix[i - 1, j - 1]
-            dtw[i, j] = cost + min(dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1])
+            batch_gpu = {
+                "gt_pos_w": gt_pos_w,
+                "gt_vel_w": gt_vel_w,
+                "gt_zupt": gt_zupt,
+            }
 
-    normalized_dtw = dtw[n, m] / (n + m)
+            # Use None for target_phy_weight in validation
+            loss, sub_losses = criterion(
+                model_out=model_output,
+                batch=batch_gpu,
+                mask=mask,
+                reg_weight=reg_weight,
+                model_name=model_name,
+                target_phy_weight=None
+            )
+            
+            # Add Pen Tip Regularization Loss if available
+            if hasattr(model, "get_pen_tip_regularization_loss"):
+                pen_tip_loss = model.get_pen_tip_regularization_loss()
+                weighted_pen_tip = reg_weight * pen_tip_loss
+                loss += weighted_pen_tip
+                sub_losses["reg"] = sub_losses.get("reg", 0.0) + pen_tip_loss.item()
+                sub_losses["w_reg"] = sub_losses.get("w_reg", 0.0) + weighted_pen_tip.item()
 
-    return float(ate) * 100, float(normalized_dtw)
+            total_val_loss += loss.item()
+            for k, v in sub_losses.items():
+                val_losses[k] = val_losses.get(k, 0.0) + v
+            
+            num_batches += 1
+
+    avg_losses = {"total": total_val_loss / num_batches}
+    for k, v in val_losses.items():
+        avg_losses[k] = v / num_batches
+    
+    return avg_losses
 
 
 def train(
@@ -278,8 +312,16 @@ def train(
     std: torch.Tensor,
     reg_weight: float = 0.0,
     warmup_epochs: int = 10, # Added warmup_epochs argument
+    patience: int = 20, # Early stopping patience
+    min_delta: float = 1e-4, # Minimum change to qualify as improvement
 ) -> None:
-    """Runs the training loop for the specified model."""
+    """Runs the training loop for the specified model with early stopping support."""
+
+    # Initialize TensorBoard SummaryWriter
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join("runs", f"{model_name}_{timestamp}")
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard logging enabled: {log_dir}")
 
     criterion: nn.Module = UncertaintyLoss(device=device)
 
@@ -290,24 +332,55 @@ def train(
     total_steps = epochs * len(train_dataloader)
 
     # Use OneCycleLR scheduler
-    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, div_factor=25)
+    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.5, div_factor=25)
 
-    if os.path.exists(model_path):
+    # Check for checkpoint to resume training
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"{os.path.splitext(os.path.basename(model_path))[0]}_checkpoint.pth")
+    start_epoch = 0
+
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path} to resume training...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        criterion.load_state_dict(checkpoint['criterion_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resumed from epoch {start_epoch}")
+    elif os.path.exists(model_path):
         print(f"Loading saved model from {model_path} to resume training...")
-        model.load_state_dict(torch.load(model_path))
+        model.load_state_dict(torch.load(model_path, map_location=device))
 
     model.to(device)
 
     # Initialize history dictionaries for both training and validation
     train_history: Dict[str, List[float]] = {"total": [], "pos": [], "vel": [], "cos": [], "zupt": [], "reg": [], "cov": [], "lr": []}
 
+    # Early stopping variables (initialize before checkpoint loading)
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+    best_model_path = os.path.join(checkpoint_dir, f"{os.path.splitext(os.path.basename(model_path))[0]}_best.pth")
+
+    # Load training history if resuming from checkpoint
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if 'train_history' in checkpoint:
+            train_history = checkpoint['train_history']
+            print(f"Loaded training history with {len(train_history['total'])} epochs")
+        # Restore early stopping state if available
+        if 'best_val_loss' in checkpoint:
+            best_val_loss = checkpoint['best_val_loss']
+            epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
+            print(f"Restored early stopping state: best_val_loss={best_val_loss:.4f}, epochs_without_improvement={epochs_without_improvement}")
 
     print(f"Start Training for {model_name} on {device}...")
 
     mean_gpu = mean.to(device)
     std_gpu = std.to(device)
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         # --- Calculate Physics Warm-up Weight ---
         target_phy_weight: Optional[float] = None
         if epoch < warmup_epochs:
@@ -338,7 +411,7 @@ def train(
             mask = torch.arange(max_len, device=device)[None, :] < seq_lens[:, None]
 
             gt_vel_norm = torch.norm(gt_vel_w, dim=-1, keepdim=True)
-            gt_zupt = (gt_vel_norm < 0.01).float()
+            gt_zupt = (gt_vel_norm < 0.005).float()  # Tightened from 0.01 to 0.005 for better static/slow-motion separation
 
             sensor_norm = (sensor_raw - mean_gpu) / (std_gpu + 1e-6)
 
@@ -375,17 +448,25 @@ def train(
                 sub_losses["w_reg"] = sub_losses.get("w_reg", 0.0) + weighted_pen_tip.item()
 
 
-            if not torch.isnan(loss):
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step() # Step the scheduler after each batch
+            # CRITICAL: Check for NaN/Inf before backward pass
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\nWARNING: NaN/Inf loss detected! Skipping batch. Loss: {loss.item()}")
+                # Print sub-losses for debugging
+                for k, v in sub_losses.items():
+                    if np.isnan(v) or np.isinf(v):
+                        print(f"  - Problematic loss component '{k}': {v}")
+                continue  # Skip this batch
 
-            epoch_train_losses["total"] += loss.item() if not torch.isnan(loss) else 0
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step() # Step the scheduler after each batch
+
+            epoch_train_losses["total"] += loss.item()
             pbar_train_postfix: Dict[str, float] = {"L": loss.item()}
             for k, v in sub_losses.items():
                 if k in epoch_train_losses:
-                    epoch_train_losses[k] += v if not np.isnan(v) else 0
+                    epoch_train_losses[k] += v if not (np.isnan(v) or np.isinf(v)) else 0
                 if not k.startswith("w_"): # Only show raw losses in progress bar
                     pbar_train_postfix[f"L_{k}"] = v
             pbar_train.set_postfix(pbar_train_postfix)
@@ -397,7 +478,33 @@ def train(
         # Log Learning Rate
         current_lr = optimizer.param_groups[0]['lr']
         train_history["lr"].append(current_lr)
+        
+        # --- Validation Loop ---
+        val_metrics = validate(model, val_dataloader, criterion, device, reg_weight, model_name, mean, std)
+        
+        # --- TensorBoard Logging ---
+        writer.add_scalar("Loss/Train_Total", train_history["total"][-1], epoch)
+        writer.add_scalar("Loss/Val_Total", val_metrics["total"], epoch)
+        writer.add_scalar("Learning_Rate", current_lr, epoch)
+        
+        # Log sub-losses (Train)
+        for k in ["pos", "vel", "cos", "zupt", "reg", "cov"]:
+            if k in epoch_train_losses:
+                val = epoch_train_losses[k] / len(train_dataloader)
+                writer.add_scalar(f"Loss_Components/Train_{k.capitalize()}", val, epoch)
+                
+        # Log weighted sub-losses (Train)
+        for k in ["pos", "vel", "cos", "zupt", "reg", "cov"]:
+             key = f"w_{k}"
+             if key in epoch_train_losses:
+                 val = epoch_train_losses[key] / len(train_dataloader)
+                 writer.add_scalar(f"Loss_Weighted/Train_{k.capitalize()}", val, epoch)
 
+        # Log sub-losses (Val)
+        for k, v in val_metrics.items():
+            if k != "total" and not k.startswith("w_"):
+                writer.add_scalar(f"Loss_Components/Val_{k.capitalize()}", v, epoch)
+        
         # Calculate weights for logging
         with torch.no_grad():
             w_pos = torch.exp(-criterion.log_var_pos).item()
@@ -406,8 +513,17 @@ def train(
             # w_phy = torch.exp(-criterion.log_var_phy).item() # Commented out
             w_zupt = torch.exp(-criterion.log_var_zupt).item()
             w_cov = torch.exp(-criterion.log_var_cov).item()
+            
+            writer.add_scalars("Loss_Weights", {
+                "pos": w_pos,
+                "vel": w_vel,
+                "cos": w_cos,
+                "zupt": w_zupt,
+                "cov": w_cov
+            }, epoch)
 
-        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | LR={current_lr:.2e}"
+
+        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | Val_Total={val_metrics['total']:.4f} | LR={current_lr:.2e}"
 
         total_sum = epoch_train_losses["total"]
         def get_pct(key):
@@ -424,8 +540,68 @@ def train(
             log_str += f" | Weight_Pos={w_pos:.3f} ({get_pct('pos'):.1f}%)"
         print(log_str)
 
+        # Early stopping logic
+        current_val_loss = val_metrics['total']
+        if current_val_loss < best_val_loss - min_delta:
+            # Improvement detected
+            best_val_loss = current_val_loss
+            epochs_without_improvement = 0
+            # Save best model
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  New best validation loss: {best_val_loss:.4f} - Model saved to {best_model_path}")
+        else:
+            # No improvement
+            epochs_without_improvement += 1
+            print(f"  No improvement for {epochs_without_improvement} epoch(s). Best: {best_val_loss:.4f}")
+
+            if epochs_without_improvement >= patience:
+                print(f"\nEarly stopping triggered after {patience} epochs without improvement.")
+                print(f"Best validation loss: {best_val_loss:.4f} at epoch {epoch + 1 - patience}")
+                break
+
+        # Save checkpoint every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'criterion_state_dict': criterion.state_dict(),
+                'train_history': train_history,
+                'best_val_loss': best_val_loss,
+                'epochs_without_improvement': epochs_without_improvement,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            # Also save epoch-specific checkpoint for backup
+            epoch_checkpoint_path = os.path.join(checkpoint_dir, f"{os.path.splitext(os.path.basename(model_path))[0]}_epoch{epoch+1}.pth")
+            torch.save(checkpoint, epoch_checkpoint_path)
+            print(f"  Checkpoint saved: {checkpoint_path} and {epoch_checkpoint_path}")
+
+    # Restore best model if it exists
+    if os.path.exists(best_model_path):
+        print(f"\nRestoring best model from {best_model_path}")
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        print(f"Best validation loss: {best_val_loss:.4f}")
+
+    # Save final model state dict for inference/compatibility
     torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path}")
+    print(f"Final model saved to {model_path}")
+
+    # Save final complete checkpoint
+    final_checkpoint = {
+        'epoch': epochs - 1,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'criterion_state_dict': criterion.state_dict(),
+        'train_history': train_history,
+        'best_val_loss': best_val_loss,
+        'epochs_without_improvement': epochs_without_improvement,
+    }
+    torch.save(final_checkpoint, checkpoint_path)
+    print(f"Final checkpoint saved to {checkpoint_path}")
+    
+    writer.close()
 
     # Plotting training history
     plt.figure(figsize=(12, 8))
@@ -447,50 +623,19 @@ def train(
     plt.savefig(f"plots/loss_history_{model_name}.png")
     plt.close()
 
-    # --- Final Metric Evaluation (ATE, DTW) ---
-    print("\n--- Computing Final Metrics on Validation Set ---")
-    model.eval()
-    ate_list = []
-    dtw_list = []
-
-    with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc="Evaluating Metrics"):
-            sensor_raw = batch["imu_seq_raw"].to(device)
-            gt_pos_w = batch["gt_pos_w"].to(device)
-            seq_lens = batch["len"].to(device)
-            sensor_norm = (sensor_raw - mean_gpu) / (std_gpu + 1e-6)
-
-            model_output = model(sensor_raw, sensor_norm)
-
-            if model_name == "only_tcn":
-                pred_pos_w = model_output
-            else:
-                pred_pos_w = model_output["pred_pos_w"]
-
-            # Calculate metrics for each sample in the batch
-            for i in range(len(seq_lens)):
-                length = int(seq_lens[i].item())
-                gt_traj = gt_pos_w[i, :length].cpu().numpy()
-                pred_traj = pred_pos_w[i, :length].cpu().numpy()
-
-                ate, dtw = calculate_metrics(gt_traj, pred_traj)
-                ate_list.append(ate)
-                dtw_list.append(dtw)
-
-    print(f"\nFinal Validation Results:")
-    print(f"Mean ATE (RMSE): {np.mean(ate_list):.4f} m")
-    print(f"Mean DTW: {np.mean(dtw_list):.4f}")
 
 
 def main() -> None:
     """Main function to parse arguments, set up training, and start the training process."""
     parser = argparse.ArgumentParser(description="Train various trajectory estimation models.")
     parser.add_argument("--model", type=str, default="eskf_tcn", choices=["eskf_tcn", "aekf_tcn", "only_tcn"], help="Type of model to train.")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs.")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for physics loss warmup.") # Added arg
-    parser.add_argument("--lr", type=float, default=3e-3, help="Learning rate.")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=30, help="Batch size for training.")
     parser.add_argument("--device", type=str, default="mps" if torch.cuda.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
+    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs without improvement).")
+    parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum change in validation loss to qualify as improvement.")
     args, _ = parser.parse_known_args()
 
     # Note: Most loss weights are now learned automatically. Only `reg_weight` remains.
@@ -554,7 +699,22 @@ def main() -> None:
 
     model_path = f"{args.model}_model.pth"
 
-    train(args.model, model, train_dataloader, val_dataloader, args.epochs, args.lr, args.device, model_path, mean, std, **loss_weights, warmup_epochs=args.warmup_epochs)
+    train(
+        args.model,
+        model,
+        train_dataloader,
+        val_dataloader,
+        args.epochs,
+        args.lr,
+        args.device,
+        model_path,
+        mean,
+        std,
+        **loss_weights,
+        warmup_epochs=args.warmup_epochs,
+        patience=args.patience,
+        min_delta=args.min_delta
+    )
 
 
 if __name__ == "__main__":

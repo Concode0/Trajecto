@@ -107,7 +107,7 @@ class ExtendedKalmanFilter(nn.Module):
             torch.tensor(Config.AEKFTCN.ZUPT_NOISE_STD_AEKF, device=device)
         )
 
-        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device))
+        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, -Config.GRAVITY_MAGNITUDE], device=device))
 
         self.zupt_detector = ZuptDetector(
             window_size=Config.ZUPT_WINDOW_SIZE,

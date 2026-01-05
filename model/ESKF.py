@@ -86,12 +86,12 @@ class ErrorStateKalmanFilter(nn.Module):
         Q_diag_tensor[12:15] = torch.tensor([accel_bi_x**2, accel_bi_y**2, accel_bi_z**2], device=device)  # Accel bias: BI
         self.register_buffer("Q_diag", Q_diag_tensor)
 
-        if use_zupt:
+        if use_zupt or use_tcn_zupt:
             self.zupt_noise_std = nn.Parameter(torch.tensor(Config.ESKFTCN.ZUPT_NOISE_STD_ESKF, device=device))
 
         self.register_buffer("R_diag", torch.ones(self.obs_dim, device=device) * 1e-4)
 
-        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device))
+        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, -Config.GRAVITY_MAGNITUDE], device=device))
 
         self.zupt_detector = ZuptDetector(
             window_size=Config.ZUPT_WINDOW_SIZE,
@@ -292,14 +292,21 @@ class ErrorStateKalmanFilter(nn.Module):
         else:
             accel_meas = measurement[..., 0:3]
             accel_norm_diff = torch.abs(torch.norm(accel_meas, dim=-1, keepdim=True) - torch.norm(self.gravity_w))
+            # CRITICAL: Clamp accel_norm_diff to prevent exponential explosion
+            # Max diff of 20 m/s² (realistic for handwriting + safety margin)
+            accel_norm_diff = torch.clamp(accel_norm_diff, max=20.0)
             scaling_factor = torch.exp(self.adaptive_gain * accel_norm_diff)
+            # Additional safety: clamp scaling factor to [1.0, 1000.0]
+            scaling_factor = torch.clamp(scaling_factor, min=1.0, max=1000.0)
             base_R = torch.diag_embed(F.softplus(self.R_diag) + 1e-6)
             R_noise_matrix = base_R.unsqueeze(0).expand(batch_size, -1, -1).clone()
             R_noise_matrix[..., 0:3, 0:3] *= scaling_factor.unsqueeze(-1)
 
         # S = HPH^T + R, K = PH^T S^-1
         S_matrix = H_error_matrix @ P_error_pred @ H_error_matrix.transpose(-2, -1) + R_noise_matrix
-        S_matrix += torch.eye(self.obs_dim, device=self.device) * 1e-6
+        # Add regularization to ensure S_matrix is well-conditioned for solve operations
+        # Increased from 1e-6 to 1e-5 for better numerical stability
+        S_matrix += torch.eye(self.obs_dim, device=self.device) * 1e-5
 
         K_gain = torch.linalg.solve(
             S_matrix, H_error_matrix @ P_error_pred.transpose(-2, -1)
@@ -308,9 +315,14 @@ class ErrorStateKalmanFilter(nn.Module):
         # δx = Ky
         delta_x = (K_gain @ innovation.unsqueeze(-1)).squeeze(-1)
 
-        # d² = y^T S^-1 y
+        # d² = y^T S^-1 y (Mahalanobis distance squared)
+        # This measures how many standard deviations the innovation is from expected
+        # Safety: clamp result to prevent inf/nan propagation from ill-conditioned S_matrix
         sol_x = torch.linalg.solve(S_matrix, innovation.unsqueeze(-1))
         mahalanobis_sq = (innovation.unsqueeze(1) @ sol_x).squeeze(-1).squeeze(-1)
+        # Clamp to reasonable range: [0, 1e6] prevents numerical issues in gating logic
+        # Chi-square distribution for 6 DOF has p=0.99999 at ~27, so 1e6 is extremely conservative
+        mahalanobis_sq = torch.clamp(mahalanobis_sq, min=0.0, max=1e6)
 
         # P: Joseph form for numerical stability
         I_matrix = torch.eye(self.error_state_dim, device=self.device)
@@ -432,14 +444,17 @@ class ErrorStateKalmanFilter(nn.Module):
         P_error_pred: torch.Tensor,
         vel_corr_b: torch.Tensor,
         quat_b_to_w: torch.Tensor,
+        tcn_cov_diag: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Applies TCN velocity correction as pseudo-measurement.
+        """Applies TCN velocity correction as pseudo-measurement with adaptive noise.
 
         Args:
             vel_w_pred: Predicted velocity in world frame.
             P_error_pred: Predicted 15x15 error covariance.
             vel_corr_b: TCN velocity correction in body frame.
             quat_b_to_w: Current body-to-world quaternion.
+            tcn_cov_diag: Optional TCN-predicted covariance diagonal (6D).
+                         First 3 elements used for velocity correction noise.
 
         Returns:
             Tuple of (delta_x_tcn, P_error_new).
@@ -453,7 +468,18 @@ class ErrorStateKalmanFilter(nn.Module):
         vel_corr_w = (rot_mat_b_to_w @ vel_corr_b.unsqueeze(-1)).squeeze(-1)
         innovation_tcn = vel_corr_w
 
-        R_tcn_matrix = torch.eye(3, device=self.device).unsqueeze(0) * 1e-4
+        # Adaptive R_tcn from TCN's predicted covariance (if available)
+        if tcn_cov_diag is not None:
+            # Use first 3 elements of covariance prediction for velocity correction
+            # tcn_cov_diag is raw output (log-space), apply softplus for positive variance
+            R_tcn_diag = F.softplus(tcn_cov_diag[:, :3]) + 1e-6
+            # Clamp to reasonable range: [1e-4, 1.0] m²/s²
+            R_tcn_diag = torch.clamp(R_tcn_diag, min=1e-4, max=1.0)
+            R_tcn_matrix = torch.diag_embed(R_tcn_diag)
+        else:
+            # Fallback: moderate fixed noise (higher than original 1e-4 for safety)
+            R_tcn_matrix = torch.eye(3, device=self.device).unsqueeze(0) * 1e-2
+
         S_tcn_matrix = H_tcn @ P_error_pred @ H_tcn.transpose(-2, -1) + R_tcn_matrix
 
         K_tcn_gain = torch.linalg.solve(
@@ -613,18 +639,26 @@ class ErrorStateKalmanFilter(nn.Module):
 
         # Apply TCN-based corrections or standard measurement update.
         if tcn_output is not None:
-            # TCN Velocity Correction
+            # TCN Velocity Correction with adaptive R
             vel_corr_body = tcn_output["vel_corr"]
+            tcn_cov_raw = tcn_output.get("covariance_R", None)  # May be None for older models
+
             if torch.any(is_zupt): # Don't apply TCN velocity correction during ZUPT
                 vel_corr_body = torch.where(is_zupt.unsqueeze(-1), torch.zeros_like(vel_corr_body), vel_corr_body)
-            delta_x_tcn, P_after_tcn = self._apply_tcn_velocity_correction(vel_w_pred, P_error_final, vel_corr_body, quat_b_to_w_pred)
+
+            delta_x_tcn, P_after_tcn = self._apply_tcn_velocity_correction(
+                vel_w_pred, P_error_final, vel_corr_body, quat_b_to_w_pred,
+                tcn_cov_diag=tcn_cov_raw
+            )
             total_delta_x += delta_x_tcn
             P_error_final = P_after_tcn
 
             # Standard Measurement Update (with TCN-provided adaptive R)
-            # TCN now predicts log(R), so use exp to get R
-            tcn_cov_diag = torch.exp(tcn_output["covariance_R"])
-            tcn_cov_diag = torch.clamp(tcn_cov_diag, min=1e-8, max=3.0)
+            # TCN output is already clamped to [-10, 5] in TCN.py
+            # Apply softplus for positive variance (matches training loss)
+            tcn_cov_raw = tcn_output["covariance_R"]
+            tcn_cov_diag = F.softplus(tcn_cov_raw) + 1e-4  # softplus ensures positive, +1e-4 for numerical stability
+            tcn_cov_diag = torch.clamp(tcn_cov_diag, min=1e-4, max=3.0)  # Clamp output variance for stability
             R_tcn_override = torch.diag_embed(tcn_cov_diag)
 
             # Pass gating threshold from Config

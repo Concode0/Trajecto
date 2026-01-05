@@ -63,8 +63,8 @@ class PureIntegrationModel(nn.Module):
         self.device = device
         self.dt = dt
 
-        # Gravity vector (world frame, Z-up)
-        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device))
+        # Gravity vector (world frame, Z-down)
+        self.register_buffer("gravity_w", torch.tensor([0.0, 0.0, -Config.GRAVITY_MAGNITUDE], device=device))
 
         # Pen tip offset from IMU center
         self.pen_tip_offset = torch.tensor(Config.INITIAL_PEN_TIP_OFFSET, device=device)

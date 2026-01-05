@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
-from scipy.signal import butter, filtfilt, correlate, correlation_lags
+from scipy.signal import butter, bessel, filtfilt, correlate, correlation_lags
 from scipy.ndimage import gaussian_filter1d
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +47,7 @@ PROCESSED_DATASET_PATH = "data/dataset.h5"
 VALIDATION_DATASET_PATH = "data/validation_dataset.h5"
 SCALER_STATS_PATH = "data/scaler_stats.h5"
 
-NUM_SESSIONS = 3
+NUM_SESSIONS = 5
 LABELS_PER_SESSION = 10
 CONTINUOUS_SHAPES = [
     "Infinity Loop (∞)", "Spiral (In-Out)", "Spiral (Out-In)",
@@ -72,6 +72,7 @@ WORD_LIST = [
 TARGET_SAMPLING_RATE_HZ = Config.TARGET_SAMPLING_RATE_HZ
 GRAVITY = Config.GRAVITY_MAGNITUDE  # Standard gravity (m/s²) - CODATA 2018
 CUTOFF_FREQ_HZ = 5.0  # Reduced from 20.0 for better noise reduction (see optimize_fsr_zero_phase.py)
+IMU_CUTOFF_FREQ_HZ = 25.0  # Anti-aliasing filter for IMU at Nyquist frequency (50Hz sampling)
 FILTER_ORDER = 4
 SEGMENTATION_THRESHOLD = 0.01  # GT iPad screen force (0-1 normalized): exclude true zeros, keep actual writing (was: 0)
 SEGMENTATION_MARGIN = 30
@@ -83,7 +84,7 @@ SYNC_WINDOW_S = 3.0  # Window for correlation in  (reduced from 5.0 to support s
 ROI_TAP_SEARCH_WINDOW_S = 2.0  # Initial search window for taps to define ROI in preprocess_single
 ROI_MARGIN_S = 0.5  # Margin around taps to define writing ROI
 MIN_SEGMENT_LENGTH_S = 1.0 # Minimum length for a valid segment (after margin)
-STATIC_BUFFER_S = 3 # Static buffer duration to include before the segmeestimate_time_alignment_two_tapsnt
+STATIC_BUFFER_S = 2.5 # Static buffer duration to include before the segmeestimate_time_alignment_two_tapsnt
 
 DIGITIZER_JUMP_THRESHOLD_M = 0.020  # 10mm - Maximum plausible single-frame position jump
 DIGITIZER_JUMP_MIN_VELOCITY = 0.5  # m/s - Minimum velocity threshold to trigger jump detection (ignore static regions)
@@ -94,6 +95,13 @@ def butter_lowpass_filter(data: np.ndarray, cutoff: float, fs: float, order: int
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
     b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return filtfilt(b, a, data)
+
+def bessel_lowpass_filter(data: np.ndarray, cutoff: float, fs: float, order: int) -> np.ndarray:
+    """Zero-phase Bessel lowpass filter. Better phase response than Butterworth for IMU data."""
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = bessel(order, normal_cutoff, btype='low', analog=False, norm='phase')
     return filtfilt(b, a, data)
 
 def pad_sequence(data: np.ndarray, max_len: int, is_velocity: bool = False) -> np.ndarray:
@@ -573,8 +581,14 @@ class AcquisitionManager:
         df_s_seg = df_sensor_aligned.iloc[final_start:final_end].reset_index(drop=True)
         df_g_seg = df_gt_aligned.iloc[final_start:final_end].reset_index(drop=True)
 
+        # Apply Bessel lowpass filter to IMU signals at 25Hz
+        for col in ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]:
+            if col in df_s_seg.columns:
+                df_s_seg[col] = bessel_lowpass_filter(df_s_seg[col], IMU_CUTOFF_FREQ_HZ, TARGET_SAMPLING_RATE_HZ, FILTER_ORDER)
+
+        # Apply Bessel lowpass filter to FSR at 5Hz
         if "fsr" in df_s_seg.columns:
-            df_s_seg["fsr"] = butter_lowpass_filter(df_s_seg["fsr"], CUTOFF_FREQ_HZ, TARGET_SAMPLING_RATE_HZ, FILTER_ORDER)
+            df_s_seg["fsr"] = bessel_lowpass_filter(df_s_seg["fsr"], CUTOFF_FREQ_HZ, TARGET_SAMPLING_RATE_HZ, FILTER_ORDER)
 
         processed_segments = []
 

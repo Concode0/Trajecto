@@ -121,6 +121,23 @@ def visualize_sample(
 
     time = np.arange(len(gt_xyz)) * dt
 
+    # Calculate unified axis limits for consistent scaling across all spatial plots
+    # Combine GT and aligned prediction for bounds calculation
+    all_data = np.vstack([gt_xyz, pred_xyz_aligned])
+    margin = 0.05  # 5% margin for better visualization
+
+    x_min, x_max = all_data[:, 0].min(), all_data[:, 0].max()
+    y_min, y_max = all_data[:, 1].min(), all_data[:, 1].max()
+    z_min, z_max = all_data[:, 2].min(), all_data[:, 2].max()
+
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    z_range = z_max - z_min
+
+    x_lim = [x_min - margin * x_range, x_max + margin * x_range]
+    y_lim = [y_min - margin * y_range, y_max + margin * y_range]
+    z_lim = [z_min - margin * z_range, z_max + margin * z_range]
+
     # Plot 1: 3D Trajectory (before alignment)
     ax1 = fig.add_subplot(gs[0, 0], projection='3d')
     ax1.plot(gt_xyz[:, 0], gt_xyz[:, 1], gt_xyz[:, 2], 'g-', linewidth=2, label='Ground Truth', alpha=0.8)
@@ -130,6 +147,9 @@ def visualize_sample(
     ax1.set_xlabel('X (m)')
     ax1.set_ylabel('Y (m)')
     ax1.set_zlabel('Z (m)')
+    ax1.set_xlim(x_lim)
+    ax1.set_ylim(y_lim)
+    ax1.set_zlim(z_lim)
     ax1.set_title(f'3D Trajectory (Before Alignment)')
     ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3)
@@ -143,6 +163,9 @@ def visualize_sample(
     ax2.set_xlabel('X (m)')
     ax2.set_ylabel('Y (m)')
     ax2.set_zlabel('Z (m)')
+    ax2.set_xlim(x_lim)
+    ax2.set_ylim(y_lim)
+    ax2.set_zlim(z_lim)
     ax2.set_title(f'3D Trajectory (After Alignment)')
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
@@ -155,10 +178,12 @@ def visualize_sample(
     ax3.scatter(gt_xyz[-1, 0], gt_xyz[-1, 1], c='red', s=100, marker='x')
     ax3.set_xlabel('X (m)')
     ax3.set_ylabel('Y (m)')
+    ax3.set_xlim(x_lim)
+    ax3.set_ylim(y_lim)
     ax3.set_title('XY Projection')
     ax3.legend(fontsize=8)
     ax3.grid(True, alpha=0.3)
-    ax3.axis('equal')
+    ax3.set_aspect('equal', adjustable='box')
 
     # Plot 4: XZ Projection
     ax4 = fig.add_subplot(gs[0, 3])
@@ -168,10 +193,12 @@ def visualize_sample(
     ax4.scatter(gt_xyz[-1, 0], gt_xyz[-1, 2], c='red', s=100, marker='x')
     ax4.set_xlabel('X (m)')
     ax4.set_ylabel('Z (m)')
+    ax4.set_xlim(x_lim)
+    ax4.set_ylim(z_lim)
     ax4.set_title('XZ Projection')
     ax4.legend(fontsize=8)
     ax4.grid(True, alpha=0.3)
-    ax4.axis('equal')
+    ax4.set_aspect('equal', adjustable='box')
 
     # Plot 5: Per-axis errors over time
     error_xyz = pred_xyz_aligned - gt_xyz

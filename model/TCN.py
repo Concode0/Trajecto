@@ -138,7 +138,7 @@ class TCN(nn.Module):
         # Batch Normalization applied to the input features across the time dimension.
         # This replaces the LayerNorm that was previously in the wrapper class.
         # BatchNorm is more efficient for inference (can be fused) and treats features independently.
-        self.input_bn = nn.GroupNorm(num_groups=20, num_channels=input_size, affine=True)
+        self.input_bn = nn.GroupNorm(num_groups=19, num_channels=input_size, affine=True)
 
         self.tcn_layers = nn.ModuleList()  # Stores the sequential TCN blocks.
         in_channels = input_size
@@ -179,6 +179,14 @@ class TCN(nn.Module):
             }
         )
 
+        # Register isotropic velocity correction scale as buffer
+        # Using L2 norm maintains directional accuracy across all axes
+        # Physical Z-axis constraints are handled by data distribution, not output scaling
+        self.register_buffer(
+            "vel_scale_isotropic",
+            torch.tensor(Config.VEL_CORRECTION_SCALE, dtype=torch.float32)
+        )
+
     @property
     def receptive_field(self) -> int:
         """Returns the receptive field of the TCN.
@@ -212,6 +220,11 @@ class TCN(nn.Module):
         # from `[B, T, D]` to `[B, D, T]`.
         tcn_input = feature_sequence.transpose(1, 2)
 
+        # Apply GroupNorm to stabilize training and normalize input feature scales
+        # Different features have different scales: IMU (~1.0), velocity (~0.1), innovation (varies)
+        # GroupNorm helps TCN layers learn efficiently by normalizing across feature groups
+        tcn_input = self.input_bn(tcn_input)
+
         # Pass the input through all TCN layers.
         # Since we use CausalConv1d, the output sequence length is naturally preserved
         # and causality is maintained.
@@ -226,6 +239,32 @@ class TCN(nn.Module):
             head_name: head(tcn_output)
             for head_name, head in self.output_heads.items()
         }
+
+        # Bounded Velocity Correction: Isotropic denormalization to physical units
+        # Tanh naturally maps unbounded linear output → [-1, 1]
+        # Scale by isotropic L2 norm (2σ of velocity magnitude distribution)
+        # Isotropic scaling is critical because:
+        #   (1) Preserves directional accuracy: TCN learns true velocity vectors
+        #   (2) Physical Z-axis constraint is naturally learned from data distribution
+        #   (3) Avoids asymmetric regularization (all axes penalized equally)
+        #   (4) Simpler architecture: network doesn't need to learn axis-specific scaling
+        # Trade-off: Z-axis may saturate tanh more often, but preserves geometric correctness
+        # Use cached buffer (registered in __init__) - avoids tensor creation
+        outputs["vel_corr"] = torch.tanh(outputs["vel_corr"]) * self.vel_scale_isotropic
+
+        # CRITICAL: Clip covariance output to prevent numerical explosion
+        # Raw TCN output represents log-space values that will be transformed by:
+        #   variance = softplus(output) + 1e-4, then clamped to [1e-4, 3.0]
+        # To fully utilize the valid range without wasting network capacity:
+        #   - min: softplus(-10) + 1e-4 ≈ 1.45e-4 (slightly above floor)
+        #   - max: softplus(2.95) + 1e-4 ≈ 3.0 (matches ESKF/train.py upper bound)
+        # This ensures TCN output directly maps to usable variance range [1e-4, 3.0]
+        if "covariance_R" in outputs:
+            outputs["covariance_R"] = torch.clamp(
+                outputs["covariance_R"],
+                min=-10.0,
+                max=2.95
+            )
 
         return outputs
 

@@ -16,7 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from model.ESKF import ErrorStateKalmanFilter
 from model.base_hybrid_model import BaseFilterTCNModel
-from model.rotation_utils import quaternion_from_two_vectors
+from model.rotation_utils import quaternion_from_two_vectors, quaternion_to_rotation_matrix
 from model.config import Config
 
 
@@ -81,53 +81,210 @@ class ESKFTCN_model(BaseFilterTCNModel):
         dtype: torch.dtype,
         imu_data_seq: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
-        """Initializes ESKF nominal state and error covariance.
+        """Initializes ESKF nominal state and error covariance with robust estimation.
+
+        Leverages the Tap-Wait-Write-Tap protocol's ~2s static period to:
+        1. Detect actual static duration per sample (gyro variance monitoring)
+        2. Average accelerometer readings for robust gravity alignment
+        3. Estimate gyroscope and accelerometer biases from static data
+        4. Initialize error covariance based on static period variance
 
         Args:
             batch_size: Number of sequences in batch.
             dtype: Data type for tensors.
-            imu_data_seq: Optional IMU data for orientation initialization via leveling.
+            imu_data_seq: Optional IMU data [Batch, Seq, 7] for initialization.
+                Channels: [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, force]
 
         Returns:
             Tuple of (pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error).
         """
+        # Initialize position and velocity (ZUPT assumption at start)
         pos_w = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
         vel_w = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
         gyro_bias_b = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
         accel_bias_b = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
         quat_b_to_w = torch.zeros(batch_size, 4, device=self.device, dtype=dtype)
 
-        if imu_data_seq is not None:
-            # Orientation initialization via gravity leveling
-            accel_init = imu_data_seq[:, 0, :3]
-            accel_norm = torch.norm(accel_init, p=2, dim=-1)
+        if imu_data_seq is not None and imu_data_seq.shape[1] > 10:
+            # --- Enhanced Initialization from Static Period ---
+            # Static buffer duration from acquisition protocol (see CLAUDE.md)
+            STATIC_INIT_S = 2.0
+            seq_len = imu_data_seq.shape[1]
+            max_static_samples = min(seq_len, int(STATIC_INIT_S / self.dt))
 
-            reliable_mask = (accel_norm > 4.9) & (accel_norm < 14.7)
+            if max_static_samples >= 20:  # Need minimum samples for reliable estimation
+                # Step 1: Detect actual static period per sample
+                # Use gyroscope variance as motion detector
+                window_size = Config.ZUPT_WINDOW_SIZE
+                gyro_data = imu_data_seq[:, :max_static_samples, 3:6]  # [batch, time, 3]
 
-            if reliable_mask.any():
-                gravity_up_w = (
-                    torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=dtype)
+                # Initialize per-sample static counts
+                static_samples = torch.full((batch_size,), max_static_samples,
+                                           dtype=torch.long, device=self.device)
+                still_searching = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+
+                # Detect motion onset for each sample independently
+                for t in range(window_size, max_static_samples, window_size):
+                    if not still_searching.any():
+                        break
+
+                    window = gyro_data[:, t:t+window_size, :]  # [batch, window, 3]
+                    gyro_var_per_sample = torch.var(window, dim=1)  # [batch, 3]
+                    gyro_var_mean = gyro_var_per_sample.mean(dim=1)  # [batch]
+
+                    # Motion detected when gyro variance exceeds threshold
+                    motion_detected = gyro_var_mean > 0.002  # rad²/s²
+                    newly_detected = motion_detected & still_searching
+                    static_samples[newly_detected] = t
+                    still_searching[newly_detected] = False
+
+                # Enforce minimum samples for numerical stability
+                static_samples = torch.maximum(static_samples,
+                                               torch.full_like(static_samples, 20))
+
+                # Step 2: Average accelerometer reading during static period with outlier rejection
+                avg_accel_b = torch.zeros(batch_size, 3, device=self.device, dtype=dtype)
+                for b in range(batch_size):
+                    # RANSAC-based outlier rejection using MAD (Median Absolute Deviation)
+                    accel_static = imu_data_seq[b, :static_samples[b], 0:3]
+
+                    # Compute median and MAD for robust statistics
+                    median_accel = torch.median(accel_static, dim=0).values
+                    mad = torch.median(torch.abs(accel_static - median_accel), dim=0).values
+
+                    # Reject outliers: samples > 3*MAD from median (equivalent to ~3σ for Gaussian)
+                    deviation = torch.abs(accel_static - median_accel)
+                    inlier_mask = torch.all(deviation < 3.0 * (mad + 1e-6), dim=1)
+
+                    # Average only inliers (fallback to all samples if too many rejected)
+                    if inlier_mask.sum() > 10:  # Need minimum 10 samples
+                        avg_accel_b[b] = accel_static[inlier_mask].mean(dim=0)
+                    else:
+                        # Fallback: use median if outlier rejection too aggressive
+                        avg_accel_b[b] = median_accel
+
+                # Step 3: Gravity alignment with averaged measurement
+                accel_norm = torch.norm(avg_accel_b, p=2, dim=-1)
+                reliable_mask = (accel_norm > 4.9) & (accel_norm < 14.7)  # ~[0.5g, 1.5g]
+
+                # Initialize with identity quaternion as fallback
+                quat_b_to_w[:, 0] = 1.0
+
+                if reliable_mask.any():
+                    # CRITICAL: Accelerometer measures specific force (reaction force), not gravity
+                    # When stationary, it measures normal force pointing UP (opposite of gravity)
+                    # Gravity in world frame points DOWN: [0, 0, -9.81]
+                    # Measured accel points UP in body frame when Z-axis is vertical
+                    # Therefore, align measured accel (UP) with world UP direction [0, 0, +1]
+                    world_up = torch.zeros(reliable_mask.sum(), 3,
+                                          device=self.device, dtype=dtype)
+                    world_up[:, 2] = 1.0  # Unit vector pointing UP
+
+                    # Normalize measured acceleration for pure orientation alignment
+                    avg_accel_normalized = torch.nn.functional.normalize(
+                        avg_accel_b[reliable_mask], p=2, dim=-1
+                    )
+
+                    # Quaternion aligns measured accel (specific force UP) with world UP
+                    init_quat = quaternion_from_two_vectors(
+                        avg_accel_normalized,
+                        world_up
+                    )
+                    quat_b_to_w[reliable_mask] = init_quat
+
+                # Step 4: Estimate gyroscope bias from static period with outlier rejection
+                for b in range(batch_size):
+                    gyro_static = imu_data_seq[b, :static_samples[b], 3:6]
+
+                    # Robust outlier rejection for gyroscope
+                    median_gyro = torch.median(gyro_static, dim=0).values
+                    mad_gyro = torch.median(torch.abs(gyro_static - median_gyro), dim=0).values
+
+                    deviation_gyro = torch.abs(gyro_static - median_gyro)
+                    inlier_mask_gyro = torch.all(deviation_gyro < 3.0 * (mad_gyro + 1e-6), dim=1)
+
+                    if inlier_mask_gyro.sum() > 10:
+                        gyro_bias_b[b] = gyro_static[inlier_mask_gyro].mean(dim=0)
+                    else:
+                        gyro_bias_b[b] = median_gyro
+
+                # Step 5: Estimate accelerometer bias from static period
+                # Bias = measured_accel - expected_accel (gravity in body frame)
+                # After leveling, expected accel in body frame ≈ R_w_to_b @ gravity_w
+                rot_mat_b_to_w = quaternion_to_rotation_matrix(quat_b_to_w)
+                rot_mat_w_to_b = rot_mat_b_to_w.transpose(-1, -2)
+
+                # Expected gravity in body frame after alignment
+                gravity_w = torch.tensor([0.0, 0.0, -Config.GRAVITY_MAGNITUDE],
+                                        device=self.device, dtype=dtype)
+                expected_accel_b = (rot_mat_w_to_b @ gravity_w.unsqueeze(-1)).squeeze(-1)
+
+                # Accelerometer bias = measured - expected
+                accel_bias_b = avg_accel_b - expected_accel_b
+
+                # Step 6: Initialize error covariance based on static variance
+                # Use actual variance from static period for realistic uncertainty
+                P_error = torch.eye(15, device=self.device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+
+                for b in range(batch_size):
+                    static_imu = imu_data_seq[b, :static_samples[b], :]
+
+                    # Position uncertainty (start at origin)
+                    P_error[b, 0:3, 0:3] *= 0.01  # 1cm initial position uncertainty
+
+                    # Velocity uncertainty (ZUPT assumption)
+                    P_error[b, 3:6, 3:6] *= 0.001  # 1mm/s initial velocity uncertainty
+
+                    # Orientation uncertainty from accelerometer variance
+                    accel_var = torch.var(static_imu[:, 0:3], dim=0)
+                    ori_uncertainty = (accel_var / Config.GRAVITY_MAGNITUDE**2).clamp(min=1e-4, max=0.1)
+                    P_error[b, 6:9, 6:9] = torch.diag(ori_uncertainty)
+
+                    # Gyro bias uncertainty from static variance
+                    gyro_var = torch.var(static_imu[:, 3:6], dim=0).clamp(min=1e-6, max=1e-3)
+                    P_error[b, 9:12, 9:12] = torch.diag(gyro_var)
+
+                    # Accel bias uncertainty from static variance
+                    accel_bias_var = accel_var.clamp(min=1e-4, max=1.0)
+                    P_error[b, 12:15, 12:15] = torch.diag(accel_bias_var)
+
+            else:
+                # Fallback: insufficient static data, use simple initialization
+                accel_init = imu_data_seq[:, 0, :3]
+                accel_norm = torch.norm(accel_init, p=2, dim=-1)
+                reliable_mask = (accel_norm > 4.9) & (accel_norm < 14.7)
+
+                quat_b_to_w[:, 0] = 1.0
+
+                if reliable_mask.any():
+                    # Accelerometer measures UP when stationary (specific force)
+                    world_up = torch.zeros(reliable_mask.sum(), 3,
+                                          device=self.device, dtype=dtype)
+                    world_up[:, 2] = 1.0  # Align with UP, not DOWN
+
+                    accel_normalized = torch.nn.functional.normalize(
+                        accel_init[reliable_mask], p=2, dim=-1
+                    )
+                    init_quat = quaternion_from_two_vectors(accel_normalized, world_up)
+                    quat_b_to_w[reliable_mask] = init_quat
+
+                # Default covariance
+                P_error = (
+                    torch.eye(15, device=self.device, dtype=dtype)
                     .unsqueeze(0)
-                    .expand(reliable_mask.sum(), -1)
+                    .repeat(batch_size, 1, 1)
+                    * 0.1
                 )
-                init_quat = quaternion_from_two_vectors(
-                    accel_init[reliable_mask], gravity_up_w
-                )
-                quat_b_to_w[reliable_mask] = init_quat
-
-            identity_quat = torch.tensor(
-                [1.0, 0.0, 0.0, 0.0], device=self.device, dtype=dtype
-            )
-            quat_b_to_w[~reliable_mask] = identity_quat.expand((~reliable_mask).sum(), -1)
         else:
+            # No IMU data provided: use identity orientation and default covariance
             quat_b_to_w[:, 0] = 1.0
+            P_error = (
+                torch.eye(15, device=self.device, dtype=dtype)
+                .unsqueeze(0)
+                .repeat(batch_size, 1, 1)
+                * 0.1
+            )
 
-        P_error = (
-            torch.eye(15, device=self.device, dtype=dtype)
-            .unsqueeze(0)
-            .repeat(batch_size, 1, 1)
-            * 0.1
-        )
         return (pos_w, vel_w, quat_b_to_w, gyro_bias_b, accel_bias_b, P_error)
 
     def _filter_step(

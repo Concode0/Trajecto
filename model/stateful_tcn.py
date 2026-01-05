@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from model.TCN import TCN
+from model.config import Config
 
 class StatefulTCNExport(nn.Module):
     """
@@ -98,10 +99,25 @@ class StatefulTCNExport(nn.Module):
         # Final Heads
         # current_input: [Batch, FinalC, 1] -> Transpose to [Batch, 1, FinalC] for linear layers
         final_feature = current_input.transpose(1, 2)
-        
+
         # Return outputs in a fixed order for ONNX
         vel_corr = self.output_heads["vel_corr"](final_feature)
+        # Physics Scale Layer: Bridge normalized features to physical units
+        vel_corr = vel_corr * Config.VELOCITY_SCALE
+        # Hard-clip velocity correction to prevent extreme values
+        vel_corr = torch.clamp(
+            vel_corr,
+            min=-Config.ESKFTCN.VEL_CORR_CLIP_RANGE,
+            max=Config.ESKFTCN.VEL_CORR_CLIP_RANGE
+        )
         cov_R = self.output_heads["covariance_R"](final_feature)
+        # CRITICAL: Clip covariance output to prevent numerical explosion
+        # Clamping to [-10, 5] → variance range after softplus: [~4.5e-5, ~150]
+        cov_R = torch.clamp(
+            cov_R,
+            min=-10.0,
+            max=5.0
+        )
         zupt_p = self.output_heads["zupt_prob"](final_feature)
-        
+
         return (vel_corr, cov_R, zupt_p), tuple(new_states)

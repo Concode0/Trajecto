@@ -104,7 +104,33 @@ class BaseFilterTCNModel(nn.Module):
 
         self.register_buffer(
             "gravity_w",
-            torch.tensor([0.0, 0.0, Config.GRAVITY_MAGNITUDE], device=device)
+            torch.tensor([0.0, 0.0, -Config.GRAVITY_MAGNITUDE], device=device)
+        )
+
+        # Register normalization constants as buffers (optimization)
+        # These are created once and automatically moved to device, avoiding
+        # repeated tensor creation in the forward loop
+        # NOTE: vel_mean is NOT registered because body-frame velocity normalization
+        #       only uses std (mean subtraction would be incorrect due to frame rotation)
+        self.register_buffer(
+            "vel_std",
+            torch.tensor(Config.VEL_STD, device=device, dtype=torch.float32)
+        )
+
+        # Register measurement noise std from Allan variance (for innovation normalization)
+        # Use ISOTROPIC normalization (max noise) to preserve directional information
+        # Rationale:
+        #   - Innovation can represent directional errors (e.g., gravity misalignment)
+        #   - Variation is small: accel 1.39×, gyro 1.11× (not 10× like velocity)
+        #   - Consistent with isotropic velocity scaling philosophy
+        #   - TCN learns physical relationships, not statistical artifacts
+        # Channels: [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
+        max_vrw = max(Config.VRW_X, Config.VRW_Y, Config.VRW_Z)  # Max accel noise
+        max_arw = max(Config.ARW_X, Config.ARW_Y, Config.ARW_Z)  # Max gyro noise
+        self.register_buffer(
+            "measurement_noise_std",
+            torch.tensor([max_vrw, max_vrw, max_vrw, max_arw, max_arw, max_arw],
+                        device=device, dtype=torch.float32)
         )
 
     def get_pen_tip_regularization_loss(self) -> torch.Tensor:
@@ -351,21 +377,40 @@ class BaseFilterTCNModel(nn.Module):
             # Combined pen tip velocity in body frame (filter's linear velocity + tangential).
             pen_tip_vel_b = tcn_features_from_filter["body_velocity"] + tangential_vel_b
 
-            # Apply tanh squashing to bound feature values within a reasonable range [-1, 1].
-            # This can improve the stability and performance of neural networks.
-            pen_tip_vel_b_squashed = torch.tanh(pen_tip_vel_b)
-            innovation_squashed = torch.tanh(raw_innovation)
+            # Normalize velocity by std only (not mean) because:
+            # 1. pen_tip_vel_b is in BODY frame (rotates with pen)
+            # 2. VEL_MEAN/STD are from WORLD frame ground truth
+            # 3. Body frame statistics are non-stationary due to rotation
+            # 4. Handwriting is approximately zero-mean in body frame (symmetric strokes)
+            # Use cached buffers (registered in __init__) - avoids repeated tensor creation
+            # Safety epsilon 1e-3: prevents numerical explosion if std corrupts (Z-axis std ~0.01)
+            pen_tip_vel_b_norm = pen_tip_vel_b / (self.vel_std + 1e-3)
+
+            # Normalize innovation by MEASUREMENT NOISE (not empirical drift-contaminated stats)
+            # Theoretical foundation: In well-calibrated KF, innovation ~ N(0, R)
+            # Using empirical stats from pure ESKF is wrong because:
+            #   1. Pure ESKF drifts → innovation std is contaminated by drift (inflated)
+            #   2. During training, ESKF-TCN has minimal drift (TCN corrects it)
+            #   3. Training/statistics mismatch causes over-normalization
+            # Solution: Normalize by measurement noise R (from Allan variance)
+            #   - Accel noise: VRW (Velocity Random Walk)
+            #   - Gyro noise: ARW (Angular Random Walk)
+            # This is theoretically principled and independent of drift
+            # Use cached buffers for measurement noise std (registered in __init__)
+            # Safety epsilon 1e-3: prevents numerical explosion (ARW ~7e-4, VRW ~9e-3)
+            innovation_norm = raw_innovation / (self.measurement_noise_std + 1e-3)
 
             # Construct the comprehensive TCN input vector for this time step.
             # Note: zupt_flag removed to avoid circular dependency when using TCN-based ZUPT
+            # All features now use z-score normalization (preserves magnitude info)
             tcn_input_vec = torch.cat(
                 [
-                    gyro_b_norm_t,
-                    accel_b_norm_t,
-                    force_norm_t,
-                    pen_tip_vel_b_squashed,
-                    gravity_b_norm,
-                    innovation_squashed,
+                    gyro_b_norm_t,           # [3] - Already z-score normalized
+                    accel_b_norm_t,          # [3] - Already z-score normalized
+                    force_norm_t,            # [1] - Already z-score normalized
+                    pen_tip_vel_b_norm,      # [3] - Z-score normalized (not squashed!)
+                    gravity_b_norm,          # [3] - Unit normalized (÷ g)
+                    innovation_norm,         # [6] - Z-score normalized (not squashed!)
                 ],
                 dim=-1,
             )
@@ -427,11 +472,19 @@ class BaseFilterTCNModel(nn.Module):
         stacked_filter_vel_w = torch.stack(filter_vel_w_seq, dim=1)
         
         # Pad and stack P_error sequence
-        # Determine covariance shape dynamically
-        cov_shape = (15, 15) # Default ESKF
+        # Determine covariance shape dynamically from filter type
+        # ESKF uses error_state_dim (15), AEKF uses state_dim (16)
+        if hasattr(self.filter, 'error_state_dim'):
+            dim = self.filter.error_state_dim  # ESKF
+        elif hasattr(self.filter, 'state_dim'):
+            dim = self.filter.state_dim  # AEKF
+        else:
+            dim = 15  # Fallback to ESKF default
+
+        cov_shape = (dim, dim)
         if P_error_seq:
-            cov_shape = P_error_seq[0].shape[1:]
-        
+            cov_shape = P_error_seq[0].shape[1:]  # Override if sequence is non-empty
+
         stacked_P_error = pad_sequence(P_error_seq, cov_shape, imu_data_raw.dtype)
 
         # --- Final Trajectory Calculation (Open-loop vs. Closed-loop) ---
