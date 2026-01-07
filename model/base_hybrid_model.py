@@ -16,6 +16,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from TCN import TCN
 from config import Config
+
+# Import rotation utilities
 from rotation_utils import quaternion_to_rotation_matrix
 
 

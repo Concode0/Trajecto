@@ -16,14 +16,17 @@ import torch.nn.functional as F
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from config import Config
+
+# Import rotation utilities
 from rotation_utils import (
     quaternion_multiply,
     quaternion_to_rotation_matrix,
     small_angle_to_quaternion,
     quaternion_from_two_vectors,
 )
+
 from zupt_detector import ZuptDetector
-from config import Config
 
 
 class ErrorStateKalmanFilter(nn.Module):
@@ -308,18 +311,26 @@ class ErrorStateKalmanFilter(nn.Module):
         # Increased from 1e-6 to 1e-5 for better numerical stability
         S_matrix += torch.eye(self.obs_dim, device=self.device) * 1e-5
 
-        K_gain = torch.linalg.solve(
-            S_matrix, H_error_matrix @ P_error_pred.transpose(-2, -1)
-        ).transpose(-2, -1)
+        # MPS-compatible solve: Use Cholesky decomposition (faster + stable + works on MPS)
+        # S is symmetric positive definite (covariance matrix), perfect for Cholesky
+        try:
+            L = torch.linalg.cholesky(S_matrix)
+            K_gain = torch.cholesky_solve(
+                H_error_matrix @ P_error_pred.transpose(-2, -1), L
+            ).transpose(-2, -1)
+
+            # Mahalanobis distance: y^T S^-1 y
+            sol_x = torch.cholesky_solve(innovation.unsqueeze(-1), L)
+            mahalanobis_sq = (innovation.unsqueeze(1) @ sol_x).squeeze(-1).squeeze(-1)
+        except RuntimeError:
+            # Fallback if Cholesky fails (rare, matrix not positive definite)
+            # Use pseudo-inverse as emergency fallback
+            S_inv = torch.linalg.pinv(S_matrix)
+            K_gain = (S_inv @ H_error_matrix @ P_error_pred.transpose(-2, -1)).transpose(-2, -1)
+            mahalanobis_sq = (innovation.unsqueeze(1) @ S_inv @ innovation.unsqueeze(-1)).squeeze(-1).squeeze(-1)
 
         # δx = Ky
         delta_x = (K_gain @ innovation.unsqueeze(-1)).squeeze(-1)
-
-        # d² = y^T S^-1 y (Mahalanobis distance squared)
-        # This measures how many standard deviations the innovation is from expected
-        # Safety: clamp result to prevent inf/nan propagation from ill-conditioned S_matrix
-        sol_x = torch.linalg.solve(S_matrix, innovation.unsqueeze(-1))
-        mahalanobis_sq = (innovation.unsqueeze(1) @ sol_x).squeeze(-1).squeeze(-1)
         # Clamp to reasonable range: [0, 1e6] prevents numerical issues in gating logic
         # Chi-square distribution for 6 DOF has p=0.99999 at ~27, so 1e6 is extremely conservative
         mahalanobis_sq = torch.clamp(mahalanobis_sq, min=0.0, max=1e6)
@@ -421,9 +432,15 @@ class ErrorStateKalmanFilter(nn.Module):
         S_stationary_matrix = H_stationary @ P_error_pred @ H_stationary.transpose(-2, -1) + R_stationary_matrix
         S_stationary_matrix += torch.eye(meas_dim, device=self.device) * 1e-6
 
-        K_stationary_gain = torch.linalg.solve(
-            S_stationary_matrix, H_stationary @ P_error_pred.transpose(-2, -1)
-        ).transpose(-2, -1)
+        # MPS-compatible: Use Cholesky for ZUPT update
+        try:
+            L_zupt = torch.linalg.cholesky(S_stationary_matrix)
+            K_stationary_gain = torch.cholesky_solve(
+                H_stationary @ P_error_pred.transpose(-2, -1), L_zupt
+            ).transpose(-2, -1)
+        except RuntimeError:
+            S_inv = torch.linalg.pinv(S_stationary_matrix)
+            K_stationary_gain = (S_inv @ H_stationary @ P_error_pred.transpose(-2, -1)).transpose(-2, -1)
 
         delta_x_stationary = (K_stationary_gain @ innovation_stationary.unsqueeze(-1)).squeeze(-1)
 
@@ -482,9 +499,15 @@ class ErrorStateKalmanFilter(nn.Module):
 
         S_tcn_matrix = H_tcn @ P_error_pred @ H_tcn.transpose(-2, -1) + R_tcn_matrix
 
-        K_tcn_gain = torch.linalg.solve(
-            S_tcn_matrix, H_tcn @ P_error_pred.transpose(-2, -1)
-        ).transpose(-2, -1)
+        # MPS-compatible: Use Cholesky for TCN velocity correction update
+        try:
+            L_tcn = torch.linalg.cholesky(S_tcn_matrix)
+            K_tcn_gain = torch.cholesky_solve(
+                H_tcn @ P_error_pred.transpose(-2, -1), L_tcn
+            ).transpose(-2, -1)
+        except RuntimeError:
+            S_inv = torch.linalg.pinv(S_tcn_matrix)
+            K_tcn_gain = (S_inv @ H_tcn @ P_error_pred.transpose(-2, -1)).transpose(-2, -1)
 
         delta_x_tcn = (K_tcn_gain @ innovation_tcn.unsqueeze(-1)).squeeze(-1)
 

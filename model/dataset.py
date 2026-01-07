@@ -178,8 +178,25 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                 sensor_data[:, :3] = (rot_local @ sensor_data[:, :3].T).T
                 sensor_data[:, 3:6] = (rot_local @ sensor_data[:, 3:6].T).T
 
-            # Inject Noise in all channels
-            noise = torch.randn_like(sensor_data) * self.noise_std
+            # Inject calibrated noise based on sensor characteristics (Allan variance)
+            # Different noise levels for each sensor type provide realistic augmentation
+            noise = torch.zeros_like(sensor_data)
+
+            # Accelerometer noise: Based on VRW (Velocity Random Walk) from Allan variance
+            # VRW = [8.33e-3, 6.72e-3, 9.33e-3] m/s²/√Hz
+            # Multiply by 1.5x for augmentation (conservative, realistic variation)
+            accel_noise_std = torch.tensor([8.33e-3, 6.72e-3, 9.33e-3], dtype=sensor_data.dtype)
+            noise[:, :3] = torch.randn(sensor_data.shape[0], 3) * accel_noise_std * 1.5
+
+            # Gyroscope noise: Based on ARW (Angular Random Walk) from Allan variance
+            # ARW = [7.17e-4, 7.93e-4, 7.53e-4] rad/s/√Hz
+            gyro_noise_std = torch.tensor([7.17e-4, 7.93e-4, 7.53e-4], dtype=sensor_data.dtype)
+            noise[:, 3:6] = torch.randn(sensor_data.shape[0], 3) * gyro_noise_std * 1.5
+
+            # Force sensor noise: Empirical (no Allan variance available)
+            # ~0.5% of typical force range, calibrated from real data
+            noise[:, 6:] = torch.randn(sensor_data.shape[0], sensor_data.shape[1] - 6) * 0.005
+
             sensor_data += noise
 
         return {

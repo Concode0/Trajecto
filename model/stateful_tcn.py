@@ -18,10 +18,10 @@ class StatefulTCNExport(nn.Module):
         super().__init__()
         self.layers = tcn_model.tcn_layers
         self.output_heads = tcn_model.output_heads
-        
-        # Capture the BatchNorm layer from the trained model
-        self.input_bn = tcn_model.input_bn
-        
+
+        # No input normalization - features are pre-normalized upstream
+        # This preserves physical relationships between feature magnitudes
+
         # Precompute buffer sizes for each layer
         self.buffer_sizes = []
         for layer in self.layers:
@@ -50,18 +50,10 @@ class StatefulTCNExport(nn.Module):
             outputs (tuple): (vel_corr, covariance_R, zupt_prob) each [Batch, 1, OutDim]
             new_states (tuple): Updated state tensors.
         """
-        # Ensure BatchNorm is in eval mode for stateful inference
-        if self.input_bn.training:
-             raise RuntimeError("StatefulTCNExport must be in eval mode (self.eval()) for BatchNorm to work correctly with single-step inputs.")
-
         # Input x_t is [Batch, 1, C] (NLC) from external world.
         # Transpose to [Batch, C, 1] (NCL)
+        # Features are already normalized upstream (see base_hybrid_model.py)
         current_input = x_t.transpose(1, 2)
-        
-        # Apply Batch Normalization
-        # BN expects [Batch, C, L]. Here L=1, which is valid.
-        # It applies (x - running_mean) / sqrt(running_var + eps) * weight + bias
-        current_input = self.input_bn(current_input)
         
         new_states = []
         
@@ -102,8 +94,8 @@ class StatefulTCNExport(nn.Module):
 
         # Return outputs in a fixed order for ONNX
         vel_corr = self.output_heads["vel_corr"](final_feature)
-        # Physics Scale Layer: Bridge normalized features to physical units
-        vel_corr = vel_corr * Config.VELOCITY_SCALE
+        # Apply tanh + physics scale (matching TCN.py forward pass)
+        vel_corr = torch.tanh(vel_corr) * Config.VEL_CORRECTION_SCALE
         # Hard-clip velocity correction to prevent extreme values
         vel_corr = torch.clamp(
             vel_corr,

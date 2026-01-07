@@ -14,10 +14,12 @@ import torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from model.ESKF import ErrorStateKalmanFilter
 from model.base_hybrid_model import BaseFilterTCNModel
-from model.rotation_utils import quaternion_from_two_vectors, quaternion_to_rotation_matrix
 from model.config import Config
+from model.ESKF import ErrorStateKalmanFilter
+
+# Import rotation utilities
+from model.rotation_utils import quaternion_from_two_vectors, quaternion_to_rotation_matrix
 
 
 class ESKFTCN_model(BaseFilterTCNModel):

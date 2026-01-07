@@ -14,6 +14,7 @@ import os
 import sys
 from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime
+import warnings
 
 import h5py
 import matplotlib.pyplot as plt
@@ -25,6 +26,11 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+# Suppress common noisy warnings
+warnings.filterwarnings('ignore', category=FutureWarning)  # Suppress FutureWarning (numpy, keras, etc.)
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')  # Suppress PyTorch UserWarnings
+warnings.filterwarnings('ignore', message='.*MPS.*')  # Suppress MPS-related warnings
 
 # Add parent directory to sys.path for relative imports to models
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -95,8 +101,9 @@ class UncertaintyLoss(nn.Module):
              precision_pos = torch.exp(-self.log_var_pos)
              loss_pos = precision_pos * mse_pos + self.log_var_pos
              total_loss += loss_pos
-             losses["pos"] = mse_pos.item()
-             losses["w_pos"] = loss_pos.item()
+             # OPTIMIZATION: Return detached tensors instead of .item() to avoid GPU sync
+             losses["pos"] = mse_pos.detach()
+             losses["w_pos"] = loss_pos.detach()
 
         # --- Hybrid Model Losses (ESKF-TCN, AEKF-TCN) ---
         if model_name != "only_tcn":
@@ -114,8 +121,9 @@ class UncertaintyLoss(nn.Module):
             precision_vel = torch.exp(-self.log_var_vel)
             loss_vel = precision_vel * mse_vel + self.log_var_vel
             total_loss += loss_vel
-            losses["vel"] = mse_vel.item()
-            losses["w_vel"] = loss_vel.item()
+            # OPTIMIZATION: Return detached tensors instead of .item() to avoid GPU sync
+            losses["vel"] = mse_vel.detach()
+            losses["w_vel"] = loss_vel.detach()
 
             # 2. Cosine Similarity Loss for Velocity Direction
             # Loss = 1 - cosine_similarity. Range [0, 2].
@@ -127,8 +135,9 @@ class UncertaintyLoss(nn.Module):
             precision_cos = torch.exp(-self.log_var_cos)
             loss_cos = precision_cos * mean_cos_loss + self.log_var_cos
             total_loss += loss_cos
-            losses["cos"] = mean_cos_loss.item()
-            losses["w_cos"] = loss_cos.item()
+            # OPTIMIZATION: Return detached tensors instead of .item() to avoid GPU sync
+            losses["cos"] = mean_cos_loss.detach()
+            losses["w_cos"] = loss_cos.detach()
 
             # --- Kinematic Consistency Loss (Physics Loss) ---
             # This loss term was found to be detrimental, as it penalizes acceleration
@@ -186,8 +195,9 @@ class UncertaintyLoss(nn.Module):
                 precision_zupt = torch.exp(-self.log_var_zupt)
                 loss_zupt = precision_zupt * bce_zupt + self.log_var_zupt
                 total_loss += loss_zupt
-                losses["zupt"] = bce_zupt.item()
-                losses["w_zupt"] = loss_zupt.item()
+                # OPTIMIZATION: Return detached tensors instead of .item() to avoid GPU sync
+                losses["zupt"] = bce_zupt.detach()
+                losses["w_zupt"] = loss_zupt.detach()
 
             # --- Regularization Loss (fixed weight) ---
             # Compute mean squared error instead of total norm to avoid scaling with sequence length
@@ -195,8 +205,9 @@ class UncertaintyLoss(nn.Module):
             loss_reg = (masked_vel_resid ** 2).sum() / (mask_3d.sum() + 1e-8)
             weighted_reg_loss = reg_weight * loss_reg
             total_loss += weighted_reg_loss
-            losses["reg"] = loss_reg.item()
-            losses["w_reg"] = weighted_reg_loss.item()
+            # OPTIMIZATION: Return detached tensors instead of .item() to avoid GPU sync
+            losses["reg"] = loss_reg.detach()
+            losses["w_reg"] = weighted_reg_loss.detach()
 
         # --- Probabilistic Model Loss (ESKF-TCN) ---
         if model_name == "eskf_tcn":
@@ -220,8 +231,9 @@ class UncertaintyLoss(nn.Module):
             precision_cov = torch.exp(-self.log_var_cov)
             loss_cov = precision_cov * nll_cov + self.log_var_cov
             total_loss += loss_cov
-            losses["cov"] = nll_cov.item()
-            losses["w_cov"] = loss_cov.item()
+            # OPTIMIZATION: Return detached tensors instead of .item() to avoid GPU sync
+            losses["cov"] = nll_cov.detach()
+            losses["w_cov"] = loss_cov.detach()
 
         return total_loss, losses
 
@@ -277,25 +289,30 @@ def validate(
                 model_name=model_name,
                 target_phy_weight=None
             )
-            
+
             # Add Pen Tip Regularization Loss if available
             if hasattr(model, "get_pen_tip_regularization_loss"):
                 pen_tip_loss = model.get_pen_tip_regularization_loss()
                 weighted_pen_tip = reg_weight * pen_tip_loss
                 loss += weighted_pen_tip
-                sub_losses["reg"] = sub_losses.get("reg", 0.0) + pen_tip_loss.item()
-                sub_losses["w_reg"] = sub_losses.get("w_reg", 0.0) + weighted_pen_tip.item()
+                # OPTIMIZATION: Accumulate detached tensors
+                prev_reg = sub_losses.get("reg", torch.tensor(0.0, device=pen_tip_loss.device))
+                prev_w_reg = sub_losses.get("w_reg", torch.tensor(0.0, device=pen_tip_loss.device))
+                sub_losses["reg"] = prev_reg + pen_tip_loss.detach() if torch.is_tensor(prev_reg) else torch.tensor(prev_reg, device=pen_tip_loss.device) + pen_tip_loss.detach()
+                sub_losses["w_reg"] = prev_w_reg + weighted_pen_tip.detach() if torch.is_tensor(prev_w_reg) else torch.tensor(prev_w_reg, device=pen_tip_loss.device) + weighted_pen_tip.detach()
 
-            total_val_loss += loss.item()
+            # OPTIMIZATION: Convert tensors to scalars only once per batch
+            total_val_loss += loss.detach().item()
             for k, v in sub_losses.items():
-                val_losses[k] = val_losses.get(k, 0.0) + v
-            
+                v_scalar = v.item() if torch.is_tensor(v) else v
+                val_losses[k] = val_losses.get(k, 0.0) + v_scalar
+
             num_batches += 1
 
     avg_losses = {"total": total_val_loss / num_batches}
     for k, v in val_losses.items():
         avg_losses[k] = v / num_batches
-    
+
     return avg_losses
 
 
@@ -331,8 +348,19 @@ def train(
     # Calculate total_steps for OneCycleLR
     total_steps = epochs * len(train_dataloader)
 
-    # Use OneCycleLR scheduler
-    scheduler = OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.5, div_factor=25)
+    # Use OneCycleLR scheduler with improved parameters
+    # pct_start=0.3: Reach max LR at 30% of training (epoch 12 for 40 epochs)
+    # div_factor=10: Initial LR = max_lr/10 = 2e-5 (was 8e-6 with div_factor=25)
+    # final_div_factor=1000: Final LR = max_lr/1000 = 2e-7 for fine-tuning
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=total_steps,
+        pct_start=0.3,          # Faster warmup (was 0.5)
+        div_factor=10,          # Higher initial LR (was 25)
+        final_div_factor=1000,  # Lower final LR for fine-tuning
+        anneal_strategy='cos'   # Cosine annealing (explicit)
+    )
 
     # Check for checkpoint to resume training
     checkpoint_dir = "checkpoints"
@@ -399,6 +427,9 @@ def train(
         for k in ["pos", "vel", "cos", "zupt", "reg", "cov"]:
             epoch_train_losses[f"w_{k}"] = 0.0
 
+        # Track gradient norms for monitoring
+        epoch_grad_norms: List[float] = []
+
         pbar_train = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
 
         for batch in pbar_train:
@@ -444,8 +475,11 @@ def train(
                 # Assuming reg_weight is appropriate for this too (it's usually small, e.g., 1e-4).
                 weighted_pen_tip = reg_weight * pen_tip_loss
                 loss += weighted_pen_tip
-                sub_losses["reg"] = sub_losses.get("reg", 0.0) + pen_tip_loss.item()
-                sub_losses["w_reg"] = sub_losses.get("w_reg", 0.0) + weighted_pen_tip.item()
+                # OPTIMIZATION: Accumulate detached tensors instead of calling .item() here
+                prev_reg = sub_losses.get("reg", torch.tensor(0.0, device=pen_tip_loss.device))
+                prev_w_reg = sub_losses.get("w_reg", torch.tensor(0.0, device=pen_tip_loss.device))
+                sub_losses["reg"] = prev_reg + pen_tip_loss.detach() if torch.is_tensor(prev_reg) else torch.tensor(prev_reg, device=pen_tip_loss.device) + pen_tip_loss.detach()
+                sub_losses["w_reg"] = prev_w_reg + weighted_pen_tip.detach() if torch.is_tensor(prev_w_reg) else torch.tensor(prev_w_reg, device=pen_tip_loss.device) + weighted_pen_tip.detach()
 
 
             # CRITICAL: Check for NaN/Inf before backward pass
@@ -453,22 +487,38 @@ def train(
                 print(f"\nWARNING: NaN/Inf loss detected! Skipping batch. Loss: {loss.item()}")
                 # Print sub-losses for debugging
                 for k, v in sub_losses.items():
-                    if np.isnan(v) or np.isinf(v):
-                        print(f"  - Problematic loss component '{k}': {v}")
+                    v_check = v if not torch.is_tensor(v) else v.item()
+                    if np.isnan(v_check) or np.isinf(v_check):
+                        print(f"  - Problematic loss component '{k}': {v_check}")
                 continue  # Skip this batch
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Gradient clipping to prevent explosion (critical post-GroupNorm removal)
+            # Returns the total norm of gradients before clipping for monitoring
+            max_grad_norm = 1.0
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=max_grad_norm
+            )
+            # Track gradient norm for epoch average
+            epoch_grad_norms.append(grad_norm.item())
+
             optimizer.step()
             scheduler.step() # Step the scheduler after each batch
 
-            epoch_train_losses["total"] += loss.item()
-            pbar_train_postfix: Dict[str, float] = {"L": loss.item()}
+            # OPTIMIZATION: Detach loss before .item() to avoid holding computation graph
+            loss_value = loss.detach().item()
+            epoch_train_losses["total"] += loss_value
+            pbar_train_postfix: Dict[str, float] = {"L": loss_value}  # Reuse value
+            # OPTIMIZATION: Convert tensor losses to scalars only once for display
             for k, v in sub_losses.items():
+                # Convert tensor to scalar (sub_losses now contains detached tensors)
+                v_scalar = v.item() if torch.is_tensor(v) else v
                 if k in epoch_train_losses:
-                    epoch_train_losses[k] += v if not (np.isnan(v) or np.isinf(v)) else 0
+                    epoch_train_losses[k] += v_scalar if not (np.isnan(v_scalar) or np.isinf(v_scalar)) else 0
                 if not k.startswith("w_"): # Only show raw losses in progress bar
-                    pbar_train_postfix[f"L_{k}"] = v
+                    pbar_train_postfix[f"L_{k}"] = v_scalar
             pbar_train.set_postfix(pbar_train_postfix)
 
         for k in train_history.keys():
@@ -478,21 +528,28 @@ def train(
         # Log Learning Rate
         current_lr = optimizer.param_groups[0]['lr']
         train_history["lr"].append(current_lr)
-        
+
         # --- Validation Loop ---
         val_metrics = validate(model, val_dataloader, criterion, device, reg_weight, model_name, mean, std)
-        
+
         # --- TensorBoard Logging ---
         writer.add_scalar("Loss/Train_Total", train_history["total"][-1], epoch)
         writer.add_scalar("Loss/Val_Total", val_metrics["total"], epoch)
         writer.add_scalar("Learning_Rate", current_lr, epoch)
-        
+
+        # Log gradient norm (average over epoch)
+        if epoch_grad_norms:
+            avg_grad_norm = np.mean(epoch_grad_norms)
+            max_grad_norm_epoch = np.max(epoch_grad_norms)
+            writer.add_scalar("Gradients/Average_Norm", avg_grad_norm, epoch)
+            writer.add_scalar("Gradients/Max_Norm", max_grad_norm_epoch, epoch)
+
         # Log sub-losses (Train)
         for k in ["pos", "vel", "cos", "zupt", "reg", "cov"]:
             if k in epoch_train_losses:
                 val = epoch_train_losses[k] / len(train_dataloader)
                 writer.add_scalar(f"Loss_Components/Train_{k.capitalize()}", val, epoch)
-                
+
         # Log weighted sub-losses (Train)
         for k in ["pos", "vel", "cos", "zupt", "reg", "cov"]:
              key = f"w_{k}"
@@ -504,7 +561,7 @@ def train(
         for k, v in val_metrics.items():
             if k != "total" and not k.startswith("w_"):
                 writer.add_scalar(f"Loss_Components/Val_{k.capitalize()}", v, epoch)
-        
+
         # Calculate weights for logging
         with torch.no_grad():
             w_pos = torch.exp(-criterion.log_var_pos).item()
@@ -513,7 +570,7 @@ def train(
             # w_phy = torch.exp(-criterion.log_var_phy).item() # Commented out
             w_zupt = torch.exp(-criterion.log_var_zupt).item()
             w_cov = torch.exp(-criterion.log_var_cov).item()
-            
+
             writer.add_scalars("Loss_Weights", {
                 "pos": w_pos,
                 "vel": w_vel,
@@ -600,7 +657,7 @@ def train(
     }
     torch.save(final_checkpoint, checkpoint_path)
     print(f"Final checkpoint saved to {checkpoint_path}")
-    
+
     writer.close()
 
     # Plotting training history
@@ -632,8 +689,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs.")
     parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for physics loss warmup.") # Added arg
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
-    parser.add_argument("--batch_size", type=int, default=30, help="Batch size for training.")
-    parser.add_argument("--device", type=str, default="mps" if torch.cuda.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
+    parser.add_argument("--batch_size", type=int, default=192, help="Batch size for training.")
+    parser.add_argument("--device", type=str, default="mps" if torch.mps.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs without improvement).")
     parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum change in validation loss to qualify as improvement.")
     args, _ = parser.parse_known_args()
@@ -663,6 +720,8 @@ def main() -> None:
     loss_weights = selected_config.get("loss_weights", {})
 
     print(f"Training on device: {args.device}")
+    print(f"JIT Optimization: {'Enabled' if Config.USE_JIT_OPTIMIZATION else 'Disabled'}")
+    print(f"Optimized ESKF: {'Enabled' if Config.USE_OPTIMIZED_ESKF else 'Disabled'}")
 
     # Load Training Dataset
     train_dataset = TrajectoryDataset(

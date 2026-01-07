@@ -135,11 +135,9 @@ class TCN(nn.Module):
                 "Length of tcn_dilation_factors must match length of tcn_channels."
             )
 
-        # Batch Normalization applied to the input features across the time dimension.
-        # This replaces the LayerNorm that was previously in the wrapper class.
-        # BatchNorm is more efficient for inference (can be fused) and treats features independently.
-        self.input_bn = nn.GroupNorm(num_groups=19, num_channels=input_size, affine=True)
-
+        # No input normalization layer - features are already z-score normalized
+        # in base_hybrid_model.py before entering TCN. This preserves relative
+        # magnitudes between features which carry physical meaning.
         self.tcn_layers = nn.ModuleList()  # Stores the sequential TCN blocks.
         in_channels = input_size
         self._receptive_field = 1  # Tracks the effective receptive field of the network.
@@ -220,10 +218,9 @@ class TCN(nn.Module):
         # from `[B, T, D]` to `[B, D, T]`.
         tcn_input = feature_sequence.transpose(1, 2)
 
-        # Apply GroupNorm to stabilize training and normalize input feature scales
-        # Different features have different scales: IMU (~1.0), velocity (~0.1), innovation (varies)
-        # GroupNorm helps TCN layers learn efficiently by normalizing across feature groups
-        tcn_input = self.input_bn(tcn_input)
+        # Input features already z-score normalized upstream - preserving relative
+        # magnitudes allows TCN to learn from physical relationships between features
+        # (e.g., innovation magnitude vs velocity, force vs acceleration correlation)
 
         # Pass the input through all TCN layers.
         # Since we use CausalConv1d, the output sequence length is naturally preserved
