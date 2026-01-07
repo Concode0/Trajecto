@@ -720,10 +720,7 @@ def main() -> None:
     loss_weights = selected_config.get("loss_weights", {})
 
     print(f"Training on device: {args.device}")
-    print(f"JIT Optimization: {'Enabled' if Config.USE_JIT_OPTIMIZATION else 'Disabled'}")
-    print(f"Optimized ESKF: {'Enabled' if Config.USE_OPTIMIZED_ESKF else 'Disabled'}")
 
-    # Load Training Dataset
     train_dataset = TrajectoryDataset(
         preprocessed_file=Config.DATASET_H5_PATH,
         augment_multiplier=Config.AUGMENT_MULTIPLIER,
@@ -741,8 +738,8 @@ def main() -> None:
         do_augment=False,
     )
 
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=6)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=6, persistent_workers=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=2, persistent_workers=True)
 
     with h5py.File(Config.SCALER_STATS_H5_PATH, "r") as f:
         mean = torch.from_numpy(f["mean"][:]).float()

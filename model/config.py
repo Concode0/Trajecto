@@ -19,7 +19,7 @@ class Config:
     # --- Dataset Parameters ---
     DATASET_H5_PATH = "./data/dataset.h5"
     VALIDATION_DATASET_H5_PATH = "./data/dataset.h5"
-    AUGMENT_MULTIPLIER = 10
+    AUGMENT_MULTIPLIER = 40
     SUBSAMPLE_STEP = 1
     DO_AUGMENT = True
     YAW_ANGLE = (-0.78, 0.78)   # Set small angle in first and increase when fine tunning.
