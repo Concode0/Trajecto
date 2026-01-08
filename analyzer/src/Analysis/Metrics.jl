@@ -1,3 +1,24 @@
+"""
+Trajectory Alignment and Metrics Calculation.
+
+This module provides functions for aligning predicted trajectories to ground truth
+and calculating standardized evaluation metrics similar to the evo trajectory evaluation toolkit.
+
+# Key Functions
+- `align_trajectory`: Sim(3) or SE(3) alignment using Umeyama algorithm
+- `calculate_metrics`: Comprehensive trajectory evaluation metrics
+
+# Mathematical Background
+Alignment uses the Umeyama algorithm which finds the optimal similarity transformation
+(rotation, translation, and optionally scale) that minimizes the least-squares error
+between two point sets. This is equivalent to Sim(3) alignment when scale is enabled,
+or SE(3) alignment when scale is fixed to 1.
+
+# References
+- Umeyama, S. (1991). "Least-Squares Estimation of Transformation Parameters
+  Between Two Point Patterns". IEEE PAMI 13(4): 376-380.
+- evo trajectory evaluation toolkit: https://github.com/MichaelGrupp/evo
+"""
 module Metrics
 
 using LinearAlgebra
@@ -6,11 +27,27 @@ using Statistics
 export calculate_metrics, align_trajectory
 
 """
-    align_trajectory(gt::AbstractMatrix, pred::AbstractMatrix; with_scale=true)
+    align_trajectory(gt::AbstractMatrix, pred::AbstractMatrix; with_scale::Bool=true) -> Matrix
 
-Aligns `pred` to `gt` using Umeyama algorithm (Sim(3) or SE(3)).
-Inputs are (N, 3) matrices.
-Returns `aligned_pred` (N, 3).
+Align predicted trajectory to ground truth using the Umeyama algorithm.
+
+Computes the optimal similarity transformation (Sim(3)) or rigid transformation (SE(3))
+that minimizes the least-squares error between corresponding points.
+
+# Arguments
+- `gt::AbstractMatrix`: Ground truth trajectory (N×3) with N 3D positions
+- `pred::AbstractMatrix`: Predicted trajectory (N×3), must have same length as gt
+- `with_scale::Bool`: Whether to estimate scale factor (default: true)
+
+# Returns
+- `Matrix{Float64}`: Aligned prediction trajectory (N×3)
+
+# Algorithm
+Uses SVD-based Umeyama algorithm to find optimal rotation, translation, and scale.
+Handles reflection case by checking determinant and adjusting smallest singular value.
+
+# See Also
+- `calculate_metrics`: Computes metrics after alignment
 """
 function align_trajectory(gt::AbstractMatrix, pred::AbstractMatrix; with_scale=true)
     n = size(gt, 1)
@@ -98,13 +135,29 @@ function align_trajectory(gt::AbstractMatrix, pred::AbstractMatrix; with_scale=t
 end
 
 """
-    calculate_metrics(gt::AbstractMatrix, pred::AbstractMatrix, dt::Float64)
+    calculate_metrics(gt::AbstractMatrix, pred::AbstractMatrix, dt::Float64) -> NamedTuple
 
-Computes validation metrics similar to evo.
-- APE (RMSE) after Sim(3) alignment
-- Error/Distance
-- Error/Time
-- Axis-wise RMSE
+Calculate comprehensive trajectory evaluation metrics after Sim(3) alignment.
+
+# Arguments
+- `gt::AbstractMatrix`: Ground truth trajectory (N×3) in meters
+- `pred::AbstractMatrix`: Predicted trajectory (N×3) in meters
+- `dt::Float64`: Time step between consecutive positions in seconds
+
+# Returns
+A NamedTuple with fields:
+- `ape_rmse`: Absolute Pose Error (RMSE) in meters after alignment
+- `error_over_dist`: APE normalized by total path length
+- `error_over_time`: APE normalized by total duration (m/s)
+- `axis_rmse`: Per-axis RMSE [x, y, z] in meters
+- `aligned_traj`: Sim(3)-aligned prediction trajectory (N×3)
+
+# Metrics
+Computes APE (Absolute Pose Error) similar to evo toolkit, plus normalized
+metrics for error/distance ratio and error/time. Compatible with evo evaluation.
+
+# See Also
+- `align_trajectory`: Underlying alignment function
 """
 function calculate_metrics(gt::AbstractMatrix, pred::AbstractMatrix, dt::Float64)
     # Align

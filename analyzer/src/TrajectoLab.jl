@@ -1,5 +1,9 @@
 module TrajectoLab
 
+# Configuration Constants
+include("Config.jl")
+using .Config
+
 # Abstract Interfaces
 include("AbstractLayers.jl")
 using .AbstractLayers

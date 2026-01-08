@@ -1,9 +1,66 @@
+"""
+PyTorch Model Estimator for Trajecto Analyzer.
+
+This module provides a unified interface for loading and running PyTorch-based
+trajectory estimation models through Julia's PythonCall.
+
+Supported model types:
+- ESKF-TCN: Hybrid physics + ML model
+- AEKF-TCN: Adaptive EKF variant
+- TCN-only: Pure data-driven regression
+- Pure ESKF: Physics-only baseline
+- Pure Integration: Simple dead reckoning baseline
+"""
 module PyTorchEstimator
 
 using ..AbstractLayers
+using ..Config
 using PythonCall
 using HDF5
 
+"""
+    TrajectoEstimator <: AbstractEstimator
+
+Interface for PyTorch-based trajectory estimation models.
+
+# Fields
+- `model_type::String`: Model type identifier (eskf, aekf, tcn, pure_eskf, pure_integration)
+- `model_path::String`: Path to .pth model weights file (empty for baseline models)
+- `script_path::String`: Path to Python model directory (typically PROJECT_ROOT/model)
+- `scaler_path::String`: Path to HDF5 scaler statistics file (mean/std for normalization)
+- `engine::Ref{Any}`: Lazy-loaded Python model instance and torch module
+- `scaler_stats::Ref{Any}`: Lazy-loaded normalization statistics (mean, std)
+
+# Constructor
+```julia
+estimator = TrajectoEstimator(model_type, model_path, script_path, scaler_path)
+```
+
+Model types are automatically lowercased for consistency.
+
+# Example
+```julia
+# Load hybrid model
+estimator = TrajectoEstimator(
+    "eskf",
+    "/path/to/eskf_tcn_model.pth",
+    "/path/to/model",
+    "/path/to/scaler_stats.h5"
+)
+
+# Load baseline (no weights required)
+estimator = TrajectoEstimator(
+    "pure_eskf",
+    "",  # Empty for baselines
+    "/path/to/model",
+    "/path/to/scaler_stats.h5"
+)
+```
+
+# See Also
+- `load_model`: Explicitly load model weights (called automatically on first inference)
+- `predict_trajectory`: Run trajectory estimation
+"""
 struct TrajectoEstimator <: AbstractEstimator
     model_type::String
     model_path::String
@@ -44,33 +101,27 @@ function AbstractLayers.load_model(estimator::TrajectoEstimator)
     end
 
     torch = pyimport("torch")
-    
-    println(">>> Loading PyTorch Model [$(estimator.model_type)]: ", abspath(estimator.model_path))
-    
-    raw_model = nothing
-    
-    if estimator.model_type == "eskf"
-        model_module = pyimport("model.ESKF_TCN")
-        raw_model = model_module.ESKFTCN_model(device="cpu")
-    elseif estimator.model_type == "aekf"
-        model_module = pyimport("model.AEKF_TCN")
-        raw_model = model_module.AEKFTCN_model(device="cpu")
-    elseif estimator.model_type == "tcn"
-        model_module = pyimport("model.onlyTCN")
-        raw_model = model_module.OnlyTCN(device="cpu")
-    elseif estimator.model_type == "pure_eskf"
-        model_module = pyimport("model.pure_eskf")
-        raw_model = model_module.PureESKFModel(device="cpu")
-    elseif estimator.model_type == "pure_integration"
-        model_module = pyimport("model.pure_integration")
-        raw_model = model_module.PureIntegrationModel(device="cpu")
-    else
-        error("Unknown model type: $(estimator.model_type)")
+
+    # Validate model type
+    if !haskey(Config.MODEL_CONFIGS, estimator.model_type)
+        error("Unknown model type: $(estimator.model_type). Supported types: $(keys(Config.MODEL_CONFIGS))")
     end
 
-    # Baseline models don't require pre-trained weights
-    if !(estimator.model_type in ["pure_eskf", "pure_integration"])
-        state_dict = torch.load(abspath(estimator.model_path), map_location="cpu")
+    # Get model configuration
+    model_config = Config.MODEL_CONFIGS[estimator.model_type]
+
+    println(">>> Loading PyTorch Model [$(estimator.model_type)]: $(model_config.description)")
+    if model_config.requires_weights
+        println("    Model file: ", abspath(estimator.model_path))
+    end
+
+    # Import Python module and instantiate model
+    model_module = pyimport(model_config.module_path)
+    raw_model = getproperty(model_module, model_config.class_name)(device=Config.DEFAULT_DEVICE)
+
+    # Load pre-trained weights if required
+    if model_config.requires_weights
+        state_dict = torch.load(abspath(estimator.model_path), map_location=Config.DEFAULT_DEVICE)
         raw_model.load_state_dict(state_dict)
     end
     raw_model.eval()

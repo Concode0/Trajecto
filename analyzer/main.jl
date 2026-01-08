@@ -23,7 +23,7 @@ const COMPARE_MODE = false
 # Models to compare (used when COMPARE_MODE = true)
 # Format: (name, type, model_path)
 const MODELS_TO_COMPARE = [
-    ("Pure Integration", "pure_integration"),
+    ("Pure Integration", "pure_integration", ""),  # Empty path for baselines
     ("Pure ESKF", "pure_eskf", ""),
     ("ESKF-TCN", "eskf", joinpath(PROJECT_ROOT, "eskf_tcn_model.pth"))
 ]
