@@ -19,7 +19,7 @@ class Config:
     # --- Dataset Parameters ---
     DATASET_H5_PATH = "./data/dataset.h5"
     VALIDATION_DATASET_H5_PATH = "./data/dataset.h5"
-    AUGMENT_MULTIPLIER = 40
+    AUGMENT_MULTIPLIER = 1
     SUBSAMPLE_STEP = 1
     DO_AUGMENT = True
     YAW_ANGLE = (-0.78, 0.78)   # Set small angle in first and increase when fine tunning.
@@ -115,6 +115,6 @@ class Config:
 
     # --- Loss Parameters ---
     class LOSS:
-        REG_WEIGHT_ESKF_TCN = 1e-4
+        REG_WEIGHT_ESKF_TCN = 1e-5
         REG_WEIGHT_AEKF_TCN = 1e-5
         # No specific reg weight for OnlyTCN in current loss setup

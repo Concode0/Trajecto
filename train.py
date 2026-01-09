@@ -12,7 +12,7 @@ of training history, ultimately saving the trained model and loss plots.
 import argparse
 import os
 import sys
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 from datetime import datetime
 import warnings
 
@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -68,7 +68,6 @@ class UncertaintyLoss(nn.Module):
         self.log_var_cos = nn.Parameter(torch.tensor(0.0, device=device)) # Cosine Similarity Loss weight
         self.log_var_zupt = nn.Parameter(torch.tensor(0.0, device=device))
         self.log_var_cov = nn.Parameter(torch.tensor(0.0, device=device))
-        # self.log_var_phy = nn.Parameter(torch.tensor(0.0, device=device)) # Physics Consistency Loss weight (commented out)
 
     def forward(
         self,
@@ -77,7 +76,6 @@ class UncertaintyLoss(nn.Module):
         mask: torch.Tensor,
         reg_weight: float,
         model_name: str,
-        target_phy_weight: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Computes the total loss as a sum of uncertainty-weighted task losses.
@@ -138,55 +136,6 @@ class UncertaintyLoss(nn.Module):
             # OPTIMIZATION: Return detached tensors instead of .item() to avoid GPU sync
             losses["cos"] = mean_cos_loss.detach()
             losses["w_cos"] = loss_cos.detach()
-
-            # --- Kinematic Consistency Loss (Physics Loss) ---
-            # This loss term was found to be detrimental, as it penalizes acceleration
-            # which is critical for handwriting strokes. It also effectively fights
-            # the ESKF's corrections.
-            # The kinematic consistency is already implicitly handled by the ESKF's
-            # integration step.
-            # dt = Config.DT
-            # Calculate numerical derivative of position (batch, seq-1, 3)
-            # pred_vel_from_pos = (pred_pos_w[:, 1:] - pred_pos_w[:, :-1]) / dt
-
-            # Clip the numerical derivative to prevent massive spikes/exploding gradients
-            # from 1/dt scaling on noisy predictions, especially early in training.
-            # +/- 20.0 m/s is a safe upper bound for handwriting.
-            # pred_vel_from_pos = torch.clamp(pred_vel_from_pos, -20.0, 20.0)
-
-            # Align predicted velocity (batch, seq-1, 3)
-            # Euler: p_{t+1} = p_t + v_t * dt. So v_t ~ (p_{t+1}-p_t)/dt.
-            # We take 0..L-2 to match the diff length.
-            # pred_vel_ref = pred_total_vel_w[:, :-1]
-
-            # Adjust mask for the shortened sequence
-            # mask_phy = mask_3d[:, :-1]
-            # valid_phy_count = mask_phy.sum() + 1e-8
-
-            # per_element_phy_loss = self.vel_criterion(pred_vel_from_pos, pred_vel_ref)
-            # mse_phy = (per_element_phy_loss * mask_phy).sum() / valid_phy_count
-
-            # --- Warm-up / Forced Schedule Logic ---
-            # if target_phy_weight is not None:
-            #     # Force the weight (precision) to the target value.
-            #     # Update the learnable parameter so the optimizer picks up from here.
-            #     # precision = exp(-log_var)  =>  log_var = -log(precision)
-            #     forced_log_var = -math.log(target_phy_weight + 1e-8)
-            #     self.log_var_phy.data.fill_(forced_log_var)
-
-            #     # Use the forced values for calculation
-            #     precision_phy = torch.tensor(target_phy_weight, device=self.log_var_phy.device)
-            #     log_var_phy_val = torch.tensor(forced_log_var, device=self.log_var_phy.device)
-
-            #     loss_phy = precision_phy * mse_phy + log_var_phy_val
-            # else:
-            #     # Standard learned uncertainty weighting
-            #     precision_phy = torch.exp(-self.log_var_phy)
-            #     loss_phy = precision_phy * mse_phy + self.log_var_phy
-
-            # total_loss += loss_phy
-            # losses["phy"] = mse_phy.item() # Keep for logging historical values if desired, otherwise comment out.
-
 
             # --- ZUPT Loss (Conditional) ---
             if "pred_zupt_prob" in model_out and model_out["pred_zupt_prob"] is not None:
@@ -280,14 +229,12 @@ def validate(
                 "gt_zupt": gt_zupt,
             }
 
-            # Use None for target_phy_weight in validation
             loss, sub_losses = criterion(
                 model_out=model_output,
                 batch=batch_gpu,
                 mask=mask,
                 reg_weight=reg_weight,
                 model_name=model_name,
-                target_phy_weight=None
             )
 
             # Add Pen Tip Regularization Loss if available
@@ -319,8 +266,8 @@ def validate(
 def train(
     model_name: str,
     model: nn.Module,
-    train_dataloader: DataLoader, # Modified to train_dataloader
-    val_dataloader: DataLoader,   # Added val_dataloader
+    train_dataloader: DataLoader,
+    val_dataloader: DataLoader,
     epochs: int,
     lr: float,
     device: str,
@@ -328,11 +275,18 @@ def train(
     mean: torch.Tensor,
     std: torch.Tensor,
     reg_weight: float = 0.0,
-    warmup_epochs: int = 10, # Added warmup_epochs argument
-    patience: int = 20, # Early stopping patience
-    min_delta: float = 1e-4, # Minimum change to qualify as improvement
-) -> None:
-    """Runs the training loop for the specified model with early stopping support."""
+    reg_warmup_epochs: int = 50,
+    patience: int = 20,
+    min_delta: float = 1e-4,
+) -> float:
+    """Runs the training loop for the specified model with early stopping support.
+
+    Args:
+        reg_warmup_epochs: Number of epochs to warm up regularization from 0 to reg_weight.
+                          Set to 0 to disable warmup (use full reg_weight from start).
+        patience: Early stopping patience (epochs without improvement).
+        min_delta: Minimum change in validation loss to qualify as improvement.
+    """
 
     # Initialize TensorBoard SummaryWriter
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -345,28 +299,28 @@ def train(
     # Ensure the learnable loss parameters are included in the optimizer
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(criterion.parameters()), lr=lr)
 
-    # Calculate total_steps for OneCycleLR
-    total_steps = epochs * len(train_dataloader)
-
-    # Use OneCycleLR scheduler with improved parameters
-    # pct_start=0.3: Reach max LR at 30% of training (epoch 12 for 40 epochs)
-    # div_factor=10: Initial LR = max_lr/10 = 2e-5 (was 8e-6 with div_factor=25)
-    # final_div_factor=1000: Final LR = max_lr/1000 = 2e-7 for fine-tuning
-    scheduler = OneCycleLR(
+    # ReduceLROnPlateau: Reduce LR when validation loss plateaus
+    # Called once per epoch with validation loss (not per-batch)
+    scheduler = ReduceLROnPlateau(
         optimizer,
-        max_lr=lr,
-        total_steps=total_steps,
-        pct_start=0.3,          # Faster warmup (was 0.5)
-        div_factor=10,          # Higher initial LR (was 25)
-        final_div_factor=1000,  # Lower final LR for fine-tuning
-        anneal_strategy='cos'   # Cosine annealing (explicit)
+        mode='min',
+        factor=0.5,
+        patience=10,
     )
 
     # Check for checkpoint to resume training
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{os.path.splitext(os.path.basename(model_path))[0]}_checkpoint.pth")
+    best_model_path = os.path.join(checkpoint_dir, f"{os.path.splitext(os.path.basename(model_path))[0]}_best.pth")
     start_epoch = 0
+
+    # Initialize history dictionaries for both training and validation
+    train_history: Dict[str, List[float]] = {"total": [], "pos": [], "vel": [], "cos": [], "zupt": [], "reg": [], "cov": [], "lr": []}
+
+    # Early stopping variables
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
 
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path} to resume training...")
@@ -376,24 +330,7 @@ def train(
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         criterion.load_state_dict(checkpoint['criterion_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        print(f"Resumed from epoch {start_epoch}")
-    elif os.path.exists(model_path):
-        print(f"Loading saved model from {model_path} to resume training...")
-        model.load_state_dict(torch.load(model_path, map_location=device))
-
-    model.to(device)
-
-    # Initialize history dictionaries for both training and validation
-    train_history: Dict[str, List[float]] = {"total": [], "pos": [], "vel": [], "cos": [], "zupt": [], "reg": [], "cov": [], "lr": []}
-
-    # Early stopping variables (initialize before checkpoint loading)
-    best_val_loss = float('inf')
-    epochs_without_improvement = 0
-    best_model_path = os.path.join(checkpoint_dir, f"{os.path.splitext(os.path.basename(model_path))[0]}_best.pth")
-
-    # Load training history if resuming from checkpoint
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Restore training history if available
         if 'train_history' in checkpoint:
             train_history = checkpoint['train_history']
             print(f"Loaded training history with {len(train_history['total'])} epochs")
@@ -402,23 +339,33 @@ def train(
             best_val_loss = checkpoint['best_val_loss']
             epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
             print(f"Restored early stopping state: best_val_loss={best_val_loss:.4f}, epochs_without_improvement={epochs_without_improvement}")
+        print(f"Resumed from epoch {start_epoch}")
+    elif os.path.exists(model_path):
+        print(f"Loading saved model from {model_path} to resume training...")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
+    model.to(device)
 
     print(f"Start Training for {model_name} on {device}...")
 
     mean_gpu = mean.to(device)
     std_gpu = std.to(device)
 
+    # Store target regularization weight for warmup
+    target_reg_weight = reg_weight
+
     for epoch in range(start_epoch, epochs):
-        # --- Calculate Physics Warm-up Weight ---
-        target_phy_weight: Optional[float] = None
-        if epoch < warmup_epochs:
-            # Linear ramp from 1e-4 to 1.0
-            # Start small to avoid shock, end at 1.0 (strong enforcement)
-            progress = epoch / float(warmup_epochs)
-            target_phy_weight = 1e-4 + (1.0 - 1e-4) * progress
+        # --- Calculate Regularization Warm-up Weight ---
+        if reg_warmup_epochs > 0 and epoch < 20:
+            current_reg_weight = 0
+        elif reg_warmup_epochs > 0 and 20 <= epoch < reg_warmup_epochs:
+            # Linear ramp from 0.0 to target_reg_weight
+            # Allows model to learn main task before applying regularization
+            progress = epoch / float(reg_warmup_epochs)
+            current_reg_weight = progress * target_reg_weight
         else:
-            # Let the model learn the weight via uncertainty
-            target_phy_weight = None
+            # Use full regularization weight
+            current_reg_weight = target_reg_weight
 
         # --- Training Loop ---
         model.train() # Set model to training mode
@@ -460,9 +407,8 @@ def train(
                 model_out=model_output,
                 batch=batch_gpu,
                 mask=mask,
-                reg_weight=reg_weight,
+                reg_weight=current_reg_weight,
                 model_name=model_name,
-                target_phy_weight=target_phy_weight # Pass target weight
             )
 
             # Add Pen Tip Regularization Loss if available
@@ -473,7 +419,7 @@ def train(
                 # we can use a small weight or just add it.
                 # Let's add it to total loss and log it under 'reg' (accumulating).
                 # Assuming reg_weight is appropriate for this too (it's usually small, e.g., 1e-4).
-                weighted_pen_tip = reg_weight * pen_tip_loss
+                weighted_pen_tip = current_reg_weight * pen_tip_loss
                 loss += weighted_pen_tip
                 # OPTIMIZATION: Accumulate detached tensors instead of calling .item() here
                 prev_reg = sub_losses.get("reg", torch.tensor(0.0, device=pen_tip_loss.device))
@@ -496,16 +442,15 @@ def train(
 
             # Gradient clipping to prevent explosion (critical post-GroupNorm removal)
             # Returns the total norm of gradients before clipping for monitoring
-            max_grad_norm = 1.0
+            grad_clip_threshold = 1.0
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
-                max_norm=max_grad_norm
+                max_norm=grad_clip_threshold
             )
             # Track gradient norm for epoch average
             epoch_grad_norms.append(grad_norm.item())
 
             optimizer.step()
-            scheduler.step() # Step the scheduler after each batch
 
             # OPTIMIZATION: Detach loss before .item() to avoid holding computation graph
             loss_value = loss.detach().item()
@@ -530,7 +475,11 @@ def train(
         train_history["lr"].append(current_lr)
 
         # --- Validation Loop ---
-        val_metrics = validate(model, val_dataloader, criterion, device, reg_weight, model_name, mean, std)
+        # Use target_reg_weight for validation (full weight, not warmed-up)
+        val_metrics = validate(model, val_dataloader, criterion, device, target_reg_weight, model_name, mean, std)
+
+        # Step the scheduler with validation loss (ReduceLROnPlateau)
+        scheduler.step(val_metrics['total'])
 
         # --- TensorBoard Logging ---
         writer.add_scalar("Loss/Train_Total", train_history["total"][-1], epoch)
@@ -567,7 +516,6 @@ def train(
             w_pos = torch.exp(-criterion.log_var_pos).item()
             w_vel = torch.exp(-criterion.log_var_vel).item()
             w_cos = torch.exp(-criterion.log_var_cos).item()
-            # w_phy = torch.exp(-criterion.log_var_phy).item() # Commented out
             w_zupt = torch.exp(-criterion.log_var_zupt).item()
             w_cov = torch.exp(-criterion.log_var_cov).item()
 
@@ -579,8 +527,10 @@ def train(
                 "cov": w_cov
             }, epoch)
 
+        # Log regularization weight (warmup progress)
+        writer.add_scalar("Regularization/weight", current_reg_weight, epoch)
 
-        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | Val_Total={val_metrics['total']:.4f} | LR={current_lr:.2e}"
+        log_str = f"Epoch {epoch+1}: Train_Total={train_history['total'][-1]:.4f} | Val_Total={val_metrics['total']:.4f} | LR={current_lr:.2e} | RegW={current_reg_weight:.2e}"
 
         total_sum = epoch_train_losses["total"]
         def get_pct(key):
@@ -588,10 +538,8 @@ def train(
             return (val / total_sum) * 100.0 if total_sum > 0 else 0.0
 
         if model_name != "only_tcn":
-            # log_str += f" | Train_Pos={train_history['pos'][-1]:.4f}" # Commented out as pos_loss is removed
             log_str += f" | Train_Vel={train_history['vel'][-1]:.4f} ({get_pct('vel'):.1f}%)"
             log_str += f" | Train_Cos={train_history['cos'][-1]:.4f} ({get_pct('cos'):.1f}%)"
-            # log_str += f" | Train_Phy={train_history['phy'][-1]:.4f}" # Commented out as phy_loss is removed
             log_str += f"\n    Weights: Vel={w_vel:.3f} | Cos={w_cos:.3f} | ZUPT={w_zupt:.3f} ({get_pct('zupt'):.1f}%) | Cov={w_cov:.3f} ({get_pct('cov'):.1f}%) | Reg=({get_pct('reg'):.1f}%)"
         else:
             log_str += f" | Weight_Pos={w_pos:.3f} ({get_pct('pos'):.1f}%)"
@@ -629,10 +577,7 @@ def train(
                 'epochs_without_improvement': epochs_without_improvement,
             }
             torch.save(checkpoint, checkpoint_path)
-            # Also save epoch-specific checkpoint for backup
-            epoch_checkpoint_path = os.path.join(checkpoint_dir, f"{os.path.splitext(os.path.basename(model_path))[0]}_epoch{epoch+1}.pth")
-            torch.save(checkpoint, epoch_checkpoint_path)
-            print(f"  Checkpoint saved: {checkpoint_path} and {epoch_checkpoint_path}")
+            print(f"  Checkpoint saved: {checkpoint_path}")
 
     # Restore best model if it exists
     if os.path.exists(best_model_path):
@@ -680,6 +625,7 @@ def train(
     plt.savefig(f"plots/loss_history_{model_name}.png")
     plt.close()
 
+    return best_val_loss
 
 
 def main() -> None:
@@ -687,27 +633,62 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train various trajectory estimation models.")
     parser.add_argument("--model", type=str, default="eskf_tcn", choices=["eskf_tcn", "aekf_tcn", "only_tcn"], help="Type of model to train.")
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs.")
-    parser.add_argument("--warmup_epochs", type=int, default=10, help="Number of epochs for physics loss warmup.") # Added arg
+    parser.add_argument("--reg_warmup_epochs", type=int, default=50, help="Number of epochs for regularization weight warmup (0 -> target). Set to 0 to disable.")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
-    parser.add_argument("--batch_size", type=int, default=192, help="Batch size for training.")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training.")
     parser.add_argument("--device", type=str, default="mps" if torch.mps.is_available() else "cpu", help="Computation device ('cpu', 'cuda', 'mps').")
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs without improvement).")
     parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum change in validation loss to qualify as improvement.")
+    # HPO-specific arguments
+    parser.add_argument("--mahalanobis_threshold", type=float, default=None, help="Mahalanobis distance threshold for measurement gating (HPO).")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout rate for TCN layers (HPO).")
+    parser.add_argument("--reg_weight", type=float, default=None, help="Regularization weight override (HPO).")
+    parser.add_argument("--kernel_size", type=int, default=None, help="TCN kernel size (HPO).")
+    parser.add_argument("--tcn_channel_size", type=int, default=None, help="TCN channel size per layer (HPO).")
+    parser.add_argument("--num_tcn_layers", type=int, default=None, help="Number of TCN layers (HPO).")
+    parser.add_argument("--hpo_mode", action="store_true", help="Enable HPO mode (outputs FINAL_LOSS for agent parsing).")
+    parser.add_argument("--hpo_trial_id", type=str, default=None, help="HPO trial ID for checkpoint isolation.")
     args, _ = parser.parse_known_args()
 
     # Note: Most loss weights are now learned automatically. Only `reg_weight` remains.
+    # Apply HPO overrides if specified (modify Config at runtime for ESKF consumption)
+    dropout_rate = args.dropout if args.dropout is not None else Config.ESKFTCN.DROPOUT
+    kernel_size = args.kernel_size if args.kernel_size is not None else Config.ESKFTCN.KERNEL_SIZE
+    if args.mahalanobis_threshold is not None:
+        Config.ESKFTCN.MAHALANOBIS_GATE_THRESHOLD = args.mahalanobis_threshold
+
+    # Build TCN channels list from HPO params or use defaults
+    num_layers = args.num_tcn_layers if args.num_tcn_layers is not None else len(Config.ESKFTCN.TCN_CHANNELS)
+    channel_size = args.tcn_channel_size if args.tcn_channel_size is not None else Config.ESKFTCN.TCN_CHANNELS[0]
+    tcn_channels = [channel_size] * num_layers
+
+    # Build dilation factors matching num_layers (using base pattern from config)
+    base_dilations = Config.ESKFTCN.TCN_DILATION_FACTORS
+    if num_layers <= len(base_dilations):
+        tcn_dilations = base_dilations[:num_layers]
+    else:
+        # Extend with doubling pattern
+        tcn_dilations = base_dilations + [base_dilations[-1] * (2 ** i) for i in range(1, num_layers - len(base_dilations) + 1)]
+
     model_configs: Dict[str, Dict[str, Any]] = {
         "eskf_tcn": {
             "model_params": {
                 "tcn_input_size": Config.ESKFTCN.TCN_INPUT_SIZE,
                 "use_zupt": Config.ESKFTCN.USE_ZUPT,
-                "use_tcn_zupt": Config.ESKFTCN.USE_TCN_ZUPT
+                "use_tcn_zupt": Config.ESKFTCN.USE_TCN_ZUPT,
+                "dropout": dropout_rate,
+                "kernel_size": kernel_size,
+                "tcn_channels": tcn_channels,
+                "tcn_dilation_factors": tcn_dilations,
             },
-            "loss_weights": {"reg_weight": Config.LOSS.REG_WEIGHT_ESKF_TCN},
+            "loss_weights": {"reg_weight": args.reg_weight if args.reg_weight is not None else Config.LOSS.REG_WEIGHT_ESKF_TCN},
         },
         "aekf_tcn": {
-            "model_params": {"tcn_input_size": Config.AEKFTCN.TCN_INPUT_SIZE},
-            "loss_weights": {"reg_weight": Config.LOSS.REG_WEIGHT_AEKF_TCN},
+            "model_params": {
+                "tcn_input_size": Config.AEKFTCN.TCN_INPUT_SIZE,
+                "dropout": dropout_rate,
+            },
+            "loss_weights": {"reg_weight": args.reg_weight if args.reg_weight is not None else Config.LOSS.REG_WEIGHT_AEKF_TCN},
         },
         "only_tcn": {
             "model_params": {"input_size": Config.OnlyTCN.INPUT_SIZE, "output_size": Config.OnlyTCN.OUTPUT_SIZE},
@@ -731,8 +712,10 @@ def main() -> None:
     )
 
     # Load Validation Dataset (No augmentation)
+    # NOTE: Set Config.VALIDATION_DATASET_H5_PATH to a separate validation file
+    # to avoid training/validation data leak
     val_dataset = TrajectoryDataset(
-        preprocessed_file=Config.DATASET_H5_PATH,
+        preprocessed_file=Config.VALIDATION_DATASET_H5_PATH,
         augment_multiplier=1,
         subsample_step=Config.SUBSAMPLE_STEP,
         do_augment=False,
@@ -751,11 +734,19 @@ def main() -> None:
         "only_tcn": OnlyTCN,
     }
     model_class = model_class_map.get(args.model)
+    if model_class is None:
+        raise ValueError(f"Unknown model type: {args.model}. Available: {list(model_class_map.keys())}")
     model = model_class(device=args.device, dt=Config.DT, **model_params)
 
-    model_path = f"{args.model}_model.pth"
+    # HPO-specific model path to avoid checkpoint conflicts between trials
+    if args.hpo_mode and args.hpo_trial_id:
+        hpo_checkpoint_dir = os.path.join("checkpoints", "hpo")
+        os.makedirs(hpo_checkpoint_dir, exist_ok=True)
+        model_path = os.path.join(hpo_checkpoint_dir, f"{args.model}_{args.hpo_trial_id}.pth")
+    else:
+        model_path = f"{args.model}_model.pth"
 
-    train(
+    best_val_loss = train(
         args.model,
         model,
         train_dataloader,
@@ -767,10 +758,16 @@ def main() -> None:
         mean,
         std,
         **loss_weights,
-        warmup_epochs=args.warmup_epochs,
+        reg_warmup_epochs=args.reg_warmup_epochs,
         patience=args.patience,
-        min_delta=args.min_delta
+        min_delta=args.min_delta,
     )
+
+    # HPO Mode: Output final loss for agent parsing
+    if args.hpo_mode:
+        print(f"FINAL_LOSS: {best_val_loss:.6f}")
+
+    return best_val_loss
 
 
 if __name__ == "__main__":
