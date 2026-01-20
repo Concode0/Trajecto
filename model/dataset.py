@@ -40,7 +40,9 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         noise_std: float = 0.01,
         scale_range: tuple = (0.9, 1.1),
         yaw_range: tuple = (-0.78, 0.78), # Control Rotation
-        sigma_tilt: float = 0.00
+        sigma_tilt: float = 0.00,
+        scaler_stats_path: str = None,
+        return_normalized: bool = True
     ) -> None:
         """Initializes the TrajectoryDataset.
 
@@ -56,6 +58,10 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
             noise_std: The standard deviation of the noise to add to the sensor data.
             scale_range: A tuple representing the range of the random scaling factor.
             yaw_range: A tuple representing the range of the random yaw angle in radians.
+            scaler_stats_path: Optional path to scaler statistics HDF5 file.
+                If provided, normalized sensor data will be cached.
+            return_normalized: If True and scaler_stats_path provided, return both
+                raw and normalized sensor data. If False, only return raw.
         """
         self.augment_multiplier = augment_multiplier
         self.cached_data: List[Dict[str, torch.Tensor]] = []
@@ -64,6 +70,16 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         self.scale_range = scale_range
         self.yaw_range = yaw_range
         self.sigma_tilt = sigma_tilt
+        self.return_normalized = return_normalized
+
+        # Load scaler statistics if provided
+        self.mean = None
+        self.std = None
+        if scaler_stats_path is not None:
+            with h5py.File(scaler_stats_path, "r") as f:
+                self.mean = torch.from_numpy(f["mean"][:]).float()
+                self.std = torch.from_numpy(f["std"][:]).float()
+            print(f"Loaded normalization stats from {scaler_stats_path}")
 
         print("Loading dataset into RAM for high-speed training...")
         with h5py.File(preprocessed_file, "r") as f:
@@ -73,6 +89,12 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                 sensor = f[key]["sensor_data"][:]
                 pos = f[key]["gt_pos_data"][:]
                 vel = f[key]["gt_vel_data"][:]
+
+                # Load gravity GT from Apple Pencil pose if available
+                gravity_b = None
+                if "gt_gravity_b_data" in f[key]:
+                    gravity_b = f[key]["gt_gravity_b_data"][:]
+
                 try:
                     seq_len = f[key].attrs["sequence_length"]
                 except KeyError:
@@ -88,14 +110,16 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                 # Subsample to reduce sequence length and convert to PyTorch tensors.
                 # This is a crucial step for managing memory and computational load
                 # during training, especially with high-frequency data.
-                self.cached_data.append(
-                    {
-                        "sensor": torch.from_numpy(sensor[::subsample_step]).float(),
-                        "pos": torch.from_numpy(pos[::subsample_step]).float(),
-                        "vel": torch.from_numpy(vel[::subsample_step]).float(),
-                        "len": seq_len // subsample_step,
-                    }
-                )
+                data_dict = {
+                    "sensor": torch.from_numpy(sensor[::subsample_step]).float(),
+                    "pos": torch.from_numpy(pos[::subsample_step]).float(),
+                    "vel": torch.from_numpy(vel[::subsample_step]).float(),
+                    "len": seq_len // subsample_step,
+                }
+                if gravity_b is not None:
+                    data_dict["gravity_b"] = torch.from_numpy(gravity_b[::subsample_step]).float()
+
+                self.cached_data.append(data_dict)
 
         self.num_original_samples = len(self.cached_data)
         print(f"Loaded {self.num_original_samples} original samples into RAM.")
@@ -140,6 +164,7 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
         sensor_data = data["sensor"].clone()  # Shape: (Seq, 7) [Acc(3), Gyro(3), FSR(1)]
         pos_data = data["pos"].clone()        # Shape: (Seq, 3)
         vel_data = data["vel"].clone()        # Shape: (Seq, 3)
+        gravity_b_data = data["gravity_b"].clone() if "gravity_b" in data else None  # Shape: (Seq, 3)
 
         if self.do_augment and idx >= self.num_original_samples:
             yaw = torch.rand(1) * (self.yaw_range[1] - self.yaw_range[0]) + self.yaw_range[0]
@@ -150,7 +175,8 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                 [0, 0, 1]
             ]).float()
 
-            # Rotate sensor_data and gt_data
+            # Rotate sensor_data and gt_data (world frame rotation)
+            # Note: gravity_b is NOT rotated by yaw since it's in body frame
             pos_data = (rot_yaw @ pos_data.T).T
             vel_data = (rot_yaw @ vel_data.T).T
             sensor_data[:, :3] = (rot_yaw @ sensor_data[:, :3].T).T
@@ -178,6 +204,10 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
                 sensor_data[:, :3] = (rot_local @ sensor_data[:, :3].T).T
                 sensor_data[:, 3:6] = (rot_local @ sensor_data[:, 3:6].T).T
 
+                # Also rotate gravity_b by local grip error (body frame rotation)
+                if gravity_b_data is not None:
+                    gravity_b_data = (rot_local @ gravity_b_data.T).T
+
             # Inject calibrated noise based on sensor characteristics (Allan variance)
             # Different noise levels for each sensor type provide realistic augmentation
             noise = torch.zeros_like(sensor_data)
@@ -199,9 +229,20 @@ class TrajectoryDataset(Dataset[Dict[str, torch.Tensor]]):
 
             sensor_data += noise
 
-        return {
+        result = {
             "imu_seq_raw": sensor_data,
             "gt_pos_w": pos_data,
             "gt_vel_w": vel_data,
             "len": data["len"],
         }
+
+        # Add normalized sensor data if scaler stats available
+        if self.return_normalized and self.mean is not None:
+            sensor_norm = (sensor_data - self.mean) / (self.std + 1e-6)
+            result["imu_seq_norm"] = sensor_norm
+
+        # Add gravity ground truth if available
+        if gravity_b_data is not None:
+            result["gt_gravity_b"] = gravity_b_data
+
+        return result

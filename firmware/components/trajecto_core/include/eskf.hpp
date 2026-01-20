@@ -52,6 +52,9 @@ public:
     /** @brief Simple threshold-based ZUPT check */
     bool check_zupt(const Eigen::Vector3f& accel_raw);
 
+    /** @brief Hard reset velocity to zero (for high-confidence ZUPT) */
+    void hard_reset_velocity();
+
     // Getters
     const NominalState& get_state() const { return state_; }
     const Eigen::Matrix<float, STATE_DIM, STATE_DIM>& get_covariance() const { return P_; }

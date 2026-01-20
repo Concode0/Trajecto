@@ -29,43 +29,34 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model.dataset import TrajectoryDataset
 from model.config import Config
 from model.ESKF_TCN import ESKFTCN_model
-from model.AEKF_TCN import AEKFTCN_model
-from model.onlyTCN import OnlyTCN
-from model.pure_eskf import PureESKFModel
+from train_eskf import TrainConfig # Import TrainConfig
 
+# Add TrainConfig to safe globals for checkpoint loading
+torch.serialization.add_safe_globals([TrainConfig])
 
 def load_model(model_type: str, model_path: str, device: str, mean: torch.Tensor, std: torch.Tensor) -> torch.nn.Module:
     """Initializes and loads the trained model weights."""
 
-    if model_type == "pure_eskf":
-        print("Initializing Pure ESKF (Physics Baseline)...")
-        return PureESKFModel(device=device, dt=Config.DT)
-
     model_params: Dict[str, Any] = {}
 
     if model_type == "eskf_tcn":
+        # Updated parameters for the Y-branch ESKF-TCN architecture
         model_params = {
             "tcn_input_size": Config.ESKFTCN.TCN_INPUT_SIZE,
+            "tcn_channels": Config.ESKFTCN.TCN_CHANNELS,
+            "kernel_size": Config.ESKFTCN.KERNEL_SIZE,
+            "dropout": Config.ESKFTCN.DROPOUT,
+            "tcn_backbone_dilations": Config.ESKFTCN.TCN_BACKBONE_DILATIONS,
+            "tcn_dynamic_dilations": Config.ESKFTCN.TCN_DYNAMIC_DILATIONS,
+            "tcn_static_dilations": Config.ESKFTCN.TCN_STATIC_DILATIONS,
             "use_zupt": Config.ESKFTCN.USE_ZUPT,
             "use_tcn_zupt": Config.ESKFTCN.USE_TCN_ZUPT,
-            "dt": Config.DT
+            "dt": Config.DT,
+            "separable": Config.ESKFTCN.USE_SEPARABLE_CONV,
         }
         model_class = ESKFTCN_model
-    elif model_type == "aekf_tcn":
-         model_params = {
-            "tcn_input_size": Config.AEKFTCN.TCN_INPUT_SIZE,
-            "dt": Config.DT
-         }
-         model_class = AEKFTCN_model
-    elif model_type == "only_tcn":
-        model_params = {
-            "input_size": Config.OnlyTCN.INPUT_SIZE,
-            "output_size": Config.OnlyTCN.OUTPUT_SIZE,
-            "dt": Config.DT
-        }
-        model_class = OnlyTCN
     else:
-        raise ValueError(f"Unknown model type: {model_type}")
+        raise ValueError(f"Unknown model type: {model_type}. Only 'eskf_tcn' is supported in this minimal version.")
 
     model = model_class(device=device, **model_params)
 
@@ -73,8 +64,16 @@ def load_model(model_type: str, model_path: str, device: str, mean: torch.Tensor
         raise FileNotFoundError(f"Model file not found at: {model_path}")
 
     # Load weights
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint)
+    # Set weights_only=False to allow loading custom classes like TrainConfig from the checkpoint
+    # This is safe here as we are loading locally generated trusted checkpoints
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+    # Handle both full checkpoint dict and direct state_dict
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+
     model.to(device)
     model.eval()
     return model
@@ -545,18 +544,18 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="Trajecto Validation Tool")
-    parser.add_argument("--model_type", type=str, required=True, choices=["eskf_tcn", "aekf_tcn", "only_tcn", "pure_eskf"], help="Model architecture")
-    parser.add_argument("--model_path", type=str, required=False, help="Path to .pth model file (not required for pure_eskf)")
-    parser.add_argument("--dataset", type=str, default=Config.VALIDATION_DATASET_H5_PATH, help="Path to validation HDF5 dataset")
-    parser.add_argument("--device", type=str, default="mps" if torch.cuda.is_available() else "cpu", help="Device to run inference on")
+    parser.add_argument("--model_type", type=str, default="eskf_tcn", choices=["eskf_tcn"], help="Model architecture (only eskf_tcn supported)")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to .pth model file")
+    parser.add_argument("--dataset", type=str, default="./data/dataset.h5", help="Path to validation HDF5 dataset")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"), help="Device to run inference on (cuda/mps/cpu)")
     parser.add_argument("--output_dir", type=str, default="results/validation", help="Directory to save results")
     parser.add_argument("--no_scale", action="store_true", help="Disable scale correction in alignment (use SE(3) instead of Sim(3))")
 
     args = parser.parse_args()
 
     # Validation for model path
-    if args.model_type != "pure_eskf" and not args.model_path:
-        parser.error("--model_path is required for model_type other than 'pure_eskf'")
+    if not args.model_path:
+        parser.error("--model_path is required")
 
     print(f"Validating {args.model_type} model")
     if args.model_path:
@@ -565,8 +564,8 @@ def main():
     print(f"Device: {args.device}")
 
     # Load Scaler Stats
-    print(f"Loading scaler stats from {Config.SCALER_STATS_H5_PATH}...")
-    with h5py.File(Config.SCALER_STATS_H5_PATH, "r") as f:
+    print(f"Loading scaler stats from...")
+    with h5py.File("./data/scaler_stats.h5", "r") as f:
         mean = torch.from_numpy(f["mean"][:]).float()
         std = torch.from_numpy(f["std"][:]).float()
 
@@ -574,7 +573,7 @@ def main():
     val_dataset = TrajectoryDataset(
         preprocessed_file=args.dataset,
         augment_multiplier=1,
-        subsample_step=Config.SUBSAMPLE_STEP,
+        subsample_step=1,
         do_augment=False
     )
     val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=False)

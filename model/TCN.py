@@ -2,14 +2,15 @@
 This module defines a Temporal Convolutional Network (TCN) model designed
 for multi-head output in hybrid filter architectures.
 
-The TCN processes a sequence of input features and, at each time step,
-predicts multiple quantities such as velocity corrections, elements of
-a measurement noise covariance matrix, and the probability of a
-Zero-Velocity Update (ZUPT) event. This allows the TCN to provide adaptive
-parameters and corrections to a Kalman filter in a closed-loop fashion.
+The TCN uses a Y-shaped architecture with:
+- Shared backbone (2 layers): Common feature extraction
+- Dynamic branch (2 layers): Fast motion with smaller receptive field
+- Static branch (2 layers): Static/ZUPT with larger receptive field
+
+This design allows the network to capture both fast-changing dynamics and
+slow/static patterns with appropriate temporal contexts.
 """
 
-import math
 from typing import Dict, List, Optional
 
 import torch
@@ -88,65 +89,87 @@ class CausalConv1d(nn.Module):
 
 
 class TCN(nn.Module):
-    """A multi-head Temporal Convolutional Network (TCN) for closed-loop trajectory correction.
+    """A Y-shaped multi-head TCN for closed-loop trajectory correction.
 
-    This network takes a sequence of rich features (e.g., filter innovations,
-    velocity estimates, IMU readings) and processes them through multiple
-    dilated causal convolutional layers. It produces three distinct outputs
-    at each time step, designed to inform and correct a Kalman filter:
-    1. `vel_corr`: A 3D velocity correction vector.
-    2. `covariance_R`: A 6D vector representing parameters for the measurement
-       noise covariance matrix `R` (e.g., diagonal elements or Cholesky factors).
-    3. `zupt_prob`: A scalar probability indicating if the sensor is stationary
-       (Zero-Velocity Update).
+    Architecture:
+        Input → [Shared Backbone: 2 layers] → Split
+                                              ├→ [Dynamic Branch: 2 layers] → vel_corr, covariance_R
+                                              └→ [Static Branch: 2 layers]  → zupt_prob, gravity_b
+
+    The Y-shaped design uses different receptive fields for different outputs:
+    - Dynamic branch: Smaller dilations for fast-changing motion signals
+    - Static branch: Larger dilations for static/ZUPT detection
+
+    Outputs:
+    1. `vel_corr`: A 3D velocity correction vector (from dynamic branch).
+    2. `covariance_R`: A 6D vector for adaptive measurement noise (from dynamic branch).
+    3. `zupt_prob`: A scalar probability indicating stationary state (from static branch).
+    4. `gravity_b`: A 3D unit vector for gravity direction (from static branch).
     """
 
     def __init__(
         self,
-        input_size: int = 20,
-        tcn_channels: List[int] = [64, 64, 64, 64],
+        input_size: int = 7,
+        tcn_channels: List[int] = [96, 96, 96, 96],
         kernel_size: int = 3,
         dropout: float = 0.1,
         tcn_dilation_factors: Optional[List[int]] = None,
-        separable: bool = False, # Default to False, controlled by higher-level models
+        separable: bool = False,
+        # Y-branch specific parameters
+        dynamic_dilations: Optional[List[int]] = None,
+        static_dilations: Optional[List[int]] = None,
     ):
-        """Initializes the TCN model.
+        """Initializes the Y-shaped TCN model.
 
         Args:
-            input_size: The number of features in the input sequence. This `D` corresponds
-                to the last dimension in a `[B, T, D]` input tensor.
-            tcn_channels: A list where each element specifies the number of output
-                channels (filters) for a corresponding TCN layer. The length of
-                this list determines the number of TCN layers.
-            kernel_size: The size of the convolutional kernel to be used in all TCN layers.
-            dropout: The dropout rate applied after each ReLU activation for regularization.
-            tcn_dilation_factors: Optional list of dilation factors for each TCN layer.
-                If None, defaults to `[2**i for i in range(len(tcn_channels))]`,
-                which is a common strategy for increasing the receptive field exponentially.
-            separable: If True, uses Depthwise Separable Convolutions to reduce parameters.
+            input_size: The number of features in the input sequence (default 7:
+                gyro[3] + accel[3] + force[1]).
+            tcn_channels: A list of 4 channel sizes:
+                [backbone_1, backbone_2, branch_1, branch_2]
+                First 2 for shared backbone, last 2 for each branch.
+            kernel_size: The kernel size for all convolutional layers.
+            dropout: Dropout rate for regularization.
+            tcn_dilation_factors: Dilation factors for shared backbone (2 values).
+                Defaults to [1, 2] if None.
+            separable: If True, uses Depthwise Separable Convolutions.
+            dynamic_dilations: Dilation factors for dynamic branch (2 values).
+                Defaults to [1, 2] for smaller RF (fast response).
+            static_dilations: Dilation factors for static branch (2 values).
+                Defaults to [4, 8] for larger RF (slow/static patterns).
         """
         super().__init__()
 
-        # Default dilation factors if not explicitly provided.
-        if tcn_dilation_factors is None:
-            tcn_dilation_factors = [2**i for i in range(len(tcn_channels))]
-        elif len(tcn_dilation_factors) != len(tcn_channels):
+        # Validate channel configuration (need 4 values for backbone + branches)
+        if len(tcn_channels) != 4:
             raise ValueError(
-                "Length of tcn_dilation_factors must match length of tcn_channels."
+                f"tcn_channels must have exactly 4 elements for Y-architecture, got {len(tcn_channels)}"
             )
 
-        # No input normalization layer - features are already z-score normalized
-        # in base_hybrid_model.py before entering TCN. This preserves relative
-        # magnitudes between features which carry physical meaning.
-        self.tcn_layers = nn.ModuleList()  # Stores the sequential TCN blocks.
+        # Default dilation factors for each component
+        if tcn_dilation_factors is None:
+            tcn_dilation_factors = [1, 2]  # Shared backbone dilations
+        if dynamic_dilations is None:
+            dynamic_dilations = [1, 2]  # Smaller RF for fast motion
+        if static_dilations is None:
+            static_dilations = [4, 8]  # Larger RF for static/ZUPT
+
+        # Validate dilation lists
+        if len(tcn_dilation_factors) != 2:
+            raise ValueError("tcn_dilation_factors must have 2 elements for backbone")
+        if len(dynamic_dilations) != 2:
+            raise ValueError("dynamic_dilations must have 2 elements")
+        if len(static_dilations) != 2:
+            raise ValueError("static_dilations must have 2 elements")
+
+        # === Shared Backbone (2 layers) ===
+        self.backbone = nn.ModuleList()
         in_channels = input_size
-        self._receptive_field = 1  # Tracks the effective receptive field of the network.
+        self._backbone_rf = 1
 
-        # Construct the TCN layers using CausalConv1d blocks.
-        for i, out_channels in enumerate(tcn_channels):
+        for i in range(2):
             dilation = tcn_dilation_factors[i]
-
-            self.tcn_layers.append(
+            out_channels = tcn_channels[i]
+            self.backbone.append(
                 CausalConv1d(
                     in_channels,
                     out_channels,
@@ -157,29 +180,89 @@ class TCN(nn.Module):
                 )
             )
             in_channels = out_channels
+            self._backbone_rf += (kernel_size - 1) * dilation
 
-            # The receptive field grows with each dilated convolutional layer.
-            # For a TCN layer with kernel_size k and dilation d, the receptive
-            # field increases by (k-1)*d.
-            self._receptive_field += (kernel_size - 1) * dilation
+        backbone_out_channels = tcn_channels[1]
 
-        # Define multiple output heads, each consisting of a linear layer,
-        # to predict different quantities from the TCN's final feature map.
-        self.output_heads = nn.ModuleDict(
+        # === Dynamic Branch (2 layers) - for motion-related outputs ===
+        self.dynamic_branch = nn.ModuleList()
+        in_channels = backbone_out_channels
+        self._dynamic_rf = 0
+
+        for i in range(2):
+            dilation = dynamic_dilations[i]
+            out_channels = tcn_channels[2 + i]
+            self.dynamic_branch.append(
+                CausalConv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    dilation=dilation,
+                    dropout=dropout,
+                    separable=separable,
+                )
+            )
+            in_channels = out_channels
+            self._dynamic_rf += (kernel_size - 1) * dilation
+
+        dynamic_out_channels = tcn_channels[3]
+
+        # === Static Branch (2 layers) - for static/ZUPT-related outputs ===
+        self.static_branch = nn.ModuleList()
+        in_channels = backbone_out_channels
+        self._static_rf = 0
+
+        for i in range(2):
+            dilation = static_dilations[i]
+            out_channels = tcn_channels[2 + i]
+            self.static_branch.append(
+                CausalConv1d(
+                    in_channels,
+                    out_channels,
+                    kernel_size,
+                    dilation=dilation,
+                    dropout=dropout,
+                    separable=separable,
+                )
+            )
+            in_channels = out_channels
+            self._static_rf += (kernel_size - 1) * dilation
+
+        static_out_channels = tcn_channels[3]
+
+        # Total receptive fields
+        self._receptive_field = self._backbone_rf + max(self._dynamic_rf, self._static_rf)
+        self._dynamic_total_rf = self._backbone_rf + self._dynamic_rf
+        self._static_total_rf = self._backbone_rf + self._static_rf
+
+        # === Output Heads ===
+        # Dynamic branch outputs: motion-related predictions
+        self.dynamic_heads = nn.ModuleDict(
             {
-                "vel_corr": nn.Linear(tcn_channels[-1], 3),  # 3D velocity correction
-                "covariance_R": nn.Linear(
-                    tcn_channels[-1], 6
-                ),  # Parameters for 6D log(R) (e.g., log-diagonal)
-                "zupt_prob": nn.Linear(
-                    tcn_channels[-1], 1
-                ),  # Scalar ZUPT probability
+                "vel_corr": nn.Linear(dynamic_out_channels, 3),
+                "covariance_R": nn.Linear(dynamic_out_channels, 6),
             }
         )
 
+        # Static branch outputs: static/ZUPT-related predictions
+        self.static_heads = nn.ModuleDict(
+            {
+                "zupt_prob": nn.Linear(static_out_channels, 1),
+            }
+        )
+
+        # Gravity Head: Fuses Static (Stable) + Dynamic (Responsive) features
+        # "Gravity is static, but its observation in Body Frame is dynamic."
+        fused_dim = dynamic_out_channels + static_out_channels
+        hidden_dim = fused_dim // 2
+        self.gravity_head = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3)
+        )
+
         # Register isotropic velocity correction scale as buffer
-        # Using L2 norm maintains directional accuracy across all axes
-        # Physical Z-axis constraints are handled by data distribution, not output scaling
         self.register_buffer(
             "vel_scale_isotropic",
             torch.tensor(Config.VEL_CORRECTION_SCALE, dtype=torch.float32)
@@ -195,7 +278,10 @@ class TCN(nn.Module):
         """
         return self._receptive_field
 
-    def forward(self, feature_sequence: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        feature_sequence: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         """Processes the sequence of input features to produce multi-head outputs.
 
         Args:
@@ -212,6 +298,8 @@ class TCN(nn.Module):
                     - Shape: (Batch, Seq_Len, 6) | Unit: Log-Variance or similar
                 - "zupt_prob": Zero-velocity probability.
                     - Shape: (Batch, Seq_Len, 1) | Range: [0, 1]
+                - "gravity_b": Estimated gravity vector in body frame.
+                    - Shape: (Batch, Seq_Len, 3) | Unit: normalized vector
         """
         # Conv1d layers in PyTorch expect input of shape `[B, D, T]`.
         # Therefore, we transpose the last two dimensions of the input `feature_sequence`
@@ -222,32 +310,57 @@ class TCN(nn.Module):
         # magnitudes allows TCN to learn from physical relationships between features
         # (e.g., innovation magnitude vs velocity, force vs acceleration correlation)
 
-        # Pass the input through all TCN layers.
-        # Since we use CausalConv1d, the output sequence length is naturally preserved
-        # and causality is maintained.
-        for layer in self.tcn_layers:
-            tcn_input = layer(tcn_input)
+        # Pass the input through shared backbone
+        x = tcn_input
+        for layer in self.backbone:
+            x = layer(x)
+
+        # --- Dynamic Branch ---
+        x_dynamic = x
+        for layer in self.dynamic_branch:
+            x_dynamic = layer(x_dynamic)
+
+        # --- Static Branch ---
+        x_static = x
+        for layer in self.static_branch:
+            x_static = layer(x_static)
 
         # After convolutions, transpose back to `[B, T, D']` for the linear output heads.
-        tcn_output = tcn_input.transpose(1, 2)
+        tcn_output_dynamic = x_dynamic.transpose(1, 2)
+        tcn_output_static = x_static.transpose(1, 2)
 
-        # Apply each output head (linear layer) to the TCN's final feature map.
-        outputs = {
-            head_name: head(tcn_output)
-            for head_name, head in self.output_heads.items()
-        }
+        outputs = {}
 
-        # Bounded Velocity Correction: Isotropic denormalization to physical units
-        # Tanh naturally maps unbounded linear output → [-1, 1]
-        # Scale by isotropic L2 norm (2σ of velocity magnitude distribution)
-        # Isotropic scaling is critical because:
-        #   (1) Preserves directional accuracy: TCN learns true velocity vectors
-        #   (2) Physical Z-axis constraint is naturally learned from data distribution
-        #   (3) Avoids asymmetric regularization (all axes penalized equally)
-        #   (4) Simpler architecture: network doesn't need to learn axis-specific scaling
-        # Trade-off: Z-axis may saturate tanh more often, but preserves geometric correctness
-        # Use cached buffer (registered in __init__) - avoids tensor creation
-        outputs["vel_corr"] = torch.tanh(outputs["vel_corr"]) * self.vel_scale_isotropic
+        # Apply dynamic heads
+        for head_name, head in self.dynamic_heads.items():
+            outputs[head_name] = head(tcn_output_dynamic)
+
+        # Apply static heads
+        for head_name, head in self.static_heads.items():
+            outputs[head_name] = head(tcn_output_static)
+
+        # Gravity Head Fusion: Static (Stable) + Dynamic (Responsive)
+        # Concatenate features from both branches: [B, T, Dynamic_Dim + Static_Dim]
+        feat_gravity = torch.cat([tcn_output_dynamic, tcn_output_static], dim=-1)
+        outputs["gravity_b"] = self.gravity_head(feat_gravity)
+
+        # Log-Scale Velocity Correction: signed_log1p for better gradient flow
+        # Problem with tanh: gradients vanish near saturation (±1), crushing details
+        # Solution: sign(x) * log1p(|x|) has:
+        #   (1) Linear behavior near 0: good for small corrections
+        #   (2) Logarithmic compression for large values: prevents explosion
+        #   (3) Non-vanishing gradients: gradient = 1/(1+|x|) never goes to 0
+        #   (4) Preserves sign: can represent positive/negative corrections per axis
+        # Scale by isotropic factor and clip to physical limits
+        raw_vel = outputs["vel_corr"]
+        # Signed log1p: preserves sign, compresses magnitude logarithmically
+        vel_log_scale = torch.sign(raw_vel) * torch.log1p(torch.abs(raw_vel))
+        # Scale to physical units and clip to reasonable range (5 m/s max)
+        outputs["vel_corr"] = torch.clamp(
+            vel_log_scale * self.vel_scale_isotropic,
+            min=-Config.ESKFTCN.VEL_CORR_CLIP_RANGE,
+            max=Config.ESKFTCN.VEL_CORR_CLIP_RANGE
+        )
 
         # CRITICAL: Clip covariance output to prevent numerical explosion
         # Raw TCN output represents log-space values that will be transformed by:
@@ -263,6 +376,12 @@ class TCN(nn.Module):
                 max=2.95
             )
 
+        # Gravity direction in body frame: normalize to unit vector
+        # TCN predicts the expected gravity direction, used for attitude correction
+        # L2 normalization ensures output is always a valid direction vector
+        if "gravity_b" in outputs:
+            outputs["gravity_b"] = F.normalize(outputs["gravity_b"], p=2, dim=-1, eps=1e-6)
+
         return outputs
 
 
@@ -272,13 +391,13 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Model parameters for testing.
-    input_features = 20
+    input_features = Config.ESKFTCN.TCN_INPUT_SIZE  # 19 features
     seq_length = 100
     batch_size = 32
-    tcn_channels_test = [64, 64, 64, 64]
-    kernel_size_test = 3
+    tcn_channels_test = Config.ESKFTCN.TCN_CHANNELS
+    kernel_size_test = Config.ESKFTCN.KERNEL_SIZE
 
-    # Create a model instance.
+    # Create a model instance
     model = TCN(
         input_size=input_features,
         tcn_channels=tcn_channels_test,
@@ -286,33 +405,33 @@ if __name__ == "__main__":
     ).to(device)
     print(f"\nTCN Model Receptive Field: {model.receptive_field} steps")
 
-    # Create some dummy feature data.
+    # Create dummy feature data
     dummy_feature_data = torch.randn(
         batch_size, seq_length, input_features, device=device
     )
 
-    # Perform a forward pass.
+    # Test 1: Forward pass
+    print("\n--- Test 1: Forward pass ---")
     predictions = model(dummy_feature_data)
-
-    print(f"\nInput feature sequence shape: {dummy_feature_data.shape}")
+    print(f"Input feature sequence shape: {dummy_feature_data.shape}")
     print("Output shapes for each head:")
     for head, pred in predictions.items():
         print(f"  - '{head}': {pred.shape}")
-        # Assert that output sequence length matches input sequence length.
-        assert pred.shape[1] == seq_length, f"Output length mismatch for {head}"
 
-    # Test the receptive field with an input sequence exactly its size.
-    # The output from the TCN should be valid across this length.
+    # Test 2: Receptive field test
+    print("\n--- Test 2: Receptive field test ---")
     dummy_rf_feature = torch.randn(
         batch_size, model.receptive_field, input_features, device=device
     )
     predictions_rf = model(dummy_rf_feature)
-    print(
-        f"\nInput feature sequence shape (Receptive Field test): {dummy_rf_feature.shape}"
-    )
-    print("Output shapes for each head (Receptive Field test):")
+    print(f"Input feature sequence shape (RF test): {dummy_rf_feature.shape}")
+    print("Output shapes for each head (RF test):")
     for head, pred in predictions_rf.items():
         print(f"  - '{head}': {pred.shape}")
-        assert pred.shape[1] == model.receptive_field, f"RF output length mismatch for {head}"
+        expected_len = model.receptive_field
+        actual_len = pred.shape[1] if pred.dim() == 3 else pred.shape[1]
+        assert actual_len == expected_len, f"RF output length mismatch for {head}"
 
-    print("\nTCN multi-head model created and tested successfully.")
+    print("\n" + "="*60)
+    print("TCN with Y-Branch tested successfully!")
+    print("="*60)

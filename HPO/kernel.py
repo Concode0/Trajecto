@@ -70,31 +70,63 @@ class HPOKernel:
     TPE_GOOD_PERCENTILE = 20
 
     # Hyperparameter Search Space - Optimized for ESKF-TCN Trajecto Model
+    # Updated for current system with DWA, delta loss, and context-aware weighting
     PARAM_SPACE = {
         # === Training Parameters ===
-        # Learning rate: [1e-5, 1e-3] - critical for convergence
-        "lr": {"type": "log_float", "range": (-5, -3)},
-        # Batch size: fixed for memory stability
+        # Learning rate: Narrowed to [3e-5, 3e-4] based on train_eskf.py defaults
+        # Current default: 1e-4, search ±3x around it
+        "lr": {"type": "log_float", "range": (-4.5, -3.5)},  # 3e-5 to 3e-4
+
+        # Batch size: Keep fixed for memory/GPU stability
         "batch_size": {"type": "fixed", "value": 16},
 
         # === Regularization ===
-        # Dropout: regularization for TCN layers
-        "dropout": {"type": "float", "range": (0.05, 0.3)},
-        # Regularization weight: velocity correction penalty
-        "reg_weight": {"type": "log_float", "range": (-6, -3)},
+        # Dropout: Narrow range around current default (0.15)
+        # Too low → overfitting, too high → underfitting
+        "dropout": {"type": "float", "range": (0.10, 0.25)},
+
+        # Regularization weight: Tighter range around current default (1e-7)
+        # This penalizes large TCN velocity corrections
+        "reg_weight": {"type": "log_float", "range": (-7.5, -6.0)},  # 3e-8 to 1e-6
 
         # === ESKF Parameters ===
-        # Mahalanobis threshold: measurement gating (chi-sq dof=6)
-        # ~10.6 (p=0.90), ~12.6 (p=0.95), ~16.8 (p=0.99), ~22.5 (p=0.999)
-        "mahalanobis_threshold": {"type": "float", "range": (8.0, 25.0)},
+        # Mahalanobis threshold: Narrowed to practical range
+        # Current default: 30, search around it
+        # Lower → stricter gating (fewer outliers), Higher → more lenient
+        "mahalanobis_threshold": {"type": "float", "range": (15.0, 45.0)},
 
         # === TCN Architecture ===
-        # Kernel size: temporal receptive field per layer
+        # Kernel size: Keep 3, 5, 7 (current default: 3)
+        # Larger kernel → larger receptive field but slower
         "kernel_size": {"type": "categorical", "values": [3, 5, 7]},
-        # Number of channels per TCN layer (model capacity)
-        "tcn_channel_size": {"type": "categorical", "values": [32, 64, 96]},
-        # Number of TCN layers (depth & receptive field)
-        "num_tcn_layers": {"type": "categorical", "values": [3, 4, 5]},
+
+        # TCN channels: Expanded to include higher capacity options
+        # Current default: 96, add 64 (lighter), 128 (heavier) for exploration
+        "tcn_channel_size": {"type": "categorical", "values": [64, 96, 128]},
+
+        # === Loss Weights (DWA will adjust these, but initial values matter) ===
+        # Magnitude loss initial weight
+        "w_mag": {"type": "float", "range": (0.5, 2.0)},
+
+        # Cosine (direction) loss initial weight
+        "w_cos": {"type": "float", "range": (0.5, 2.0)},
+
+        # ZUPT loss initial weight
+        "w_zupt": {"type": "float", "range": (0.2, 1.0)},
+
+        # Covariance NLL loss initial weight
+        "w_cov": {"type": "float", "range": (0.005, 0.05)},
+
+        # FFT loss initial weight
+        "w_fft": {"type": "float", "range": (0.2, 1.0)},
+
+        # Delta loss (semi-loop closure) weight - FIXED by DWA
+        "w_delta": {"type": "float", "range": (0.3, 0.7)},
+
+        # === ZUPT Parameters ===
+        # ZUPT velocity threshold: when to consider "stopped"
+        # Current default: 0.005 m/s
+        "zupt_vel_threshold": {"type": "float", "range": (0.003, 0.010)},
     }
 
     def __init__(self, port: int = DEFAULT_PORT):

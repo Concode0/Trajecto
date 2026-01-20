@@ -72,7 +72,6 @@ WORD_LIST = [
 TARGET_SAMPLING_RATE_HZ = Config.TARGET_SAMPLING_RATE_HZ
 GRAVITY = Config.GRAVITY_MAGNITUDE  # Standard gravity (m/s²) - CODATA 2018
 CUTOFF_FREQ_HZ = 5.0  # Reduced from 20.0 for better noise reduction (see optimize_fsr_zero_phase.py)
-IMU_CUTOFF_FREQ_HZ = 25.0  # Anti-aliasing filter for IMU at Nyquist frequency (50Hz sampling)
 FILTER_ORDER = 4
 SEGMENTATION_THRESHOLD = 0.01  # GT iPad screen force (0-1 normalized): exclude true zeros, keep actual writing (was: 0)
 SEGMENTATION_MARGIN = 30
@@ -88,6 +87,158 @@ STATIC_BUFFER_S = 2.5 # Static buffer duration to include before the segmeestima
 
 DIGITIZER_JUMP_THRESHOLD_M = 0.020  # 10mm - Maximum plausible single-frame position jump
 DIGITIZER_JUMP_MIN_VELOCITY = 0.5  # m/s - Minimum velocity threshold to trigger jump detection (ignore static regions)
+
+# Gravity vector in iPad frame (iPad lying flat on table, gravity points into table)
+GRAVITY_IPAD_FRAME = np.array([0.0, 0.0, -GRAVITY])
+
+
+def pencil_angles_to_rotation_matrix(azimuth: np.ndarray, altitude: np.ndarray, roll: np.ndarray) -> np.ndarray:
+    """Convert Apple Pencil pose angles to rotation matrices (pencil body → iPad world).
+
+    Apple Pencil coordinate convention:
+    - Azimuth: Angle in iPad's x-y plane from +x axis (counterclockwise when viewed from +z)
+    - Altitude: Angle above the x-y plane (0 = parallel to screen, π/2 = perpendicular)
+    - Roll: Rotation around pencil's longitudinal axis
+
+    The rotation sequence is: Rz(azimuth) @ Ry(altitude) @ Rx(roll)
+    This gives R_pencil_to_ipad: transforms vectors from pencil frame to iPad frame.
+
+    Args:
+        azimuth: [N,] array of azimuth angles (radians)
+        altitude: [N,] array of altitude angles (radians)
+        roll: [N,] array of roll angles (radians)
+
+    Returns:
+        R: [N, 3, 3] rotation matrices (pencil → iPad)
+    """
+    N = len(azimuth)
+    cos_az, sin_az = np.cos(azimuth), np.sin(azimuth)
+    cos_alt, sin_alt = np.cos(altitude), np.sin(altitude)
+    cos_roll, sin_roll = np.cos(roll), np.sin(roll)
+
+    # Rz(azimuth) - rotation around iPad's Z axis
+    Rz = np.zeros((N, 3, 3))
+    Rz[:, 0, 0] = cos_az
+    Rz[:, 0, 1] = -sin_az
+    Rz[:, 1, 0] = sin_az
+    Rz[:, 1, 1] = cos_az
+    Rz[:, 2, 2] = 1.0
+
+    # Ry(altitude) - rotation around Y axis (elevation)
+    Ry = np.zeros((N, 3, 3))
+    Ry[:, 0, 0] = cos_alt
+    Ry[:, 0, 2] = sin_alt
+    Ry[:, 1, 1] = 1.0
+    Ry[:, 2, 0] = -sin_alt
+    Ry[:, 2, 2] = cos_alt
+
+    # Rx(roll) - rotation around X axis (pencil axis)
+    Rx = np.zeros((N, 3, 3))
+    Rx[:, 0, 0] = 1.0
+    Rx[:, 1, 1] = cos_roll
+    Rx[:, 1, 2] = -sin_roll
+    Rx[:, 2, 1] = sin_roll
+    Rx[:, 2, 2] = cos_roll
+
+    # Combined: R = Rz @ Ry @ Rx
+    R = np.einsum('nij,njk->nik', Rz, Ry)
+    R = np.einsum('nij,njk->nik', R, Rx)
+
+    return R
+
+
+def compute_gravity_body_from_pencil_pose(
+    azimuth: np.ndarray,
+    altitude: np.ndarray,
+    roll: np.ndarray,
+    R_calibration: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """Compute gravity vector in pencil body frame from Apple Pencil pose angles.
+
+    Args:
+        azimuth: [N,] array of azimuth angles (radians)
+        altitude: [N,] array of altitude angles (radians)
+        roll: [N,] array of roll angles (radians)
+        R_calibration: [3, 3] optional rotation to align pencil frame with IMU frame
+
+    Returns:
+        gravity_body: [N, 3] unit gravity vectors in body frame
+    """
+    # Get rotation matrices: pencil → iPad
+    R_pencil_to_ipad = pencil_angles_to_rotation_matrix(azimuth, altitude, roll)
+
+    # Transpose to get iPad → pencil
+    R_ipad_to_pencil = np.transpose(R_pencil_to_ipad, (0, 2, 1))
+
+    # Transform gravity from iPad frame to pencil frame
+    # gravity_pencil = R_ipad_to_pencil @ gravity_ipad
+    gravity_body = np.einsum('nij,j->ni', R_ipad_to_pencil, GRAVITY_IPAD_FRAME)
+
+    # Apply calibration rotation if provided (align pencil frame with IMU frame)
+    if R_calibration is not None:
+        gravity_body = np.einsum('ij,nj->ni', R_calibration, gravity_body)
+
+    # Normalize to unit vectors
+    norms = np.linalg.norm(gravity_body, axis=1, keepdims=True)
+    gravity_body_unit = gravity_body / (norms + 1e-8)
+
+    return gravity_body_unit
+
+
+def calibrate_imu_pencil_alignment(
+    accel_static: np.ndarray,
+    azimuth_static: np.ndarray,
+    altitude_static: np.ndarray,
+    roll_static: np.ndarray
+) -> Tuple[np.ndarray, float]:
+    """Calibrate the rotation offset between Apple Pencil pose frame and IMU body frame.
+
+    During static periods, accelerometer measures gravity. We compare this with
+    the gravity vector computed from pencil pose to find the alignment rotation.
+
+    Uses Kabsch algorithm (SVD) to find optimal rotation.
+
+    Args:
+        accel_static: [N, 3] accelerometer readings during static period (m/s²)
+        azimuth_static: [N,] azimuth angles during static period
+        altitude_static: [N,] altitude angles during static period
+        roll_static: [N,] roll angles during static period
+
+    Returns:
+        R_calibration: [3, 3] rotation matrix to apply to pencil-derived gravity
+        alignment_error: Mean angular error after calibration (radians)
+    """
+    # Get gravity from accelerometer (normalize since we want direction only)
+    accel_norms = np.linalg.norm(accel_static, axis=1, keepdims=True)
+    gravity_from_accel = accel_static / (accel_norms + 1e-8)
+
+    # Get gravity from pencil pose (without calibration)
+    gravity_from_pencil = compute_gravity_body_from_pencil_pose(
+        azimuth_static, altitude_static, roll_static, R_calibration=None
+    )
+
+    # Use Kabsch algorithm to find optimal rotation R such that:
+    # gravity_from_accel ≈ R @ gravity_from_pencil
+    #
+    # Center the point clouds (already centered since unit vectors sum to ~0 over time)
+    H = gravity_from_pencil.T @ gravity_from_accel  # [3, 3] cross-covariance
+
+    U, S, Vt = np.linalg.svd(H)
+
+    # Handle reflection case
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    D = np.diag([1.0, 1.0, d])
+
+    R_calibration = Vt.T @ D @ U.T
+
+    # Compute alignment error
+    gravity_calibrated = np.einsum('ij,nj->ni', R_calibration, gravity_from_pencil)
+    cos_angles = np.sum(gravity_calibrated * gravity_from_accel, axis=1)
+    cos_angles = np.clip(cos_angles, -1.0, 1.0)
+    alignment_errors = np.arccos(cos_angles)
+    mean_error = np.mean(alignment_errors)
+
+    return R_calibration, mean_error
 
 
 def butter_lowpass_filter(data: np.ndarray, cutoff: float, fs: float, order: int) -> np.ndarray:
@@ -169,13 +320,14 @@ def preprocess_gt_data(gt_data_dict: Dict[str, np.ndarray], target_fs: float) ->
     """Preprocesses iPad ground truth: unit conversion, outlier filtering, smoothing, resampling.
 
     Pipeline: pixels→meters, remove jumps (>100px), Gaussian smoothing (σ=1), PCHIP resample.
+    Also preserves and interpolates Apple Pencil pose angles (azimuth, altitude, rollAngle).
 
     Args:
-        gt_data_dict: Raw iPad data (timestamp, x, y, hoverDistance, force)
+        gt_data_dict: Raw iPad data (timestamp, x, y, hoverDistance, force, azimuth, altitude, rollAngle)
         target_fs: Target frequency (Hz)
 
     Returns:
-        Preprocessed DataFrame with x,y,z in meters, resampled to target_fs
+        Preprocessed DataFrame with x,y,z in meters plus pose angles, resampled to target_fs
     """
     df = pd.DataFrame(gt_data_dict)
     if "timestamp" not in df.columns:
@@ -197,6 +349,11 @@ def preprocess_gt_data(gt_data_dict: Dict[str, np.ndarray], target_fs: float) ->
     for col in ["x", "y", "z", "force"]:
         if col in df.columns:
             df[col] = gaussian_filter1d(df[col].to_numpy(), sigma=1.0)
+
+    # Unwrap azimuth to handle ±π discontinuity before interpolation
+    if "azimuth" in df.columns:
+        df["azimuth"] = np.unwrap(df["azimuth"].to_numpy())
+
     original_time = df["timestamp"].to_numpy()
     sort_idx = np.argsort(original_time)
     original_time = original_time[sort_idx]
@@ -221,6 +378,13 @@ def preprocess_gt_data(gt_data_dict: Dict[str, np.ndarray], target_fs: float) ->
                 upsampled_df[col] = interp_func(new_time)
             else:
                  upsampled_df[col] = original_data[0]
+
+    # Re-wrap azimuth back to [-π, π] after interpolation
+    if "azimuth" in upsampled_df.columns:
+        upsampled_df["azimuth"] = np.arctan2(
+            np.sin(upsampled_df["azimuth"]),
+            np.cos(upsampled_df["azimuth"])
+        )
 
     return upsampled_df
 
@@ -581,11 +745,6 @@ class AcquisitionManager:
         df_s_seg = df_sensor_aligned.iloc[final_start:final_end].reset_index(drop=True)
         df_g_seg = df_gt_aligned.iloc[final_start:final_end].reset_index(drop=True)
 
-        # Apply Bessel lowpass filter to IMU signals at 25Hz
-        for col in ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]:
-            if col in df_s_seg.columns:
-                df_s_seg[col] = bessel_lowpass_filter(df_s_seg[col], IMU_CUTOFF_FREQ_HZ, TARGET_SAMPLING_RATE_HZ, FILTER_ORDER)
-
         # Apply Bessel lowpass filter to FSR at 5Hz
         if "fsr" in df_s_seg.columns:
             df_s_seg["fsr"] = bessel_lowpass_filter(df_s_seg["fsr"], CUTOFF_FREQ_HZ, TARGET_SAMPLING_RATE_HZ, FILTER_ORDER)
@@ -604,11 +763,62 @@ class AcquisitionManager:
             fsr
         ])
 
+        # Compute gravity GT from Apple Pencil pose angles
+        gt_gravity_b = None
+        pose_cols = ["azimuth", "altitude", "rollAngle"]
+        if all(col in df_g_seg.columns for col in pose_cols):
+            azimuth = df_g_seg["azimuth"].to_numpy()
+            altitude = df_g_seg["altitude"].to_numpy()
+            roll = df_g_seg["rollAngle"].to_numpy()
+
+            # Use the static buffer period (first STATIC_BUFFER_S seconds) for calibration
+            # The static buffer is at the beginning of the segment before writing starts
+            static_samples = min(static_buffer_samples, len(df_s_seg))
+            if static_samples > 10:  # Need enough samples for robust calibration
+                accel_static = df_s_seg[["accel_x", "accel_y", "accel_z"]].to_numpy()[:static_samples]
+
+                # Filter out hover/invalid pose data during calibration
+                # Check if pencil was in contact (force > 0) or just use accel magnitude
+                accel_norms = np.linalg.norm(accel_static, axis=1)
+                static_mask = (accel_norms > 8.0) & (accel_norms < 12.0)  # Near gravity
+
+                if static_mask.sum() > 10:
+                    R_calibration, alignment_error = calibrate_imu_pencil_alignment(
+                        accel_static[static_mask],
+                        azimuth[:static_samples][static_mask],
+                        altitude[:static_samples][static_mask],
+                        roll[:static_samples][static_mask]
+                    )
+                    print(f"\nGravity Calibration:")
+                    print(f"  Static samples used: {static_mask.sum()}/{static_samples}")
+                    print(f"  Alignment error: {np.degrees(alignment_error):.2f}°")
+
+                    # Compute gravity for entire sequence using calibration
+                    gt_gravity_b = compute_gravity_body_from_pencil_pose(
+                        azimuth, altitude, roll, R_calibration
+                    )
+                else:
+                    print(f"\nWarning: Insufficient static samples for gravity calibration")
+                    print(f"  Valid static samples: {static_mask.sum()}, required: >10")
+                    # Fallback: compute without calibration
+                    gt_gravity_b = compute_gravity_body_from_pencil_pose(
+                        azimuth, altitude, roll, R_calibration=None
+                    )
+            else:
+                print(f"\nWarning: Static buffer too short for calibration ({static_samples} samples)")
+                gt_gravity_b = compute_gravity_body_from_pencil_pose(
+                    azimuth, altitude, roll, R_calibration=None
+                )
+        else:
+            print(f"\nWarning: Pose columns not found in GT data. Skipping gravity GT.")
+            print(f"  Available columns: {list(df_g_seg.columns)}")
+
         processed_segments.append({
             "name": f"{sample_name}_seg0",
             "sensor": sensor_final,
             "gt_pos": gt_pos,
-            "gt_vel": gt_vel
+            "gt_vel": gt_vel,
+            "gt_gravity_b": gt_gravity_b
         })
 
         return processed_segments, debug_info
@@ -799,6 +1009,11 @@ class AcquisitionManager:
                 g.create_dataset("sensor_data", data=pad_sequence(seg["sensor"], MAX_SEQUENCE_LENGTH))
                 g.create_dataset("gt_pos_data", data=pad_sequence(seg["gt_pos"], MAX_SEQUENCE_LENGTH))
                 g.create_dataset("gt_vel_data", data=pad_sequence(seg["gt_vel"], MAX_SEQUENCE_LENGTH))
+
+                # Save gravity GT from Apple Pencil pose if available
+                if seg.get("gt_gravity_b") is not None:
+                    g.create_dataset("gt_gravity_b_data", data=pad_sequence(seg["gt_gravity_b"], MAX_SEQUENCE_LENGTH))
+
                 g.attrs["original_label"] = label
                 g.attrs["sequence_length"] = len(seg["sensor"])
 
@@ -924,9 +1139,18 @@ class AcquisitionManager:
         finally:
             await self.disconnect()
 
-    def run_reprocess(self):
-        """Reprocesses existing raw data with interactive review."""
+    def run_reprocess(self, approve_all: bool = False, no_viz: bool = False):
+        """Reprocesses existing raw data with optional interactive review.
+
+        Args:
+            approve_all: If True, automatically approve all successfully processed samples.
+            no_viz: If True, skip visualization plots (useful with approve_all for batch processing).
+        """
         print(f"Reprocessing raw data from {RAW_HDF5_PATH}...")
+        if approve_all:
+            print("  Mode: Auto-approve all valid samples")
+        if no_viz:
+            print("  Mode: Visualization disabled")
 
         if not os.path.exists(RAW_HDF5_PATH):
             print("Raw data file not found.")
@@ -948,44 +1172,67 @@ class AcquisitionManager:
                 })
 
         samples.sort(key=lambda x: x["name"])
-        print(f"Found {len(samples)} samples. Starting interactive review...")
+        mode_str = "auto-approve" if approve_all else "interactive review"
+        print(f"Found {len(samples)} samples. Starting {mode_str}...")
 
         all_segments = []
+        failed_samples = []
 
         for i, s in enumerate(samples):
-            print(f"\n[{i+1}/{len(samples)}] Reviewing: {s['name']} (Label: {s['label']})")
+            print(f"\n[{i+1}/{len(samples)}] Processing: {s['name']} (Label: {s['label']})")
 
             proc_segs, debug = self.preprocess_single(s["pen_data"], s["gt_data"], s["name"])
 
-            if proc_segs:
-                self.visualize_sync(debug, s['label'])
-                choice = input(f"  Action for {s['name']}? [ (A)pprove / (S)kip / (Q)uit ]: ").lower().strip()
-            else:
-                print(f"  [Error] Preprocessing failed: {debug.get('error')}")
-                if "sensor_aligned" in debug:
-                    print("  Showing debug plot...")
-                    self.visualize_sync(debug, s['label'])
-                choice = input(f"  Action for {s['name']} (Failed)? [ (S)kip / (Q)uit ]: ").lower().strip()
-
-            if choice in ['a', 'approve', '']:
+            if approve_all:
+                # Auto-approve mode
                 if proc_segs:
+                    if not no_viz:
+                        self.visualize_sync(debug, s['label'])
                     for seg in proc_segs:
                         seg["original_label"] = s["label"]
                         all_segments.append(seg)
-                    print(f"  -> Approved. ({len(proc_segs)} segments)")
+                    print(f"  -> Auto-approved. ({len(proc_segs)} segments)")
                 else:
-                    print("  -> Cannot approve failed sample.")
-            elif choice in ['q', 'quit', 'exit']:
-                print("Stopping review.")
-                if all_segments:
-                     if input("Save currently approved samples? (y/n): ").lower() == 'y':
-                         break
-                     else:
-                         return
-                else:
-                    return
+                    failed_samples.append(s['name'])
+                    print(f"  [Error] Preprocessing failed: {debug.get('error')}")
+                    print(f"  -> Skipped (failed).")
             else:
-                print("  -> Skipped.")
+                # Interactive mode
+                if proc_segs:
+                    if not no_viz:
+                        self.visualize_sync(debug, s['label'])
+                    choice = input(f"  Action for {s['name']}? [ (A)pprove / (S)kip / (Q)uit ]: ").lower().strip()
+                else:
+                    print(f"  [Error] Preprocessing failed: {debug.get('error')}")
+                    if not no_viz and "sensor_aligned" in debug:
+                        print("  Showing debug plot...")
+                        self.visualize_sync(debug, s['label'])
+                    choice = input(f"  Action for {s['name']} (Failed)? [ (S)kip / (Q)uit ]: ").lower().strip()
+
+                if choice in ['a', 'approve', '']:
+                    if proc_segs:
+                        for seg in proc_segs:
+                            seg["original_label"] = s["label"]
+                            all_segments.append(seg)
+                        print(f"  -> Approved. ({len(proc_segs)} segments)")
+                    else:
+                        print("  -> Cannot approve failed sample.")
+                elif choice in ['q', 'quit', 'exit']:
+                    print("Stopping review.")
+                    if all_segments:
+                         if input("Save currently approved samples? (y/n): ").lower() == 'y':
+                             break
+                         else:
+                             return
+                    else:
+                        return
+                else:
+                    print("  -> Skipped.")
+
+        if failed_samples:
+            print(f"\n[Warning] {len(failed_samples)} samples failed preprocessing:")
+            for name in failed_samples:
+                print(f"  - {name}")
 
         if all_segments:
             print(f"\nReprocessing Complete. {len(all_segments)} valid segments collected.")
@@ -1035,6 +1282,9 @@ class AcquisitionManager:
                     g.create_dataset("sensor_data", data=pad_sequence(s["sensor"], MAX_SEQUENCE_LENGTH))
                     g.create_dataset("gt_pos_data", data=pad_sequence(s["gt_pos"], MAX_SEQUENCE_LENGTH))
                     g.create_dataset("gt_vel_data", data=pad_sequence(s["gt_vel"], MAX_SEQUENCE_LENGTH, True))
+                    # Save gravity GT from Apple Pencil pose if available
+                    if s.get("gt_gravity_b") is not None:
+                        g.create_dataset("gt_gravity_b_data", data=pad_sequence(s["gt_gravity_b"], MAX_SEQUENCE_LENGTH))
                     g.attrs["original_label"] = s["original_label"]
                     g.attrs["sequence_length"] = len(s["sensor"])
 
@@ -1044,15 +1294,32 @@ class AcquisitionManager:
 
 
 async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--reprocess", action="store_true", help="Re-process existing raw data")
+    parser = argparse.ArgumentParser(
+        description="Trajecto data acquisition and preprocessing pipeline.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python utils/acquire.py                      # Interactive acquisition mode
+  python utils/acquire.py --reprocess          # Reprocess with interactive review
+  python utils/acquire.py --reprocess --approve-all          # Auto-approve all valid samples
+  python utils/acquire.py --reprocess --approve-all --no-viz # Batch mode (no plots)
+"""
+    )
+    parser.add_argument("--reprocess", action="store_true",
+                        help="Re-process existing raw data from raw_acquired_data.h5")
+    parser.add_argument("--approve-all", "-y", action="store_true",
+                        help="Auto-approve all successfully processed samples (skip interactive prompts)")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Skip visualization plots (useful for batch processing)")
     args = parser.parse_args()
 
     manager = AcquisitionManager()
 
     if args.reprocess:
-        manager.run_reprocess()
+        manager.run_reprocess(approve_all=args.approve_all, no_viz=args.no_viz)
     else:
+        if args.approve_all or args.no_viz:
+            print("Warning: --approve-all and --no-viz only apply to --reprocess mode.")
         await manager.run_interactive()
 
 if __name__ == "__main__":

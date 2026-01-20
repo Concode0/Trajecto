@@ -107,12 +107,7 @@ def format_for_config(vel_stats: Dict[str, np.ndarray]) -> str:
     Returns:
         Formatted Python code string
     """
-    vel_mean = vel_stats['vel_mean']
-    vel_std = vel_stats['vel_std']
     vel_std_l2 = vel_stats['vel_std_l2']
-
-    # Compute isotropic correction scale (2σ for ~95% coverage)
-    vel_correction_scale = 2.0 * vel_std_l2
 
     code = f'''
 # =============================================================================
@@ -120,27 +115,11 @@ def format_for_config(vel_stats: Dict[str, np.ndarray]) -> str:
 # =============================================================================
 # To regenerate: python utils/compute_config_statistics.py
 # Dataset: data/dataset.h5
-# Samples used: 100 sequences
 # =============================================================================
 
-# --- Velocity Statistics ---
-# Per-axis mean and standard deviation from ground truth velocities (WORLD frame)
-# NOTE: VEL_MEAN is NOT used for body-frame velocity normalization (frame mismatch)
-#       Only VEL_STD is used for scaling body-frame velocities
-VEL_MEAN = [{vel_mean[0]:.15f}, {vel_mean[1]:.15f}, {vel_mean[2]:.15f}]  # m/s [x, y, z] - WORLD frame (diagnostic only)
-VEL_STD = [{vel_std[0]:.15f}, {vel_std[1]:.15f}, {vel_std[2]:.15f}]      # m/s [x, y, z] - used for BODY frame scaling
-VEL_STD_L2 = {vel_std_l2:.15f}  # L2 norm of std vector (m/s)
-
-# Velocity correction scale (2σ for ~95% coverage, ISOTROPIC)
-# Used to denormalize TCN velocity correction output: tanh(output) * VEL_CORRECTION_SCALE
-# Isotropic scaling preserves directional accuracy across all axes
-VEL_CORRECTION_SCALE = {vel_correction_scale:.15f}  # m/s (isotropic)
-
-# --- Innovation Normalization ---
-# Innovation is normalized using Allan variance (VRW/ARW) from theoretical sensor noise.
-# See Config.VRW_X, VRW_Y, VRW_Z (accel) and Config.ARW_X, ARW_Y, ARW_Z (gyro).
-# Normalization: innovation / max(VRW) for accel, innovation / max(ARW) for gyro (isotropic).
-# This approach is theoretically principled and avoids drift-contaminated empirical statistics.
+# --- Velocity Statistics (from ground truth) ---
+# L2 norm of per-axis velocity std, used for isotropic body-frame normalization
+VEL_STD_L2 = {vel_std_l2:.15f}  # m/s
 '''
 
     return code
@@ -195,9 +174,7 @@ def main():
         print("SUMMARY")
         print("="*70)
         print(f"Velocity std L2:          {vel_stats['vel_std_l2']:.4f} m/s")
-        print(f"Correction scale:         {2.0 * vel_stats['vel_std_l2']:.4f} m/s (isotropic)")
-        print(f"Per-axis X/Y/Z std:       {vel_stats['vel_std'][0]:.4f}, {vel_stats['vel_std'][1]:.4f}, {vel_stats['vel_std'][2]:.4f} m/s")
-        print(f"Z-axis reduction:         {vel_stats['vel_std'][0] / vel_stats['vel_std'][2]:.1f}× smaller than X")
+        print(f"Per-axis X/Y/Z std:       {vel_stats['vel_std'][0]:.4f}, {vel_stats['vel_std'][1]:.4f}, {vel_stats['vel_std'][2]:.4f} m/s (diagnostic only)")
         print(f"\nInnovation normalization: Allan variance (theoretical)")
         print(f"  Max VRW (accel):        {max_vrw:.6f} m/s²")
         print(f"  Max ARW (gyro):         {max_arw:.8f} rad/s")

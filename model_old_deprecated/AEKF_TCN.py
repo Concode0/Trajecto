@@ -33,17 +33,37 @@ class AEKFTCN_model(BaseFilterTCNModel):
         tcn_num_channels: list = Config.AEKFTCN.TCN_NUM_CHANNELS,
         tcn_kernel_size: int = Config.AEKFTCN.TCN_KERNEL_SIZE,
         tcn_dropout: float = Config.AEKFTCN.TCN_DROPOUT,
-        tcn_dilation_factors: Optional[List[int]] = Config.AEKFTCN.TCN_DILATION_FACTORS,
+        tcn_backbone_dilations: Optional[List[int]] = Config.AEKFTCN.TCN_BACKBONE_DILATIONS,
+        tcn_dynamic_dilations: Optional[List[int]] = Config.AEKFTCN.TCN_DYNAMIC_DILATIONS,
+        tcn_static_dilations: Optional[List[int]] = Config.AEKFTCN.TCN_STATIC_DILATIONS,
         dt: float = Config.DT,
         separable: bool = Config.AEKFTCN.USE_SEPARABLE_CONV,
     ) -> None:
+        """Initializes the AEKF-TCN hybrid model.
+
+        Args:
+            device: The computation device ('cpu', 'cuda', 'mps').
+            tcn_input_size: The number of features in the TCN input vector.
+            tcn_num_channels: A list specifying the number of channels (filters)
+                for each layer in the TCN.
+            tcn_kernel_size: The kernel size for TCN convolutions.
+            tcn_dropout: The dropout rate applied within the TCN for regularization.
+            tcn_backbone_dilations: Dilation factors for shared backbone layers.
+            tcn_dynamic_dilations: Dilation factors for dynamic branch layers.
+            tcn_static_dilations: Dilation factors for static branch layers.
+            dt: The time step (delta time) in seconds, crucial for the filter's
+                integration steps.
+            separable: Whether to use Depthwise Separable Convolutions in TCN.
+        """
         super().__init__(
             tcn_input_size=tcn_input_size,
             tcn_channels=tcn_num_channels,
             kernel_size=tcn_kernel_size,
             dropout=tcn_dropout,
             device=device,
-            tcn_dilation_factors=tcn_dilation_factors,
+            tcn_backbone_dilations=tcn_backbone_dilations,
+            tcn_dynamic_dilations=tcn_dynamic_dilations,
+            tcn_static_dilations=tcn_static_dilations,
             dt=dt,
             loop_type="open",
             separable=separable,

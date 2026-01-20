@@ -9,31 +9,58 @@ ESKF::ESKF(float dt) : dt_(dt) {
     P_.setIdentity();
     P_ *= 0.1f;
 
-    // Process noise from Allan Variance analysis (2025-12-29)
-    float vrw = 8.1255e-4f;
-    float arw = 7.5427e-5f;
-    float accel_bi = 2.9840e-4f;
-    float gyro_bi = 1.8947e-5f;
+    // Process noise from Allan Variance analysis (per-axis from Python config.py)
+    // VRW: Velocity Random Walk (accel noise) - m/s²/√Hz
+    // ARW: Angular Random Walk (gyro noise) - rad/√Hz
+    // Bias Instability: long-term drift parameters
+    float vrw_x = 8.3297e-3f, vrw_y = 6.7196e-3f, vrw_z = 9.3271e-3f;
+    float arw_x = 7.1664e-4f, arw_y = 7.9283e-4f, arw_z = 7.5335e-4f;
+    float gyro_bi_x = 1.6441e-4f, gyro_bi_y = 2.8196e-4f, gyro_bi_z = 1.2203e-4f;
+    float accel_bi_x = 4.3723e-3f, accel_bi_y = 1.7697e-3f, accel_bi_z = 2.8099e-3f;
 
     Q_diag_.setZero();
-    Q_diag_.segment<3>(3).setConstant(vrw * vrw);
-    Q_diag_.segment<3>(6).setConstant(arw * arw);
-    Q_diag_.segment<3>(9).setConstant(gyro_bi * gyro_bi);
-    Q_diag_.segment<3>(12).setConstant(accel_bi * accel_bi);
+    // Position noise: driven by velocity (set to 0)
+    Q_diag_.segment<3>(0).setZero();
+    // Velocity noise: from accelerometer VRW
+    Q_diag_(3) = vrw_x * vrw_x;
+    Q_diag_(4) = vrw_y * vrw_y;
+    Q_diag_(5) = vrw_z * vrw_z;
+    // Orientation noise: from gyroscope ARW
+    Q_diag_(6) = arw_x * arw_x;
+    Q_diag_(7) = arw_y * arw_y;
+    Q_diag_(8) = arw_z * arw_z;
+    // Gyro bias drift: from bias instability
+    Q_diag_(9) = gyro_bi_x * gyro_bi_x;
+    Q_diag_(10) = gyro_bi_y * gyro_bi_y;
+    Q_diag_(11) = gyro_bi_z * gyro_bi_z;
+    // Accel bias drift: from bias instability
+    Q_diag_(12) = accel_bi_x * accel_bi_x;
+    Q_diag_(13) = accel_bi_y * accel_bi_y;
+    Q_diag_(14) = accel_bi_z * accel_bi_z;
 
     zupt_noise_std_ = 0.01f;
     tcn_vel_noise_std_ = 0.05f;
 
-    gravity_w_ << 0.0f, 0.0f, 9.81f;
+    // Gravity in world frame: Z points UP, gravity pulls DOWN (negative Z)
+    // This matches Python: gravity_w = [0, 0, -9.80665]
+    gravity_w_ << 0.0f, 0.0f, -9.80665f;
 
-    mahalanobis_gate_threshold_ = 20.0f;
+    // Mahalanobis gating threshold (matches Python config)
+    mahalanobis_gate_threshold_ = 8.0f;
 }
 
 void ESKF::initialize(const Eigen::Vector3f& accel_init) {
+    // When stationary, accelerometer measures reaction to gravity: -g_world in body frame
+    // With gravity_w = [0, 0, -9.81], if device is flat, accel reads [0, 0, +9.81]
+    // We need to find quaternion q such that: q * accel_body = gravity_w
+    // i.e., rotate body frame to align with world frame where gravity points -Z
     Eigen::Vector3f accel_norm = accel_init.normalized();
-    Eigen::Vector3f target_up = Eigen::Vector3f::UnitZ();
+    Eigen::Vector3f gravity_dir = -Eigen::Vector3f::UnitZ();  // Gravity direction in world: -Z
 
-    Eigen::Quaternionf q_init = Eigen::Quaternionf::FromTwoVectors(accel_norm, target_up);
+    // FromTwoVectors(a, b) gives quaternion that rotates a to b
+    // Here: rotate accel reading (which is -gravity_body) to align with -Z world
+    // accel measures -g_body, so we rotate -accel_norm to gravity_dir
+    Eigen::Quaternionf q_init = Eigen::Quaternionf::FromTwoVectors(-accel_norm, gravity_dir);
 
     state_.quat = q_init;
     state_.pos.setZero();
@@ -134,9 +161,19 @@ void ESKF::update_tcn_vel(const Eigen::Vector3f& vel_corr_body, const Eigen::Mat
     H.setZero();
     H.block<3, 3>(0, 3).setIdentity();
 
+    // Use TCN's adaptive R matrix (first 3 elements of R_params)
+    // Python applies: R_vel_diag = softplus(tcn_cov_raw[:, :3]) + 1e-4, clamped to [1e-4, 3.0]
     Eigen::Matrix3f R;
-    R.setIdentity();
-    R *= (tcn_vel_noise_std_ * tcn_vel_noise_std_);
+    R.setZero();
+    for (int i = 0; i < 3; i++) {
+        float val = R_params[i];
+        // Apply softplus: log(1 + exp(x))
+        float softplus_val = (val > 20.0f) ? val : std::log1p(std::exp(val));
+        // Add floor and clamp to valid range
+        float R_val = softplus_val + 1e-4f;
+        R_val = std::max(1e-4f, std::min(3.0f, R_val));
+        R(i, i) = R_val;
+    }
 
     Eigen::Vector3f innovation = vel_corr_w;
 
@@ -146,8 +183,10 @@ void ESKF::update_tcn_vel(const Eigen::Vector3f& vel_corr_body, const Eigen::Mat
 
     Eigen::Matrix<float, STATE_DIM, 1> delta_x = K * innovation;
 
+    // Joseph form for numerical stability (matches Python)
     Eigen::Matrix<float, STATE_DIM, STATE_DIM> I = Eigen::Matrix<float, STATE_DIM, STATE_DIM>::Identity();
-    P_ = (I - K * H) * P_;
+    Eigen::Matrix<float, STATE_DIM, STATE_DIM> ImKH = I - K * H;
+    P_ = ImKH * P_ * ImKH.transpose() + K * R * K.transpose();
 
     enforce_symmetry();
     inject_error(delta_x);
@@ -217,7 +256,13 @@ Eigen::Matrix<float, 6, 1> ESKF::update_imu(
 
 bool ESKF::check_zupt(const Eigen::Vector3f& accel_raw) {
     float norm = accel_raw.norm();
-    return std::abs(norm - 9.81f) < 0.3f; 
+    return std::abs(norm - 9.80665f) < 0.3f;
+}
+
+void ESKF::hard_reset_velocity() {
+    // Directly set velocity to zero (matches Python ESKF.py:901-908)
+    // Used when TCN is very confident about stationary state (zupt_prob >= 0.98)
+    state_.vel.setZero();
 }
 
 void ESKF::inject_error(const Eigen::Matrix<float, STATE_DIM, 1>& delta_x) {

@@ -16,6 +16,11 @@ docs/
 .DS_Store
 CLAUDE.md
 GEMINI.md
+runs/
+acquired_data_long/
+checkpoints/
+hpo_checkpoints/
+firmware/.cache/
 
 # Virtual environments
 .venv

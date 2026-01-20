@@ -74,6 +74,7 @@ void TCNWrapper::extract_features(
     out_features.resize(kInputSize);
     const auto& state = eskf.get_state();
 
+    // Z-score normalization for IMU data (matches Python)
     float norm_accel[3];
     float norm_gyro[3];
     float norm_force;
@@ -83,37 +84,62 @@ void TCNWrapper::extract_features(
     norm_force = (force_raw - IMU_MEAN[6]) / IMU_STD[6];
 
     Eigen::Matrix3f R_bw = state.quat.toRotationMatrix();
-    Eigen::Vector3f gravity_b = R_bw.transpose() * Eigen::Vector3f::UnitZ();
+    Eigen::Matrix3f R_wb = R_bw.transpose();
 
-    Eigen::Vector3f vel_b_linear = R_bw.transpose() * state.vel;
+    // Gravity in body frame: use world gravity vector (negative Z) rotated to body
+    // Python: gravity_b_raw = rot_mat_w_to_b @ gravity_w, then scale by GRAVITY_NORM_SCALE
+    Eigen::Vector3f gravity_w(0.0f, 0.0f, -GRAVITY_MAGNITUDE);  // Gravity points down in world
+    Eigen::Vector3f gravity_b_raw = R_wb * gravity_w;
+    Eigen::Vector3f gravity_b_norm = (gravity_b_raw / GRAVITY_MAGNITUDE) * GRAVITY_NORM_SCALE;
 
+    // Pen tip velocity in body frame
+    Eigen::Vector3f vel_b_linear = R_wb * state.vel;
     Eigen::Vector3f gyro_corr = gyro_raw - state.gyro_bias;
     Eigen::Vector3f offset;
     offset << PEN_TIP_OFFSET[0], PEN_TIP_OFFSET[1], PEN_TIP_OFFSET[2];
     Eigen::Vector3f vel_tangential = gyro_corr.cross(offset);
-
     Eigen::Vector3f pen_tip_vel_b = vel_b_linear + vel_tangential;
 
-    for (int i=0; i<3; i++) pen_tip_vel_b[i] = std::tanh(pen_tip_vel_b[i]);
+    // ISOTROPIC velocity normalization (matches Python)
+    // Python uses: pen_tip_vel_b / (VEL_STD_L2 + 1e-3)
+    Eigen::Vector3f pen_tip_vel_b_norm = pen_tip_vel_b / (VEL_STD_L2 + 1e-3f);
 
-    Eigen::Matrix<float, 6, 1> inn_squashed;
-    for (int i=0; i<6; i++) inn_squashed[i] = std::tanh(last_innovation[i]);
+    // Innovation normalization using Allan variance (matches Python)
+    // Accel channels (0-2): normalize by max VRW
+    // Gyro channels (3-5): normalize by max ARW
 
+    Eigen::Matrix<float, 6, 1> innovation_norm;
+    for (int i = 0; i < 3; i++) {
+        float val = last_innovation(i) / (MAX_VRW + 1e-3f);
+        innovation_norm(i) = std::max(-INNOVATION_CLAMP_RANGE, std::min(INNOVATION_CLAMP_RANGE, val));
+    }
+    for (int i = 3; i < 6; i++) {
+        float val = last_innovation(i) / (MAX_ARW + 1e-3f);
+        innovation_norm(i) = std::max(-INNOVATION_CLAMP_RANGE, std::min(INNOVATION_CLAMP_RANGE, val));
+    }
+
+    // Build feature vector (order matches Python: base_hybrid_model.py:447-456)
     int idx = 0;
+    // 1. gyro_b_norm [3]
     out_features[idx++] = norm_gyro[0];
     out_features[idx++] = norm_gyro[1];
     out_features[idx++] = norm_gyro[2];
+    // 2. accel_b_norm [3]
     out_features[idx++] = norm_accel[0];
     out_features[idx++] = norm_accel[1];
     out_features[idx++] = norm_accel[2];
+    // 3. force_norm [1]
     out_features[idx++] = norm_force;
-    out_features[idx++] = pen_tip_vel_b[0];
-    out_features[idx++] = pen_tip_vel_b[1];
-    out_features[idx++] = pen_tip_vel_b[2];
-    out_features[idx++] = gravity_b[0];
-    out_features[idx++] = gravity_b[1];
-    out_features[idx++] = gravity_b[2];
-    for (int i=0; i<6; i++) out_features[idx++] = inn_squashed[i];
+    // 4. pen_tip_vel_b_norm [3] - isotropic normalized
+    out_features[idx++] = pen_tip_vel_b_norm(0);
+    out_features[idx++] = pen_tip_vel_b_norm(1);
+    out_features[idx++] = pen_tip_vel_b_norm(2);
+    // 5. gravity_b_norm [3] - scaled unit vector
+    out_features[idx++] = gravity_b_norm(0);
+    out_features[idx++] = gravity_b_norm(1);
+    out_features[idx++] = gravity_b_norm(2);
+    // 6. innovation_norm [6] - Allan variance normalized, clamped
+    for (int i = 0; i < 6; i++) out_features[idx++] = innovation_norm(i);
 }
 
 TCNOutput TCNWrapper::process_step(

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from model.TCN import TCN
 from model.config import Config
 
@@ -111,5 +112,11 @@ class StatefulTCNExport(nn.Module):
             max=5.0
         )
         zupt_p = self.output_heads["zupt_prob"](final_feature)
+        # Apply sigmoid to convert logits to probability [0, 1]
+        zupt_p = torch.sigmoid(zupt_p)
 
-        return (vel_corr, cov_R, zupt_p), tuple(new_states)
+        # Gravity direction in body frame (unit vector for attitude correction)
+        gravity_b = self.output_heads["gravity_b"](final_feature)
+        gravity_b = F.normalize(gravity_b, p=2, dim=-1, eps=1e-6)
+
+        return (vel_corr, cov_R, zupt_p, gravity_b), tuple(new_states)

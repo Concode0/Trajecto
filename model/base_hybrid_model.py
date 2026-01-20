@@ -1,7 +1,7 @@
 """
 Base class for hybrid Kalman Filter-TCN models.
 
-Defines common architecture for ESKF/AEKF-TCN hybrid systems with
+Defines common architecture for ESKF-TCN hybrid system with
 configurable closed-loop or open-loop TCN correction integration.
 """
 
@@ -25,8 +25,8 @@ class BaseFilterTCNModel(nn.Module):
     """Base class for a hybrid Kalman Filter-TCN model architecture.
 
     This class sets up the common structure for models that integrate a
-    state-estimation filter (like an ESKF or AEKF) with a Temporal
-    Convolutional Network (TCN). The filter operates step-by-step on raw
+    state-estimation filter (ESKF) with a Temporal Convolutional Network
+    (TCN). The filter operates step-by-step on raw
     sensor data, while the TCN processes a sliding window of features
     derived from the filter's output. The TCN's predictions (e.g., velocity
     corrections, adaptive noise parameters, ZUPT probabilities) can then be
@@ -41,7 +41,6 @@ class BaseFilterTCNModel(nn.Module):
         filter (nn.Module): Placeholder for the specific Kalman filter
             implementation (e.g., ESKF, AEKF), to be instantiated by subclasses.
         tcn (TCN): The Temporal Convolutional Network used for feature processing.
-        input_norm_layer (nn.LayerNorm): Layer normalization applied to TCN inputs.
         pen_tip_offset_b (nn.Parameter): Learnable offset from IMU to pen tip in body frame.
         initial_pen_tip_offset_b (torch.Tensor): Initial constant offset for regularization.
         gravity_w (torch.Tensor): Constant gravity vector in world frame.
@@ -54,7 +53,9 @@ class BaseFilterTCNModel(nn.Module):
         kernel_size: int = 3,
         dropout: float = 0.1,
         device: str = "cpu",
-        tcn_dilation_factors: Optional[List[int]] = None,
+        tcn_backbone_dilations: Optional[List[int]] = None,
+        tcn_dynamic_dilations: Optional[List[int]] = None,
+        tcn_static_dilations: Optional[List[int]] = None,
         dt: float = 0.01,
         loop_type: str = "closed",
         separable: bool = False,
@@ -68,8 +69,9 @@ class BaseFilterTCNModel(nn.Module):
             kernel_size: The kernel size for TCN convolutions.
             dropout: The dropout rate applied within the TCN for regularization.
             device: The computation device ('cpu', 'cuda', 'mps').
-            tcn_dilation_factors: Optional list of dilation factors for each
-                TCN layer. If None, default dilation factors are used.
+            tcn_backbone_dilations: Dilation factors for shared backbone layers.
+            tcn_dynamic_dilations: Dilation factors for dynamic branch layers.
+            tcn_static_dilations: Dilation factors for static branch layers.
             dt: The time step (delta time) in seconds, crucial for the filter's
                 integration steps.
             loop_type: Defines how TCN corrections are applied.
@@ -90,7 +92,9 @@ class BaseFilterTCNModel(nn.Module):
             tcn_channels=tcn_channels,
             kernel_size=kernel_size,
             dropout=dropout,
-            tcn_dilation_factors=tcn_dilation_factors,
+            tcn_dilation_factors=tcn_backbone_dilations,
+            dynamic_dilations=tcn_dynamic_dilations,
+            static_dilations=tcn_static_dilations,
             separable=separable,
         )
 
@@ -112,11 +116,14 @@ class BaseFilterTCNModel(nn.Module):
         # Register normalization constants as buffers (optimization)
         # These are created once and automatically moved to device, avoiding
         # repeated tensor creation in the forward loop
-        # NOTE: vel_mean is NOT registered because body-frame velocity normalization
-        #       only uses std (mean subtraction would be incorrect due to frame rotation)
+        #
+        # ISOTROPIC velocity normalization: Use L2 norm of std vector
+        # Rationale: Per-axis normalization caused 10x Z-axis amplification
+        # (VEL_STD_Z = 0.0106 vs VEL_STD_X = 0.112), drowning X/Y detail
+        # Isotropic scaling preserves relative magnitudes across all axes
         self.register_buffer(
-            "vel_std",
-            torch.tensor(Config.VEL_STD, device=device, dtype=torch.float32)
+            "vel_std_isotropic",
+            torch.tensor(Config.VEL_STD_L2, device=device, dtype=torch.float32)
         )
 
         # Register measurement noise std from Allan variance (for innovation normalization)
@@ -135,6 +142,14 @@ class BaseFilterTCNModel(nn.Module):
                         device=device, dtype=torch.float32)
         )
 
+        # Innovation clamp range to prevent explosion (gyro can reach 100+ otherwise)
+        self.innovation_clamp = Config.INNOVATION_CLAMP_RANGE
+
+        # Gravity scaling factor to match z-score feature range
+        # Unit-normalized gravity is in [-1, +1], z-score features are in [-3, +3]
+        # Scale by 2.0 to better match magnitudes
+        self.gravity_scale = Config.GRAVITY_NORM_SCALE
+
     def get_pen_tip_regularization_loss(self) -> torch.Tensor:
         """Regularizes pen tip offset to maintain physical plausibility.
 
@@ -142,6 +157,20 @@ class BaseFilterTCNModel(nn.Module):
             L2 norm of deviation from initial physical measurement.
         """
         return torch.norm(self.pen_tip_offset_b - self.initial_pen_tip_offset_b)
+
+    def set_current_epoch(self, epoch: int) -> None:
+        """Sets the current training epoch for warmup scheduling.
+
+        This propagates the epoch to submodules (e.g., ESKF) that use it
+        for features like gravity alignment warmup.
+
+        Args:
+            epoch: Current training epoch (0-indexed).
+        """
+        self._current_epoch = epoch
+        # Propagate to filter if it exists
+        if self.filter is not None:
+            self.filter._current_epoch = epoch
 
     def _initialize_state(
         self,
@@ -152,7 +181,7 @@ class BaseFilterTCNModel(nn.Module):
         """Abstract method to initialize the filter's state and covariance.
 
         Subclasses must implement this method to provide initial conditions
-        for their specific Kalman filter (e.g., ESKF or AEKF).
+        for the Kalman filter (ESKF).
 
         Args:
             batch_size: The number of sequences in the current batch.
@@ -292,6 +321,7 @@ class BaseFilterTCNModel(nn.Module):
         pred_vel_resid_b_seq: List[torch.Tensor] = []
         pred_zupt_prob_seq: List[torch.Tensor] = []
         pred_covariance_R_seq: List[torch.Tensor] = []
+        pred_gravity_b_seq: List[torch.Tensor] = []  # TCN-predicted gravity direction
         filter_vel_w_seq: List[torch.Tensor] = []
         filter_innovation_seq: List[torch.Tensor] = []
 
@@ -309,6 +339,12 @@ class BaseFilterTCNModel(nn.Module):
             batch_size, seq_len, dtype=torch.bool, device=self.device
         )
 
+        # --- TCN Warm-Start ---
+        # Pre-fill feature buffer with first feature after t=0 to provide
+        # meaningful context when TCN starts. Without this, early TCN windows
+        # would contain zeros, reducing prediction quality.
+        first_feature_stored = False
+
         # Iterate through the sequence, applying the filter step by step.
         for t in range(seq_len):
             # Extract raw IMU data for the current time step.
@@ -325,13 +361,17 @@ class BaseFilterTCNModel(nn.Module):
 
                 # Get predictions from the TCN. The TCN typically outputs a sequence
                 # of corrections/parameters; we take the latest prediction.
-                tcn_output_seq = self.tcn(tcn_input_window)
-                tcn_output = {k: v[:, -1, :] for k, v in tcn_output_seq.items()}
+                tcn_output_seq = self.tcn(
+                    tcn_input_window,
+                )
+                tcn_output = {k: v[:, -1, :] if v.dim() == 3 else v[:, -1] for k, v in tcn_output_seq.items()}
 
                 # Store TCN predictions for later use or loss calculation.
                 pred_vel_resid_b_seq.append(tcn_output["vel_corr"])
                 pred_zupt_prob_seq.append(tcn_output["zupt_prob"])
                 pred_covariance_R_seq.append(tcn_output["covariance_R"])
+                if "gravity_b" in tcn_output:
+                    pred_gravity_b_seq.append(tcn_output["gravity_b"])
                 tcn_output_mask[:, t] = True
 
             # Perform one step of the Kalman filter (prediction and update).
@@ -368,7 +408,10 @@ class BaseFilterTCNModel(nn.Module):
             gravity_b_raw = (
                 rot_mat_w_to_b_t @ self.gravity_w.expand(batch_size, -1).unsqueeze(-1)
             ).squeeze(-1)
-            gravity_b_norm = gravity_b_raw / Config.GRAVITY_MAGNITUDE  # Normalize by magnitude of gravity
+            # Unit normalize (÷ g) then scale to match z-score feature range
+            # Unit-normalized gravity is in [-1, +1], z-score features are in [-3, +3]
+            # Scale by GRAVITY_NORM_SCALE (2.0) to better match magnitudes
+            gravity_b_norm = (gravity_b_raw / Config.GRAVITY_MAGNITUDE) * self.gravity_scale
 
             # Calculate angular velocity and tangential velocity of pen tip.
             angular_velocity_b = gyro_b_raw - gyro_bias_b
@@ -378,15 +421,6 @@ class BaseFilterTCNModel(nn.Module):
             )
             # Combined pen tip velocity in body frame (filter's linear velocity + tangential).
             pen_tip_vel_b = tcn_features_from_filter["body_velocity"] + tangential_vel_b
-
-            # Normalize velocity by std only (not mean) because:
-            # 1. pen_tip_vel_b is in BODY frame (rotates with pen)
-            # 2. VEL_MEAN/STD are from WORLD frame ground truth
-            # 3. Body frame statistics are non-stationary due to rotation
-            # 4. Handwriting is approximately zero-mean in body frame (symmetric strokes)
-            # Use cached buffers (registered in __init__) - avoids repeated tensor creation
-            # Safety epsilon 1e-3: prevents numerical explosion if std corrupts (Z-axis std ~0.01)
-            pen_tip_vel_b_norm = pen_tip_vel_b / (self.vel_std + 1e-3)
 
             # Normalize innovation by MEASUREMENT NOISE (not empirical drift-contaminated stats)
             # Theoretical foundation: In well-calibrated KF, innovation ~ N(0, R)
@@ -400,24 +434,39 @@ class BaseFilterTCNModel(nn.Module):
             # This is theoretically principled and independent of drift
             # Use cached buffers for measurement noise std (registered in __init__)
             # Safety epsilon 1e-3: prevents numerical explosion (ARW ~7e-4, VRW ~9e-3)
-            innovation_norm = raw_innovation / (self.measurement_noise_std + 1e-3)
+            # CLAMP to prevent explosion: gyro innovation can reach 100+ during motion
+            innovation_norm = torch.clamp(
+                raw_innovation / (self.measurement_noise_std + 1e-3),
+                min=-self.innovation_clamp,
+                max=self.innovation_clamp
+            )
 
             # Construct the comprehensive TCN input vector for this time step.
             # Note: zupt_flag removed to avoid circular dependency when using TCN-based ZUPT
             # All features now use z-score normalization (preserves magnitude info)
+            # Removed pen_tip_vel_b_norm (state-related feature) as requested.
             tcn_input_vec = torch.cat(
                 [
-                    gyro_b_norm_t,           # [3] - Already z-score normalized
-                    accel_b_norm_t,          # [3] - Already z-score normalized
-                    force_norm_t,            # [1] - Already z-score normalized
-                    pen_tip_vel_b_norm,      # [3] - Z-score normalized (not squashed!)
-                    gravity_b_norm,          # [3] - Unit normalized (÷ g)
-                    innovation_norm,         # [6] - Z-score normalized (not squashed!)
+                    gyro_b_norm_t,           # [3] - Z-score normalized
+                    accel_b_norm_t,          # [3] - Z-score normalized
+                    force_norm_t,            # [1] - Z-score normalized
+                    gravity_b_norm,          # [3] - Scaled unit vector (÷ g × 2.0)
+                    innovation_norm,         # [6] - Allan variance normalized, clamped
                 ],
                 dim=-1,
             )
             # Store the constructed feature vector.
             tcn_feature_seq[:, t, :] = tcn_input_vec
+
+            # TCN Warm-Start: after first feature, pre-fill buffer for warm context
+            # This ensures TCN receives meaningful features (not zeros) when it starts
+            if not first_feature_stored:
+                # Fill positions 1 to RF-1 with first feature (position 0 already set)
+                # Later timesteps will naturally overwrite with actual features
+                tcn_feature_seq[:, 1:receptive_field, :] = tcn_input_vec.unsqueeze(1).expand(
+                    -1, receptive_field - 1, -1
+                )
+                first_feature_stored = True
 
             # Log current position and quaternion from the filter for final trajectory calculation.
             positions_w_seq.append(pos_w)
@@ -470,18 +519,16 @@ class BaseFilterTCNModel(nn.Module):
         # Note: If TCN predicts R as a full matrix, final_dim would be different.
         # Assuming diagonal elements or specific covariance parameterization.
         pred_covariance_R = pad_sequence(pred_covariance_R_seq, 6, imu_data_raw.dtype)
+        pred_gravity_b = pad_sequence(pred_gravity_b_seq, 3, imu_data_raw.dtype)  # Gravity direction
         filter_innovation = pad_sequence(filter_innovation_seq, 6, imu_data_raw.dtype)
         stacked_filter_vel_w = torch.stack(filter_vel_w_seq, dim=1)
         
         # Pad and stack P_error sequence
-        # Determine covariance shape dynamically from filter type
-        # ESKF uses error_state_dim (15), AEKF uses state_dim (16)
+        # ESKF uses error_state_dim (15)
         if hasattr(self.filter, 'error_state_dim'):
-            dim = self.filter.error_state_dim  # ESKF
-        elif hasattr(self.filter, 'state_dim'):
-            dim = self.filter.state_dim  # AEKF
+            dim = self.filter.error_state_dim
         else:
-            dim = 15  # Fallback to ESKF default
+            dim = 15  # ESKF default
 
         cov_shape = (dim, dim)
         if P_error_seq:
@@ -537,6 +584,7 @@ class BaseFilterTCNModel(nn.Module):
             "pred_vel_resid_b": pred_vel_resid_b,
             "pred_zupt_prob": pred_zupt_prob,
             "pred_covariance_R": pred_covariance_R,
+            "pred_gravity_b": pred_gravity_b,  # TCN-predicted gravity direction for loss
             "filter_vel_w": stacked_filter_vel_w,
             "filter_quat": quaternions_b_to_w,
             "filter_innovation": filter_innovation,

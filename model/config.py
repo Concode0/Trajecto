@@ -11,34 +11,33 @@ This will recompute velocity and innovation statistics from the dataset.
 class Config:
     """Configuration class for trajectory estimation models."""
 
+    # --- Data Paths ---
+    DATASET_H5_PATH = "data/dataset.h5"
+    VALIDATION_DATASET_H5_PATH = "data/validation_dataset.h5"
+    SCALER_STATS_H5_PATH = "data/scaler_stats.h5"
+
     # --- Global Training Parameters ---
     TARGET_SAMPLING_RATE_HZ = 50.107  # Target sampling rate (Hz) for data acquisition and model
     DT = 1.0 / TARGET_SAMPLING_RATE_HZ  # Time delta (s) for model integration (50.107 Hz = 0.019957291396 s)
-    INITIAL_PEN_TIP_OFFSET = [0.0, -0.06, 0.0] # [x, y, z] offset from IMU to pen tip (m)
+    INITIAL_PEN_TIP_OFFSET = [0.0, -0.06, 0.0] # [x, y, z] offset from IMU to pen tip (m), check IMU's Axis from Datasheet
 
-    # --- Dataset Parameters ---
-    DATASET_H5_PATH = "./data/dataset.h5"
-    VALIDATION_DATASET_H5_PATH = "./data/dataset.h5"
-    AUGMENT_MULTIPLIER = 1
-    SUBSAMPLE_STEP = 1
-    DO_AUGMENT = True
-    YAW_ANGLE = (-0.78, 0.78)   # Set small angle in first and increase when fine tunning.
+    # --- Data Augmentation Parameters ---
+    YAW_RANGE = (-0.78, 0.78)   # Set small angle in first and increase when fine tunning.
     SIGMA_TILT = 0.02           # Same ( Don't increase too large (0.02 ~ 0.52))
-    SCALER_STATS_H5_PATH = "./data/scaler_stats.h5"
 
-    # --- ZUPT Parameters (used by ESKF and AEKF) ---
+    # --- ZUPT Parameters (used by ESKF) ---
     ZUPT_WINDOW_SIZE = 20
-    ZUPT_ACCEL_THRESHOLD = 0.1430  # Optimized from GT analysis: 92% ZUPT coverage, 51% moving rejection (was: 0.5)
-    ZUPT_FORCE_VAR_THRESHOLD = 36660  # Optimized from GT analysis: 90% ZUPT coverage, 18% moving rejection (was: 100000)
-    ZUPT_FORCE_DELTA_THRESHOLD = 154  # Optimized from GT analysis: 87% ZUPT coverage, 20% moving rejection (was: 2000)
+    ZUPT_ACCEL_THRESHOLD = 0.1430  # Optimized: 92% ZUPT coverage, 51% moving rejection
+    ZUPT_FORCE_VAR_THRESHOLD = 36660  # Optimized: 90% ZUPT coverage, 18% moving rejection
+    ZUPT_FORCE_DELTA_THRESHOLD = 154  # Optimized: 87% ZUPT coverage, 20% moving rejection
 
-    # --- Allan Variance Noise Parameters (used by ESKF and AEKF) ---
+    # --- Allan Variance Noise Parameters (used by ESKF) ---
 
     # Base values from Allan variance analysis (empirical measurements)
-    ARW_X, ARW_Y, ARW_Z = 7.1664e-04, 7.9283e-04, 7.5335e-04
-    GYRO_BI_X, GYRO_BI_Y, GYRO_BI_Z = 1.6441e-04, 2.8196e-04, 1.2203e-04
-    VRW_X, VRW_Y, VRW_Z = 8.3297e-03, 6.7196e-03, 9.3271e-03
-    ACCEL_BI_X, ACCEL_BI_Y, ACCEL_BI_Z = 4.3723e-03, 1.7697e-03, 2.8099e-03
+    ARW_X, ARW_Y, ARW_Z = 7.1664e-05, 7.9283e-05, 7.5335e-05
+    GYRO_BI_X, GYRO_BI_Y, GYRO_BI_Z = 1.6441e-05, 2.8196e-05, 1.2203e-05
+    VRW_X, VRW_Y, VRW_Z = 8.3297e-04, 6.7196e-04, 9.3271e-04
+    ACCEL_BI_X, ACCEL_BI_Y, ACCEL_BI_Z = 4.3723e-04, 1.7697e-04, 2.8099e-04
 
     # --- Physical Constants ---
     GRAVITY_MAGNITUDE = 9.80665  # Standard gravity (m/s²)
@@ -51,18 +50,26 @@ class Config:
     # Last updated: 2026-01-05
     # =========================================================================
 
-    # --- Velocity Statistics ---
-    # Per-axis mean and standard deviation from ground truth velocities (WORLD frame)
-    # NOTE: VEL_MEAN is NOT used for body-frame velocity normalization (frame mismatch)
-    #       Only VEL_STD is used for scaling body-frame velocities
-    VEL_MEAN = [0.013089556969932, -0.008355271130136, -0.000882682535667]  # m/s [x, y, z] - WORLD frame (diagnostic only)
-    VEL_STD = [0.111915624833814, 0.102708548431423, 0.010636343964785]     # m/s [x, y, z] - used for BODY frame scaling
-    VEL_STD_L2 = 0.152273716759559  # L2 norm of std vector (m/s)
+    # --- Velocity Statistics (from ground truth) ---
+    # L2 norm of per-axis velocity std, used for isotropic body-frame normalization
+    VEL_STD_L2 = 0.152273716759559  # m/s
 
-    # Velocity correction scale (2σ for ~95% coverage, ISOTROPIC)
-    # Used to denormalize TCN velocity correction output: tanh(output) * VEL_CORRECTION_SCALE
-    # Isotropic scaling preserves directional accuracy across all axes
-    VEL_CORRECTION_SCALE = 0.304547433519118  # m/s (isotropic)
+    # Velocity correction scale for log1p activation
+    # With log1p: output = sign(x) * log1p(|x|) * scale
+    # To achieve 0.3 m/s correction: log1p(raw) * scale = 0.3
+    # With raw=2.0 (typical network output): log1p(2) ≈ 1.1, so scale ≈ 0.27
+    # Increased to 0.5 to allow larger corrections with moderate raw outputs
+    # Raw=1 → 0.35 m/s, Raw=3 → 0.69 m/s, Raw=5 → 0.90 m/s
+    VEL_CORRECTION_SCALE = 0.5  # m/s (tuned for log1p activation)
+
+    # --- Feature Normalization Constants ---
+    # Innovation clamp range: prevents gyro innovation from exploding (can reach 100+)
+    # Clamped to [-10, +10] to match z-score feature range while preserving signal
+    INNOVATION_CLAMP_RANGE = 10.0
+
+    # Gravity normalization scale: unit-normalized gravity is in [-1, +1]
+    # Z-score features are typically in [-3, +3], so scale by 2.0 to match
+    GRAVITY_NORM_SCALE = 2.0
 
     # --- Innovation Normalization ---
     # Innovation is normalized using Allan variance (VRW/ARW) from theoretical sensor noise.
@@ -72,49 +79,155 @@ class Config:
 
     # --- Model Specific Parameters ---
     class ESKFTCN:
-        TCN_INPUT_SIZE = 19
-        TCN_CHANNELS = [64, 64, 64, 64]
-        KERNEL_SIZE = 5
-        DROPOUT = 0.1
-        TCN_DILATION_FACTORS = [1, 4, 8, 16] # Added TCN Dilation Factors
-        USE_ZUPT = False  # Classic threshold-based ZUPT disabled (TCN handles ZUPT detection)
-        USE_TCN_ZUPT = True  # TCN predicts zupt_prob directly from physics features
-        ADAPTIVE_GAIN_ESKF = 0.5 # Specific to ESKF's R adaptivity
-        # Initial standard deviation for ZUPT measurement noise in ESKF.
-        ZUPT_NOISE_STD_ESKF = [0.01, 0.01, 0.01]
-        # Hard velocity reset threshold: when zupt_prob >= this value, directly set velocity to zero
-        ZUPT_HARD_RESET_THRESHOLD = 0.98
-        # Whether to use Depthwise Separable Convolutions in TCN for ESKFTCN.
+        # TCN Architecture
+        TCN_INPUT_SIZE = 16
+        TCN_CHANNELS = [96, 96, 96, 96]
+        KERNEL_SIZE = 3
+        DROPOUT = 0.15
+        # Split dilations for Y-branch architecture
+        TCN_BACKBONE_DILATIONS = [1, 2]
+        TCN_DYNAMIC_DILATIONS = [1, 2]
+        TCN_STATIC_DILATIONS = [4, 8]
         USE_SEPARABLE_CONV = False
-        # Mahalanobis distance threshold for measurement gating (Chi-square dist, dof=6, p=0.99 => ~16.8)
-        MAHALANOBIS_GATE_THRESHOLD = 16.8
-        # Hard clipping range for TCN velocity correction output (m/s)
+
+        # ZUPT Configuration
+        USE_ZUPT = False  # Classic threshold-based ZUPT
+        USE_TCN_ZUPT = True  # TCN-predicted ZUPT
+        ZUPT_NOISE_STD_ESKF = [0.01, 0.01, 0.01]
+        # Gradual velocity decay parameters (replaces hard reset)
+        # decay_weight = clamp((zupt_prob - onset) / (1 - onset), 0, 1) ^ exponent
+        ZUPT_DECAY_ONSET = 0.5      # Start decay when zupt_prob > this value
+        ZUPT_DECAY_EXPONENT = 2.0   # Quadratic decay for smooth onset
+
+        # Filter Parameters
+        ADAPTIVE_GAIN_ESKF = 0.5
+        MAHALANOBIS_GATE_THRESHOLD = 30
         VEL_CORR_CLIP_RANGE = 5.0
 
-    class AEKFTCN:
-        TCN_INPUT_SIZE = 19  # Reduced from 20: removed zupt_flag to avoid circular dependency
-        TCN_OUTPUT_SIZE = 3 # Only predict 3D velocity residual
-        TCN_NUM_CHANNELS = [64, 64, 64, 64]
-        TCN_KERNEL_SIZE = 3
-        TCN_DROPOUT = 0.2
-        TCN_DILATION_FACTORS = [1, 2, 4, 8] # Added TCN Dilation Factors
-        ADAPTIVE_R_FACTOR_AEKF = 0.1 # Specific to AEKF's R adaptivity
-        ZUPT_R_FACTOR_AEKF = 1e-6 # Specific to AEKF's ZUPT R
-        # Initial standard deviation for ZUPT measurement noise in AEKF.
-        ZUPT_NOISE_STD_AEKF = [0.01, 0.01, 0.01]
-        # Whether to use Depthwise Separable Convolutions in TCN for AEKFTCN.
-        USE_SEPARABLE_CONV = False
+        # ESKF Learnable Parameters (BPTT Control)
+        # Set to False to disable backpropagation through ESKF parameters for faster training
+        # This makes R_diag, zupt_noise_std, and virtual_meas_weights fixed (non-learnable)
+        ESKF_LEARNABLE_PARAMS = True
 
+        # Virtual Measurement Correction Weights (for blind period / pure ESKF mode)
+        # These are learnable but initialized from Allan variance ratios:
+        #   orientation_weight ∝ 1/ARW (need stronger correction for noisier gyro)
+        #   gyro_bias_weight ∝ 1/GYRO_BI (stronger for faster-drifting bias)
+        #   accel_bias_weight ∝ 1/ACCEL_BI
+        # Computed: ARW_mean ≈ 7.5e-4, GYRO_BI_mean ≈ 1.9e-4, ACCEL_BI_mean ≈ 2.9e-3
+        # Ratios normalized to ~10x baseline for numerical stability
+        VIRTUAL_MEAS_WEIGHT_ORIENTATION = 13.3  # 1/(ARW_mean * 100)
+        VIRTUAL_MEAS_WEIGHT_GYRO_BIAS = 5.3     # 1/(GYRO_BI_mean * 1000)
+        VIRTUAL_MEAS_WEIGHT_ACCEL_BIAS = 3.4    # 1/(ACCEL_BI_mean * 100)
 
-    class OnlyTCN:
-        INPUT_SIZE = 7
-        OUTPUT_SIZE = 3
-        TCN_CHANNELS = [64, 64, 64, 64] # Default for OnlyTCN
-        KERNEL_SIZE = 3
-        DROPOUT = 0.1
+        # Gravity alignment for attitude correction
+        USE_GRAVITY_ALIGNMENT = True
+        # R scaling: during ZUPT, R = TCN_R * (STATIC/DYNAMIC)
+        GRAVITY_R_STATIC = 0.01
+        GRAVITY_R_DYNAMIC = 10.0  # Increased from 1.0: reduce trust in TCN gravity during motion
+        # Gating thresholds for accel magnitude (m/s²)
+        GRAVITY_ACCEL_MIN = 8.0
+        GRAVITY_ACCEL_MAX = 12.0
+        # Gravity alignment warmup: disable for first N epochs to let TCN stabilize
+        GRAVITY_WARMUP_EPOCHS = 5
+
+        # --- Quantization-Aware Training (QAT) ---
+        QAT_ENABLED = False  # Toggle QAT during training
+        QAT_BACKEND = "qnnpack"  # "qnnpack" for ARM, "fbgemm" for x86
+        QAT_START_EPOCH = 10  # Start QAT after N epochs of FP32 warmup
 
     # --- Loss Parameters ---
     class LOSS:
-        REG_WEIGHT_ESKF_TCN = 1e-5
-        REG_WEIGHT_AEKF_TCN = 1e-5
-        # No specific reg weight for OnlyTCN in current loss setup
+        REG_WEIGHT_ESKF_TCN = 1e-4  # Increased from 1e-7 to prevent TCN overfitting
+
+        # Gradient Conflict Resolution (Mutual Exclusivity)
+        USE_MUTUAL_EXCLUSIVITY = True  # Enable structural gradient conflict resolution
+        MAGNITUDE_MOVING_THRESHOLD = 0.01  # 10 mm/s - apply magnitude loss only above this
+        ZUPT_STATIC_THRESHOLD = 0.005  # 5 mm/s - apply ZUPT loss only below this
+        # Dead zone: 0.005 < vel < 0.01 reduces vel↔zupt gradient conflicts
+
+        # FFT Loss Configuration
+        USE_FFT_WINDOWING = True  # Apply Hann window to reduce spectral artifacts
+
+        # Context-Aware Direction Loss Configuration
+        GYRO_SENSITIVITY = 2.0  # Scaling factor for gyro magnitude
+        MAX_CONTEXT_WEIGHT = 3.0  # Cap to prevent extreme amplification (was unlimited 7x+)
+        # Example: gyro=1 rad/s → weight=3.0 (capped), gyro=0.5 → weight=2.0
+
+        # Initial loss weights (used before DWA warmup or as fallback)
+        INITIAL_MAG_WEIGHT = 1.0
+        INITIAL_COS_WEIGHT = 1.0
+        INITIAL_ZUPT_WEIGHT = 0.5
+        INITIAL_COV_WEIGHT = 0.1  # Increased from 0.01 to reduce disparity
+        INITIAL_FFT_WEIGHT = 0.5
+
+    # === Simulated Data Configuration ===
+    class SIMDATA:
+        DEFAULT_PATH = "data/simulated_dataset.h5"
+        DEFAULT_MIX_RATIO = 0.8  # Ratio of sim data in mixed training
+
+    # === Two-Stage Training Configuration ===
+    class TWO_STAGE:
+        # Stage 1: Sim pretrain (ESKF frozen)
+        STAGE1_EPOCHS = 150
+        STAGE1_LR = 1e-3
+        STAGE1_BATCH_SIZE = 32
+        STAGE1_ESKF_LEARNABLE = False
+
+        # Stage 2: Mixed fine-tune (ESKF unfrozen)
+        STAGE2_EPOCHS = 50
+        STAGE2_TCN_LR = 1e-5
+        STAGE2_ESKF_LR = 1e-6
+        STAGE2_BATCH_SIZE = 16
+        STAGE2_MIX_RATIO = 0.8
+
+    # === Delta Loss (Semi-Loop Closure) ===
+    class DELTA_LOSS:
+        ENABLED = True
+        WINDOW_SIZES = [25, 100, 250]  # timesteps (0.5s, 2s, 5s @ 50Hz)
+        WINDOW_WEIGHTS = [0.3, 0.4, 0.3]
+        STRIDE = 10
+        WEIGHT = 0.5  # Fixed weight, not affected by DWA
+
+    # === Motion Detection ===
+    class MOTION_DETECTION:
+        """Thresholds for motion/static detection in ESKF initialization and processing."""
+        GYRO_VAR_THRESHOLD = 0.002  # rad²/s² - variance threshold for static detection
+        ACCEL_NORM_DIFF_MAX_CLAMP = 20.0  # m/s² - max clamp for accel norm difference
+        FORCE_THRESHOLD_MOVING = 0.01  # Force sensor threshold for movement detection
+
+    # === Data Augmentation Noise ===
+    class AUGMENTATION_NOISE:
+        """Noise injection parameters for data augmentation."""
+        # Gyroscope noise multiplier (relative to base noise)
+        GYRO_NOISE_MULTIPLIER = 1.5
+        # Accelerometer noise base level (m/s²)
+        ACCEL_NOISE_BASE = 8.33e-3
+        # Gyroscope noise base level (rad/s)
+        GYRO_NOISE_BASE = 1.5e-3
+        # Force sensor noise (arbitrary units)
+        FORCE_NOISE_BASE = 0.5
+
+    # === Data Preprocessing ===
+    class PREPROCESSING:
+        """Constants for data acquisition and preprocessing pipeline."""
+        # Two-tap synchronization
+        ROI_MARGIN_S = 1.0  # seconds - margin around writing region
+        STATIC_BUFFER_S = 2.0  # seconds - static period before writing for initialization
+        # Force thresholds for segmentation (iPad units)
+        FORCE_THRESHOLD_START = 0.01
+        FORCE_THRESHOLD_END = 0.01
+        # Resampling and filtering
+        MEDIAN_FILTER_WINDOW = 3  # samples
+        SAVGOL_WINDOW = 11  # samples for Savitzky-Golay filter
+        SAVGOL_POLYORDER = 3  # polynomial order for Savitzky-Golay
+
+    # === Validation ===
+    class VALIDATION:
+        """Constants for model validation and metrics."""
+        # Sequence length validation
+        MIN_SEQUENCE_LENGTH = 10  # minimum valid sequence length (timesteps)
+        MAX_SEQUENCE_LENGTH = 2000  # maximum sequence length before truncation
+        # Tensor validation
+        EXPECTED_SENSOR_CHANNELS = 7  # [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, force]
+        EXPECTED_SPATIAL_DIMS = 3  # [x, y, z] for positions and velocities

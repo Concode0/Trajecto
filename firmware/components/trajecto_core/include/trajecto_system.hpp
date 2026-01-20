@@ -47,13 +47,17 @@ public:
             }
             current_step_prob = tcn_out.zupt_prob;
 
+            // Apply TCN velocity correction only when NOT in ZUPT (matches Python)
             if (!is_zupt) {
                 eskf_.update_tcn_vel(tcn_out.vel_corr, tcn_out.R_params);
             }
 
+            // Process R_params for IMU update
             for(int i=0; i<6; i++) {
                  float val = fast_softplus(tcn_out.R_params[i]);
-                 R_diag[i] = val + 1e-6f;
+                 // Clamp to valid range [1e-4, 3.0] (matches Python)
+                 val = std::max(1e-4f, std::min(3.0f, val + 1e-4f));
+                 R_diag[i] = val;
             }
         } else {
              current_step_prob = is_zupt ? 1.0f : 0.0f;
@@ -68,6 +72,12 @@ public:
 
         float mahalanobis_sq = 0.0f;
         last_innovation_ = eskf_.update_imu(accel, gyro, R_diag, &mahalanobis_sq);
+
+        // ZUPT Hard Reset: When TCN is very confident about stationary state,
+        // directly reset velocity to zero (matches Python ESKF.py:901-908)
+        if (tcn_out.valid && tcn_out.zupt_prob >= ZUPT_HARD_RESET_THRESHOLD) {
+            eskf_.hard_reset_velocity();
+        }
     }
 
     const NominalState& get_state() const { return eskf_.get_state(); }

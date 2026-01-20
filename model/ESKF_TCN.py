@@ -4,6 +4,8 @@ Convolutional Network for enhanced trajectory estimation.
 
 The TCN processes ESKF-derived features to predict velocity corrections,
 adaptive noise parameters, and ZUPT probabilities in closed-loop configuration.
+This model utilizes a Y-shaped TCN architecture with a shared backbone and
+separate branches for dynamic (motion) and static (ZUPT/gravity) features.
 """
 
 import os
@@ -27,6 +29,11 @@ class ESKFTCN_model(BaseFilterTCNModel):
 
     Combines ESKF error-state formulation with TCN-predicted corrections
     for velocity, adaptive noise, and ZUPT detection in closed-loop fashion.
+
+    Features:
+        - Y-shaped TCN Architecture: Split receptive fields for dynamic/static tasks.
+        - Jerk-Adapter Removed: TCN now learns motion dynamics directly via branches.
+        - Closed-Loop: TCN outputs feedback into ESKF state updates.
     """
 
     def __init__(
@@ -36,31 +43,34 @@ class ESKFTCN_model(BaseFilterTCNModel):
         kernel_size: int = Config.ESKFTCN.KERNEL_SIZE,
         dropout: float = Config.ESKFTCN.DROPOUT,
         device: str = "cpu",
-        tcn_dilation_factors: Optional[List[int]] = Config.ESKFTCN.TCN_DILATION_FACTORS,
+        tcn_backbone_dilations: Optional[List[int]] = Config.ESKFTCN.TCN_BACKBONE_DILATIONS,
+        tcn_dynamic_dilations: Optional[List[int]] = Config.ESKFTCN.TCN_DYNAMIC_DILATIONS,
+        tcn_static_dilations: Optional[List[int]] = Config.ESKFTCN.TCN_STATIC_DILATIONS,
         dt: float = Config.DT,
         use_zupt: bool = Config.ESKFTCN.USE_ZUPT,
         use_tcn_zupt: bool = Config.ESKFTCN.USE_TCN_ZUPT,
         separable: bool = Config.ESKFTCN.USE_SEPARABLE_CONV,
+        mahalanobis_threshold: float = Config.ESKFTCN.MAHALANOBIS_GATE_THRESHOLD,
+        eskf_learnable_params: bool = Config.ESKFTCN.ESKF_LEARNABLE_PARAMS,
     ):
         """Initializes the ESKF-TCN hybrid model.
 
         Args:
-            tcn_input_size: The number of features in the TCN input vector.
-            tcn_channels: A list specifying the number of channels (filters)
-                for each layer in the TCN.
-            kernel_size: The kernel size for TCN convolutions.
-            dropout: The dropout rate applied within the TCN for regularization.
-            device: The computation device ('cpu', 'cuda', 'mps').
-            tcn_dilation_factors: Optional list of dilation factors for each
-                TCN layer. If None, default dilation factors are used.
-            dt: The time step (delta time) in seconds, crucial for the filter's
-                integration steps.
-            use_zupt: A boolean flag indicating whether traditional ZUPT detection
-                and correction should be enabled in the ESKF.
-            use_tcn_zupt: A boolean flag. If True, the ZUPT decision within the
-                ESKF's forward pass is made based on the TCN's output (`zupt_prob`).
-                If False, the classic ZUPT detector in `ESKF` is used if `use_zupt` is True.
-            separable: Whether to use Depthwise Separable Convolutions in TCN.
+            tcn_input_size: Features in TCN input vector.
+            tcn_channels: Channel sizes for TCN layers [backbone*2, branch*2].
+            kernel_size: Convolution kernel size.
+            dropout: Dropout rate.
+            device: Computation device.
+            tcn_backbone_dilations: Dilations for shared backbone (feature extraction).
+            tcn_dynamic_dilations: Dilations for dynamic branch (velocity/motion).
+            tcn_static_dilations: Dilations for static branch (ZUPT/gravity).
+            dt: Time step (s).
+            use_zupt: Enable classic threshold-based ZUPT in ESKF.
+            use_tcn_zupt: Enable TCN-predicted ZUPT probability in ESKF.
+            separable: Use Depthwise Separable Convolutions.
+            mahalanobis_threshold: Threshold for Mahalanobis gating in ESKF.
+            eskf_learnable_params: Enable learnable ESKF parameters (R_diag, zupt_noise_std).
+                If False, parameters are fixed (faster training, no BPTT through ESKF).
         """
         super().__init__(
             tcn_input_size=tcn_input_size,
@@ -68,13 +78,17 @@ class ESKFTCN_model(BaseFilterTCNModel):
             kernel_size=kernel_size,
             dropout=dropout,
             device=device,
-            tcn_dilation_factors=tcn_dilation_factors,
+            tcn_backbone_dilations=tcn_backbone_dilations,
+            tcn_dynamic_dilations=tcn_dynamic_dilations,
+            tcn_static_dilations=tcn_static_dilations,
             dt=dt,
             loop_type="closed",
             separable=separable,
         )
         self.filter = ErrorStateKalmanFilter(
-            device=device, dt=dt, use_zupt=use_zupt, use_tcn_zupt=use_tcn_zupt
+            device=device, dt=dt, use_zupt=use_zupt, use_tcn_zupt=use_tcn_zupt,
+            mahalanobis_threshold=mahalanobis_threshold,
+            eskf_learnable_params=eskf_learnable_params
         )
 
     def _initialize_state(

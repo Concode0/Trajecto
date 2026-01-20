@@ -22,7 +22,22 @@ namespace trajecto {
     constexpr float IMU_MEAN[] = {2.78230069f, -2.68209409f, 4.19848411f, -0.16821001f, 0.33020652f, 0.23807174f, 3830.24641663f};
     constexpr float IMU_STD[] = {5.81654358f, 5.70299290f, 1.71116575f, 37.63273751f, 39.02173354f, 27.56065179f, 597.15314685f};
 
-    // Pen Tip Offset in Body Frame (x, y, z)
-    constexpr float PEN_TIP_OFFSET[] = {0.00000000f, 0.00000000f, 0.00000000f};
+    // Pen Tip Offset in Body Frame (x, y, z) - matches Python Config.INITIAL_PEN_TIP_OFFSET
+    constexpr float PEN_TIP_OFFSET[] = {0.0f, -0.06f, 0.0f};
+
+    // Velocity normalization (isotropic, from Python config)
+    constexpr float VEL_STD_L2 = 0.152273716759559f;
+
+    // Innovation normalization (Allan variance based, from Python config)
+    constexpr float MAX_VRW = 9.3271e-3f;  // max(VRW_X, VRW_Y, VRW_Z)
+    constexpr float MAX_ARW = 7.9283e-4f;  // max(ARW_X, ARW_Y, ARW_Z)
+    constexpr float INNOVATION_CLAMP_RANGE = 10.0f;
+
+    // Gravity normalization
+    constexpr float GRAVITY_MAGNITUDE = 9.80665f;
+    constexpr float GRAVITY_NORM_SCALE = 2.0f;
+
+    // ZUPT hard reset threshold (matches Python config)
+    constexpr float ZUPT_HARD_RESET_THRESHOLD = 0.98f;
 
 } // namespace trajecto

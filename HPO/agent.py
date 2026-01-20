@@ -133,13 +133,10 @@ class HPOAgent:
 
         # Build command with all HPO parameters
         cmd = [
-            sys.executable, "train.py",
-            "--model", str(params.get('model', 'eskf_tcn')),
+            sys.executable, "tune.py",
             "--lr", str(params['lr']),
             "--batch_size", str(int(params['batch_size'])),
             "--epochs", str(params['epochs']),
-            "--hpo_mode",  # Enable HPO output format
-            "--hpo_trial_id", trial_id,
         ]
 
         # Add optional HPO parameters if present
@@ -147,18 +144,12 @@ class HPOAgent:
             cmd.extend(["--mahalanobis_threshold", str(params['mahalanobis_threshold'])])
         if 'dropout' in params:
             cmd.extend(["--dropout", str(params['dropout'])])
-        if 'reg_weight' in params:
-            cmd.extend(["--reg_weight", str(params['reg_weight'])])
         if 'kernel_size' in params:
             cmd.extend(["--kernel_size", str(int(params['kernel_size']))])
         if 'tcn_channel_size' in params:
             cmd.extend(["--tcn_channel_size", str(int(params['tcn_channel_size']))])
         if 'num_tcn_layers' in params:
             cmd.extend(["--num_tcn_layers", str(int(params['num_tcn_layers']))])
-
-        # HPO-specific training settings
-        cmd.extend(["--patience", "999"])  # Disable early stopping (ASHA handles termination)
-        cmd.extend(["--reg_warmup_epochs", "0"])  # Disable reg warmup (use full reg_weight from start)
 
         self.log(f"Trial {trial_id}: {' '.join(cmd)}")
 
@@ -180,12 +171,6 @@ class HPOAgent:
                 self.log(f"Trial {trial_id} completed: loss={loss:.6f}")
                 return loss
             else:
-                # Fallback: try to find "Best validation loss:" pattern
-                match_fallback = re.search(r"Best validation loss:\s*([\d\.eE\-\+]+)", output)
-                if match_fallback:
-                    loss = float(match_fallback.group(1))
-                    self.log(f"Trial {trial_id} completed (fallback parse): loss={loss:.6f}")
-                    return loss
                 self.log(f"Could not find FINAL_LOSS in output. Last 500 chars:\n{output[-500:]}")
                 return None
 
