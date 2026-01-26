@@ -1,6 +1,6 @@
 # Trajecto: AI-Enhanced 3D Pen Tracking
 
-<img src="image.png" width="200" alt="Trajecto Logo">
+<img src="logo.png" width="200" alt="Trajecto Logo">
 
 **Trajecto** is a centimeter-level 3D handwriting reconstruction system that fuses **Deep Learning (TCN)** with **Physics-Based Filtering (ESKF)**. It uses a single low-cost 6-axis IMU (BMI270) to track pen trajectories in real-time on an **ESP32-C3** microcontroller.
 
@@ -9,7 +9,7 @@
 ## 🚧 Project Status: Active Development
 This project is **currently under intensive development**. We are actively refining the hybrid neuro-physical models, optimizing embedded inference, and expanding the ground-truth dataset.
 
-📄 **[Detailed Technical Specification (PDF)](technical_spec.pdf)**  
+📄 **[Detailed Technical Specification (PDF)](technical_spec.pdf)**
 *(Note: Documentation is currently incomplete and in active progress.)*
 
 ---
@@ -119,6 +119,5 @@ Trajecto/
 
 *   **Software**: Licensed under the **Apache License 2.0**. See [LICENSE](LICENSE).
 *   **Hardware**: Licensed under the **CERN Open Hardware Licence Version 2 - Permissive (CERN-OHL-P)**. See [LICENSE_HARDWARE](LICENSE_HARDWARE).
-*
 
 Notice: This project includes technologies for which patents are currently pending (Application related to Hybrid ESKF-TCN and Data Acquisition Methodology).
