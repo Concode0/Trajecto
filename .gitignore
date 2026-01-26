@@ -22,6 +22,7 @@ checkpoints/
 hpo_checkpoints/
 firmware/.cache/
 COMPLETE_WORKFLOW.md
+technical_spec.tex
 
 # Virtual environments
 .venv
