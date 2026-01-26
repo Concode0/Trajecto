@@ -52,7 +52,7 @@ private:
 
     std::vector<std::vector<float>> state_buffers_;
     
-    static constexpr int kTensorArenaSize = 60 * 1024; 
+    static constexpr int kTensorArenaSize = 120 * 1024; 
     static constexpr int kInputSize = TCN_INPUT_SIZE;
 };
 

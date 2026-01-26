@@ -64,7 +64,7 @@ struct TrajectoryPacket {
     float pos[3];       // x, y, z (m)
     float vel[3];       // x, y, z (m/s)
     float quat[4];      // w, x, y, z (orientation)
-    uint8_t pen_state;  // 0: pen up, 1: pen down (threshold-based for now)
+    float zupt_prob;    // Probability of Zero-Velocity
 };
 
 #pragma pack(pop)

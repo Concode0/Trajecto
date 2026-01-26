@@ -837,7 +837,7 @@ extern "C" void app_main(void) {
                     pkt.p.quat[1] = state.quat.x();
                     pkt.p.quat[2] = state.quat.y();
                     pkt.p.quat[3] = state.quat.z();
-                    pkt.p.prob_zupt = sys.get_zupt_prob(); 
+                    pkt.p.zupt_prob = sys.get_zupt_prob(); 
 
                     send_notification(&pkt, sizeof(pkt));
                 }

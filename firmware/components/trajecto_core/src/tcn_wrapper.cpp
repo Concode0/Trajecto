@@ -29,7 +29,7 @@ bool TCNWrapper::setup() {
         return false;
     }
 
-    static tflite::MicroMutableOpResolver<11> resolver;
+    static tflite::MicroMutableOpResolver<20> resolver;
     resolver.AddConv2D();
     resolver.AddDepthwiseConv2D();
     resolver.AddFullyConnected();
