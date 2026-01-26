@@ -4,11 +4,17 @@ Error-State Kalman Filter (ESKF) for 3D pen trajectory reconstruction.
 Maintains a nominal state propagated through non-linear dynamics and a
 linear error state for corrections. This approach combines accurate
 non-linear propagation with computationally efficient linear filtering.
+
+Supports Block-Parallel Scan for accelerated covariance computation:
+- Cache F, Q, W, K, R matrices during sequential forward pass
+- Use cached matrices with parallel scan for O(log T) covariance computation
+- Unified operator: F̃ = W @ F, Q̃ = W @ Q @ W^T + K @ R @ K^T
 """
 
 import os
 import sys
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,6 +33,41 @@ from rotation_utils import (
 )
 
 from zupt_detector import ZuptDetector
+
+
+@dataclass
+class ESKFStepCache:
+    """Cache for a single ESKF timestep."""
+    F: torch.Tensor  # Transition Jacobian [batch, 15, 15]
+    Q: torch.Tensor  # Process noise [batch, 15, 15]
+    W: torch.Tensor  # Combined compensation matrix I - K @ H [batch, 15, 15]
+    noise_inj: torch.Tensor  # Accumulated noise injection from updates [batch, 15, 15]
+
+
+@dataclass
+class ESKFSequenceCache:
+    """Cache for entire ESKF sequence, used for parallel covariance computation.
+
+    The unified operator formulation:
+        F̃ = W @ F
+        Q̃ = W @ Q @ W^T + noise_inj
+        P[t+1] = F̃ @ P[t] @ F̃^T + Q̃
+    """
+    F_seq: torch.Tensor  # [batch, seq_len, 15, 15] - Transition Jacobians
+    Q_seq: torch.Tensor  # [batch, seq_len, 15, 15] - Process noise
+    W_seq: torch.Tensor  # [batch, seq_len, 15, 15] - Combined compensation matrices
+    noise_inj_seq: torch.Tensor  # [batch, seq_len, 15, 15] - Accumulated noise injection
+    P_init: torch.Tensor  # [batch, 15, 15] - Initial covariance
+
+    def to(self, device: torch.device) -> 'ESKFSequenceCache':
+        """Move cache to device."""
+        return ESKFSequenceCache(
+            F_seq=self.F_seq.to(device),
+            Q_seq=self.Q_seq.to(device),
+            W_seq=self.W_seq.to(device),
+            noise_inj_seq=self.noise_inj_seq.to(device),
+            P_init=self.P_init.to(device),
+        )
 
 
 class ErrorStateKalmanFilter(nn.Module):
@@ -156,6 +197,464 @@ class ErrorStateKalmanFilter(nn.Module):
         """Returns the measurement noise covariance R for ZUPT."""
         return torch.diag(self.zupt_noise_std ** 2)
 
+    # =========================================================================
+    # CACHING SUPPORT FOR BLOCK-PARALLEL SCAN
+    # =========================================================================
+
+    def init_cache(self, batch_size: int, seq_len: int, dtype: torch.dtype = torch.float32):
+        """Initialize cache storage for parallel covariance computation.
+
+        Call this before the forward pass sequence to enable caching.
+
+        Args:
+            batch_size: Batch size
+            seq_len: Sequence length
+            dtype: Data type for cache tensors
+        """
+        self._cache_enabled = True
+        self._cache_step = 0
+        self._cache_batch_size = batch_size
+        self._cache_seq_len = seq_len
+
+        # Pre-allocate cache tensors (torch.zeros creates contiguous tensors by default)
+        D = self.error_state_dim
+        self._cache_F = torch.zeros(
+            batch_size, seq_len, D, D, device=self.device, dtype=dtype
+        )
+        self._cache_Q = torch.zeros(
+            batch_size, seq_len, D, D, device=self.device, dtype=dtype
+        )
+        self._cache_W = torch.zeros(
+            batch_size, seq_len, D, D, device=self.device, dtype=dtype
+        )
+        self._cache_noise_inj = torch.zeros(
+            batch_size, seq_len, D, D, device=self.device, dtype=dtype
+        )
+        self._cache_P_init = None
+
+    def finalize_cache(self) -> Optional[ESKFSequenceCache]:
+        """Finalize and return the collected cache.
+
+        Call this after the forward pass sequence completes.
+
+        Returns:
+            ESKFSequenceCache with all cached matrices, or None if caching disabled.
+        """
+        if not getattr(self, '_cache_enabled', False):
+            return None
+
+        cache = ESKFSequenceCache(
+            F_seq=self._cache_F[:, :self._cache_step].clone(),
+            Q_seq=self._cache_Q[:, :self._cache_step].clone(),
+            W_seq=self._cache_W[:, :self._cache_step].clone(),
+            noise_inj_seq=self._cache_noise_inj[:, :self._cache_step].clone(),
+            P_init=self._cache_P_init.clone() if self._cache_P_init is not None else None,
+        )
+
+        # Disable caching
+        self._cache_enabled = False
+        return cache
+
+    def _cache_step_matrices(
+        self,
+        F: torch.Tensor,
+        Q: torch.Tensor,
+        W: torch.Tensor,
+        noise_inj: torch.Tensor,
+    ):
+        """Cache matrices for current timestep.
+
+        Called internally during forward pass when caching is enabled.
+
+        Args:
+            F: Transition Jacobian [batch, 15, 15]
+            Q: Process noise [batch, 15, 15]
+            W: Combined compensation matrix from all updates [batch, 15, 15]
+            noise_inj: Accumulated noise injection from all updates [batch, 15, 15]
+        """
+        if not getattr(self, '_cache_enabled', False):
+            return
+
+        t = self._cache_step
+        if t >= self._cache_seq_len:
+            return
+
+        self._cache_F[:, t] = F
+        self._cache_Q[:, t] = Q
+        self._cache_W[:, t] = W
+        self._cache_noise_inj[:, t] = noise_inj
+        self._cache_step += 1
+
+    def _init_cache_accumulators(self, batch_size: int, dtype: torch.dtype) -> dict:
+        """Initialize accumulators for tracking combined update matrices.
+
+        Returns a dict with:
+        - W_combined: Product of all compensation matrices (I - K @ H)
+        - noise_accumulated: Cumulative noise injection from all updates
+
+        For multiple updates: P_final = W_combined @ P_pred @ W_combined^T + noise_accumulated
+        where noise_accumulated = sum of W_remaining @ K_i @ R_i @ K_i^T @ W_remaining^T
+        """
+        return {
+            'W_combined': torch.eye(self.error_state_dim, device=self.device, dtype=dtype)
+                         .unsqueeze(0).expand(batch_size, -1, -1).clone(),
+            'noise_accumulated': torch.zeros(batch_size, self.error_state_dim, self.error_state_dim,
+                                             device=self.device, dtype=dtype),
+        }
+
+    def _accumulate_update_noise(
+        self,
+        cache_accum: dict,
+        W_new: torch.Tensor,
+        K: torch.Tensor,
+        R: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        """Accumulate noise injection from an update step.
+
+        After this update:
+        - noise_new = W_new @ noise_old @ W_new^T + K @ R @ K^T
+        - W_combined = W_new @ W_combined
+
+        Args:
+            cache_accum: Cache accumulator dict
+            W_new: Compensation matrix (I - K @ H) from current update [batch, 15, 15]
+            K: Kalman gain [batch, 15, m] where m is measurement dim
+            R: Measurement noise [batch, m, m]
+            mask: Optional boolean mask for selective update [batch]
+
+        BPTT Note: Uses torch.where for gradient-safe conditional assignment.
+        """
+        batch_size = cache_accum['noise_accumulated'].shape[0]
+
+        if mask is not None:
+            # For masked updates, use torch.where for gradient-safe conditional assignment
+            # Expand mask for broadcasting: [batch] -> [batch, 1, 1]
+            mask_expanded = mask.view(batch_size, 1, 1)
+
+            # Compute updates for all samples (W_new already has correct batch dim for masked samples)
+            # We need to handle the case where W_new/K/R have different batch sizes
+            if W_new.shape[0] == mask.sum():
+                # W_new, K, R are only for masked samples - need to scatter back
+                noise_old_masked = cache_accum['noise_accumulated'][mask]
+                noise_transformed = torch.einsum("bij,bjk,blk->bil", W_new, noise_old_masked, W_new)
+                noise_injection = torch.einsum("bij,bjk,blk->bil", K, R, K)
+                new_noise_masked = noise_transformed + noise_injection
+
+                W_combined_masked = torch.einsum(
+                    "bij,bjk->bik", W_new, cache_accum['W_combined'][mask]
+                )
+
+                # Create full batch tensors with updates at masked positions
+                # Use index_copy for gradient-safe scatter
+                indices = torch.nonzero(mask, as_tuple=True)[0]
+                new_noise_full = cache_accum['noise_accumulated'].clone()
+                new_noise_full[indices] = new_noise_masked
+
+                new_W_full = cache_accum['W_combined'].clone()
+                new_W_full[indices] = W_combined_masked
+
+                cache_accum['noise_accumulated'] = new_noise_full
+                cache_accum['W_combined'] = new_W_full
+            else:
+                # W_new has full batch size - use torch.where
+                noise_transformed = torch.einsum(
+                    "bij,bjk,blk->bil", W_new, cache_accum['noise_accumulated'], W_new
+                )
+                noise_injection = torch.einsum("bij,bjk,blk->bil", K, R, K)
+                new_noise = noise_transformed + noise_injection
+
+                new_W = torch.einsum(
+                    "bij,bjk->bik", W_new, cache_accum['W_combined']
+                )
+
+                cache_accum['noise_accumulated'] = torch.where(
+                    mask_expanded, new_noise, cache_accum['noise_accumulated']
+                )
+                cache_accum['W_combined'] = torch.where(
+                    mask_expanded, new_W, cache_accum['W_combined']
+                )
+        else:
+            # Full batch update
+            # noise_new = W_new @ noise_old @ W_new^T + K @ R @ K^T
+            noise_transformed = torch.einsum("bij,bjk,blk->bil", W_new, cache_accum['noise_accumulated'], W_new)
+            noise_injection = torch.einsum("bij,bjk,blk->bil", K, R, K)
+            cache_accum['noise_accumulated'] = noise_transformed + noise_injection
+
+            # W_combined = W_new @ W_combined
+            cache_accum['W_combined'] = torch.einsum(
+                "bij,bjk->bik", W_new, cache_accum['W_combined']
+            )
+
+    def compute_F_Q_matrices(
+        self,
+        quat_b_to_w: torch.Tensor,
+        accel_b_raw: torch.Tensor,
+        accel_bias_b: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute transition Jacobian F and process noise Q matrices.
+
+        This is the core computation from predict() extracted for caching.
+
+        Args:
+            quat_b_to_w: Body-to-world quaternion [batch, 4]
+            accel_b_raw: Raw accelerometer [batch, 3]
+            accel_bias_b: Accelerometer bias [batch, 3]
+
+        Returns:
+            F: Transition Jacobian [batch, 15, 15]
+            Q: Process noise [batch, 15, 15]
+        """
+        batch_size = quat_b_to_w.shape[0]
+        dtype = quat_b_to_w.dtype
+
+        # Build F matrix (state transition Jacobian)
+        F_error_matrix = (
+            torch.eye(self.error_state_dim, device=self.device, dtype=dtype)
+            .unsqueeze(0)
+            .repeat(batch_size, 1, 1)
+        )
+
+        rot_mat_b_to_w = quaternion_to_rotation_matrix(quat_b_to_w)
+        accel_b_corrected = accel_b_raw - accel_bias_b
+
+        # Skew-symmetric matrix for acceleration
+        accel_ssm = torch.zeros(batch_size, 3, 3, device=self.device, dtype=dtype)
+        accel_ssm[:, 0, 1] = -accel_b_corrected[:, 2]
+        accel_ssm[:, 0, 2] = accel_b_corrected[:, 1]
+        accel_ssm[:, 1, 0] = accel_b_corrected[:, 2]
+        accel_ssm[:, 1, 2] = -accel_b_corrected[:, 0]
+        accel_ssm[:, 2, 0] = -accel_b_corrected[:, 1]
+        accel_ssm[:, 2, 1] = accel_b_corrected[:, 0]
+
+        # Fill F blocks
+        F_error_matrix[:, 0:3, 3:6] = torch.eye(3, device=self.device, dtype=dtype) * self.dt
+        F_error_matrix[:, 3:6, 6:9] = -rot_mat_b_to_w @ accel_ssm * self.dt
+        F_error_matrix[:, 3:6, 12:15] = -rot_mat_b_to_w * self.dt
+        F_error_matrix[:, 6:9, 9:12] = -torch.eye(3, device=self.device, dtype=dtype) * self.dt
+
+        # Build Q matrix (process noise with trapezoidal integration)
+        Q_continuous = torch.diag(self.Q_diag).unsqueeze(0).expand(batch_size, -1, -1)
+        Q_error_matrix = 0.5 * (
+            F_error_matrix @ Q_continuous @ F_error_matrix.transpose(-2, -1) + Q_continuous
+        ) * self.dt
+
+        return F_error_matrix, Q_error_matrix
+
+    def parallel_covariance_from_cache(
+        self,
+        cache: ESKFSequenceCache,
+        block_size: int = 64,
+    ) -> torch.Tensor:
+        """Compute covariances using parallel scan with cached matrices.
+
+        Uses the unified operator formulation:
+            F̃_t = W_t @ F_t
+            Q̃_t = W_t @ Q_t @ W_t^T + noise_inj_t
+            P_{t|t} = F̃_t @ P_{t-1|t-1} @ F̃_t^T + Q̃_t
+
+        The noise_inj_t is the properly accumulated noise injection from all updates,
+        accounting for the transformation by subsequent W matrices.
+
+        Args:
+            cache: ESKFSequenceCache with F, Q, W, noise_inj sequences
+            block_size: Block size for parallel scan
+
+        Returns:
+            P_seq: Covariance sequence [batch, seq_len, 15, 15]
+        """
+        from model.parallel_scan_ops import parallel_covariance_scan_blocked
+
+        # Build unified operators: F̃ = W @ F, Q̃ = W @ Q @ W^T + noise_inj
+        F_unified = torch.einsum("btij,btjk->btik", cache.W_seq, cache.F_seq)
+
+        WQW = torch.einsum("btij,btjk,btlk->btil", cache.W_seq, cache.Q_seq, cache.W_seq)
+        Q_unified = WQW + cache.noise_inj_seq
+
+        # Parallel covariance scan
+        P_seq = parallel_covariance_scan_blocked(F_unified, Q_unified, cache.P_init, block_size)
+
+        return P_seq
+
+    # =========================================================================
+    # HYBRID CPU/GPU MODE: CPU nominal state + GPU parallel P computation
+    # =========================================================================
+
+    def init_cache_hybrid_cpu(
+        self,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype = torch.float32
+    ):
+        """Initialize cache on CPU for hybrid CPU/GPU mode.
+
+        In hybrid mode:
+        - Sequential nominal state propagation runs on CPU (avoids GPU kernel overhead)
+        - F, Q matrices are cached on CPU during the loop
+        - After loop, F, Q are transferred to GPU for parallel P computation
+
+        Args:
+            batch_size: Batch size
+            seq_len: Sequence length
+            dtype: Data type for cache tensors
+        """
+        self._hybrid_mode = True
+        self._hybrid_cache_step = 0
+        self._hybrid_batch_size = batch_size
+        self._hybrid_seq_len = seq_len
+
+        # Pre-allocate cache tensors ON CPU
+        D = self.error_state_dim
+        self._hybrid_cache_F = torch.zeros(batch_size, seq_len, D, D, device='cpu', dtype=dtype)
+        self._hybrid_cache_Q = torch.zeros(batch_size, seq_len, D, D, device='cpu', dtype=dtype)
+        self._hybrid_cache_P_init = None
+
+        # CPU copies of filter parameters for fast access
+        self._cpu_Q_diag = self.Q_diag.cpu()
+        self._cpu_dt = self.dt
+
+    def forward_nominal_cpu(
+        self,
+        pos_w: torch.Tensor,
+        vel_w: torch.Tensor,
+        quat_b_to_w: torch.Tensor,
+        gyro_bias_b: torch.Tensor,
+        accel_bias_b: torch.Tensor,
+        gyro_b_raw: torch.Tensor,
+        accel_b_raw: torch.Tensor,
+        gravity_w: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """CPU-based nominal state propagation with F, Q caching.
+
+        This method runs the sequential nominal state update on CPU to avoid
+        GPU kernel launch overhead for small O(1) operations. F and Q matrices
+        are computed and cached for later GPU-based parallel P computation.
+
+        All input tensors should be on CPU. Returns updated state on CPU.
+
+        Args:
+            pos_w: Position in world frame [batch, 3] (CPU)
+            vel_w: Velocity in world frame [batch, 3] (CPU)
+            quat_b_to_w: Body-to-world quaternion [batch, 4] (CPU)
+            gyro_bias_b: Gyroscope bias [batch, 3] (CPU)
+            accel_bias_b: Accelerometer bias [batch, 3] (CPU)
+            gyro_b_raw: Raw gyroscope measurement [batch, 3] (CPU)
+            accel_b_raw: Raw accelerometer measurement [batch, 3] (CPU)
+            gravity_w: Gravity vector in world frame [batch, 3] (CPU)
+
+        Returns:
+            Tuple of (pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new,
+                     accel_bias_b_new, F_matrix, Q_matrix) all on CPU
+        """
+        batch_size = pos_w.shape[0]
+        dt = self._cpu_dt
+
+        # --- Nominal State Propagation (CPU) ---
+        gyro_b_corrected = gyro_b_raw - gyro_bias_b
+        accel_b_corrected = accel_b_raw - accel_bias_b
+
+        # Quaternion propagation
+        angle_change = gyro_b_corrected * dt
+        delta_quat = small_angle_to_quaternion(angle_change)
+        quat_b_to_w_new = quaternion_multiply(quat_b_to_w, delta_quat)
+        quat_b_to_w_new = torch.nn.functional.normalize(quat_b_to_w_new, p=2, dim=-1)
+
+        # Rotation matrices
+        rot_mat_b_to_w = quaternion_to_rotation_matrix(quat_b_to_w)
+        rot_mat_b_to_w_new = quaternion_to_rotation_matrix(quat_b_to_w_new)
+
+        # Acceleration in world frame
+        accel_w = (rot_mat_b_to_w @ accel_b_corrected.unsqueeze(-1)).squeeze(-1) - gravity_w
+        accel_w_new = (rot_mat_b_to_w_new @ accel_b_corrected.unsqueeze(-1)).squeeze(-1) - gravity_w
+
+        # Trapezoidal integration
+        vel_w_new = vel_w + 0.5 * (accel_w + accel_w_new) * dt
+        pos_w_new = pos_w + 0.5 * (vel_w + vel_w_new) * dt
+
+        # Biases (random walk - unchanged)
+        gyro_bias_b_new = gyro_bias_b
+        accel_bias_b_new = accel_bias_b
+
+        # --- Compute F, Q matrices (CPU) ---
+        D = self.error_state_dim
+        F_matrix = torch.eye(D, device='cpu', dtype=pos_w.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+
+        # Skew-symmetric matrix for acceleration
+        accel_ssm = torch.zeros(batch_size, 3, 3, device='cpu', dtype=pos_w.dtype)
+        accel_ssm[:, 0, 1] = -accel_b_corrected[:, 2]
+        accel_ssm[:, 0, 2] = accel_b_corrected[:, 1]
+        accel_ssm[:, 1, 0] = accel_b_corrected[:, 2]
+        accel_ssm[:, 1, 2] = -accel_b_corrected[:, 0]
+        accel_ssm[:, 2, 0] = -accel_b_corrected[:, 1]
+        accel_ssm[:, 2, 1] = accel_b_corrected[:, 0]
+
+        # F matrix entries
+        F_matrix[:, 0:3, 3:6] = torch.eye(3, device='cpu') * dt
+        F_matrix[:, 3:6, 6:9] = -rot_mat_b_to_w @ accel_ssm * dt
+        F_matrix[:, 3:6, 12:15] = -rot_mat_b_to_w * dt
+        F_matrix[:, 6:9, 9:12] = -torch.eye(3, device='cpu') * dt
+
+        # Q matrix (trapezoidal)
+        Q_continuous = torch.diag(self._cpu_Q_diag).unsqueeze(0).expand(batch_size, -1, -1)
+        Q_matrix = 0.5 * (F_matrix @ Q_continuous @ F_matrix.transpose(-2, -1) + Q_continuous) * dt
+
+        # Cache F, Q
+        if getattr(self, '_hybrid_mode', False):
+            t = self._hybrid_cache_step
+            if t == 0:
+                self._hybrid_cache_P_init = None  # Will be set from GPU P_error
+            self._hybrid_cache_F[:, t] = F_matrix
+            self._hybrid_cache_Q[:, t] = Q_matrix
+            self._hybrid_cache_step += 1
+
+        return pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new, accel_bias_b_new, F_matrix, Q_matrix
+
+    def compute_P_parallel_gpu(
+        self,
+        P_init: torch.Tensor,
+        block_size: int = 64,
+    ) -> torch.Tensor:
+        """Compute P sequence using GPU parallel scan from CPU-cached F, Q.
+
+        Call this after the CPU nominal state loop completes. Transfers
+        cached F, Q to GPU and computes all P matrices using parallel scan.
+
+        Args:
+            P_init: Initial covariance matrix [batch, 15, 15] (can be GPU or CPU)
+            block_size: Block size for parallel scan
+
+        Returns:
+            P_seq: Covariance sequence [batch, seq_len, 15, 15] on GPU
+        """
+        from model.parallel_scan_ops import parallel_covariance_scan_blocked
+
+        if not getattr(self, '_hybrid_mode', False):
+            raise RuntimeError("Hybrid mode not initialized. Call init_cache_hybrid_cpu first.")
+
+        seq_len = self._hybrid_cache_step
+
+        # Transfer F, Q from CPU to GPU
+        F_gpu = self._hybrid_cache_F[:, :seq_len].to(self.device)
+        Q_gpu = self._hybrid_cache_Q[:, :seq_len].to(self.device)
+        P_init_gpu = P_init.to(self.device) if P_init.device.type == 'cpu' else P_init
+
+        # Parallel scan on GPU
+        P_seq = parallel_covariance_scan_blocked(F_gpu, Q_gpu, P_init_gpu, block_size)
+
+        return P_seq
+
+    def finalize_hybrid_cache(self):
+        """Clean up hybrid mode cache."""
+        self._hybrid_mode = False
+        if hasattr(self, '_hybrid_cache_F'):
+            del self._hybrid_cache_F
+        if hasattr(self, '_hybrid_cache_Q'):
+            del self._hybrid_cache_Q
+        if hasattr(self, '_hybrid_cache_P_init'):
+            del self._hybrid_cache_P_init
+        if hasattr(self, '_cpu_Q_diag'):
+            del self._cpu_Q_diag
+
     def _make_symmetric(self, P_covariance: torch.Tensor) -> torch.Tensor:
         """Enforces symmetry on covariance matrix to prevent numerical drift.
 
@@ -199,24 +698,14 @@ class ErrorStateKalmanFilter(nn.Module):
         if B_is_1d:
             B = B.unsqueeze(-1)
 
-        try:
-            L = torch.linalg.cholesky(S)
-            X = torch.cholesky_solve(B, L)
+        # Direct Cholesky solve (no try-except) for torch.compile compatibility.
+        # Regularization ensures S is positive definite.
+        L = torch.linalg.cholesky(S)
+        X = torch.cholesky_solve(B, L)
 
-            if compute_quadratic and quadratic_vec is not None:
-                sol_v = torch.cholesky_solve(quadratic_vec.unsqueeze(-1), L)
-                quadratic_result = (quadratic_vec.unsqueeze(1) @ sol_v).squeeze(-1).squeeze(-1)
-
-        except RuntimeError as e:
-            # Fallback: pseudo-inverse for non-positive-definite matrices
-            # WARNING: This should be rare with proper regularization!
-            import warnings
-            warnings.warn(f"Cholesky decomposition failed, using pinv fallback. This indicates numerical instability! Error: {e}")
-            S_inv = torch.linalg.pinv(S)
-            X = S_inv @ B
-
-            if compute_quadratic and quadratic_vec is not None:
-                quadratic_result = (quadratic_vec.unsqueeze(1) @ S_inv @ quadratic_vec.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        if compute_quadratic and quadratic_vec is not None:
+            sol_v = torch.cholesky_solve(quadratic_vec.unsqueeze(-1), L)
+            quadratic_result = (quadratic_vec.unsqueeze(1) @ sol_v).squeeze(-1).squeeze(-1)
 
         if B_is_1d:
             X = X.squeeze(-1)
@@ -340,7 +829,8 @@ class ErrorStateKalmanFilter(nn.Module):
         measurement: torch.Tensor,
         R_override: Optional[torch.Tensor] = None,
         gating_threshold: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_update_matrices: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Performs bias-only measurement update (attitude handled by gravity alignment).
 
         This update observes accelerometer and gyroscope biases only.
@@ -355,9 +845,11 @@ class ErrorStateKalmanFilter(nn.Module):
             measurement: 6D sensor measurement (z_k).
             R_override: Optional measurement noise covariance override.
             gating_threshold: Optional Mahalanobis distance threshold.
+            return_update_matrices: If True, also return (W, K, R) for caching.
 
         Returns:
-            Tuple of (delta_x, P_error_new, innovation, mahalanobis_sq).
+            Tuple of (delta_x, P_error_new, innovation, mahalanobis_sq) or
+            (delta_x, P_error_new, innovation, mahalanobis_sq, (W, K, R)) if return_update_matrices=True.
         """
         batch_size = P_error_pred.shape[0]
 
@@ -432,8 +924,24 @@ class ErrorStateKalmanFilter(nn.Module):
              reject_mask = mahalanobis_sq > gating_threshold
              delta_x = torch.where(reject_mask.unsqueeze(-1), torch.zeros_like(delta_x), delta_x)
              P_error_new = torch.where(reject_mask.unsqueeze(-1).unsqueeze(-1), P_error_pred, P_error_new)
+             # For gated samples, use identity W and zero K (so noise_inj = K @ R @ K^T = 0)
+             if return_update_matrices:
+                 ImKH = torch.where(
+                     reject_mask.unsqueeze(-1).unsqueeze(-1),
+                     I_matrix.unsqueeze(0).expand(batch_size, -1, -1),
+                     ImKH
+                 )
+                 # Zero out K for gated samples to ensure noise_inj = 0
+                 K_gain = torch.where(
+                     reject_mask.unsqueeze(-1).unsqueeze(-1),
+                     torch.zeros_like(K_gain),
+                     K_gain
+                 )
 
-        return delta_x, P_error_new, innovation, mahalanobis_sq
+        if return_update_matrices:
+            return delta_x, P_error_new, innovation, mahalanobis_sq, (ImKH, K_gain, R_noise_matrix)
+
+        return delta_x, P_error_new, innovation, mahalanobis_sq, None
 
     def _calculate_stationary_update(
         self,
@@ -442,7 +950,8 @@ class ErrorStateKalmanFilter(nn.Module):
         gyro_pred: torch.Tensor,
         tcn_zupt_prob: Optional[torch.Tensor] = None,
         use_zaru: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_update_matrices: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Applies stationary update: ZUPT (Zero-Velocity) and optionally ZARU (Zero Angular Rate).
 
         For ESKF-TCN: Applies both ZUPT and ZARU constraints when stationary.
@@ -454,9 +963,11 @@ class ErrorStateKalmanFilter(nn.Module):
             gyro_pred: Predicted gyroscope (bias estimate) in body frame.
             tcn_zupt_prob: Optional TCN-predicted zero-velocity probability [0,1].
             use_zaru: If True, also applies zero angular rate constraint (ESKF-TCN only).
+            return_update_matrices: If True, also return (W, K, R) for caching.
 
         Returns:
-            Tuple of (delta_x_stationary, P_error_new).
+            Tuple of (delta_x_stationary, P_error_new) or
+            (delta_x_stationary, P_error_new, (W, K, R)) if return_update_matrices=True.
         """
         batch_size = P_error_pred.shape[0]
 
@@ -534,7 +1045,18 @@ class ErrorStateKalmanFilter(nn.Module):
         )
         P_error_new = self._make_symmetric(P_error_new)
 
-        return delta_x_stationary, P_error_new
+        if return_update_matrices:
+            # Pad K and R to obs_dim=6 for consistent caching
+            batch_size = P_error_pred.shape[0]
+            K_padded = torch.zeros(batch_size, self.error_state_dim, self.obs_dim,
+                                   device=self.device, dtype=P_error_pred.dtype)
+            R_padded = torch.zeros(batch_size, self.obs_dim, self.obs_dim,
+                                   device=self.device, dtype=P_error_pred.dtype)
+            K_padded[:, :, :meas_dim] = K_stationary_gain
+            R_padded[:, :meas_dim, :meas_dim] = R_stationary_matrix
+            return delta_x_stationary, P_error_new, (ImKH_stationary, K_padded, R_padded)
+
+        return delta_x_stationary, P_error_new, None
 
     def _apply_tcn_velocity_correction(
         self,
@@ -543,7 +1065,8 @@ class ErrorStateKalmanFilter(nn.Module):
         vel_corr_b: torch.Tensor,
         quat_b_to_w: torch.Tensor,
         R_vel_diag: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_update_matrices: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Apply TCN velocity correction as pseudo-measurement.
 
         Args:
@@ -552,10 +1075,12 @@ class ErrorStateKalmanFilter(nn.Module):
             vel_corr_b: Velocity correction in body frame [batch, 3].
             quat_b_to_w: Body-to-world quaternion [batch, 4].
             R_vel_diag: Measurement noise diagonal [batch, 3], already processed.
+            return_update_matrices: If True, also return (W, K, R) for caching.
 
         Returns:
             delta_x_tcn: State correction [batch, 15].
             P_error_new: Updated covariance [batch, 15, 15].
+            update_matrices: (W, K, R) if return_update_matrices=True, else None.
         """
         batch_size = P_error_pred.shape[0]
         dtype = P_error_pred.dtype
@@ -592,7 +1117,17 @@ class ErrorStateKalmanFilter(nn.Module):
         P_error_new = ImKH @ P_error_pred @ ImKH.transpose(-2, -1) + K @ R_tcn_matrix @ K.transpose(-2, -1)
         P_error_new = self._make_symmetric(P_error_new)
 
-        return delta_x_tcn, P_error_new
+        if return_update_matrices:
+            # Pad K and R to obs_dim=6 for consistent caching
+            K_padded = torch.zeros(batch_size, self.error_state_dim, self.obs_dim,
+                                   device=self.device, dtype=dtype)
+            R_padded = torch.zeros(batch_size, self.obs_dim, self.obs_dim,
+                                   device=self.device, dtype=dtype)
+            K_padded[:, :, :3] = K
+            R_padded[:, :3, :3] = R_tcn_matrix
+            return delta_x_tcn, P_error_new, (ImKH, K_padded, R_padded)
+
+        return delta_x_tcn, P_error_new, None
 
     def _apply_gravity_alignment_update(
         self,
@@ -601,7 +1136,8 @@ class ErrorStateKalmanFilter(nn.Module):
         gravity_measured_b: torch.Tensor,
         R_gravity_diag: torch.Tensor,
         accel_b_raw: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_update_matrices: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """Apply gravity alignment update to correct orientation error.
 
         Uses gravity observation to correct roll/pitch:
@@ -617,10 +1153,12 @@ class ErrorStateKalmanFilter(nn.Module):
             gravity_measured_b: Gravity direction in body frame [batch, 3].
             R_gravity_diag: Measurement noise [batch, 3].
             accel_b_raw: Raw accelerometer for gating [batch, 3].
+            return_update_matrices: If True, also return (W, K, R) for caching.
 
         Returns:
             delta_x_gravity: State correction [batch, 15].
             P_error_new: Updated covariance [batch, 15, 15].
+            update_matrices: (W, K, R) if return_update_matrices=True, else None.
         """
         batch_size = P_error_pred.shape[0]
         dtype = P_error_pred.dtype
@@ -689,7 +1227,25 @@ class ErrorStateKalmanFilter(nn.Module):
         )
         P_error_new = self._make_symmetric(P_error_new)
 
-        return delta_x_gravity, P_error_new
+        if return_update_matrices:
+            # Pad K and R to obs_dim=6 for consistent caching
+            K_padded = torch.zeros(batch_size, self.error_state_dim, self.obs_dim,
+                                   device=self.device, dtype=dtype)
+            R_padded = torch.zeros(batch_size, self.obs_dim, self.obs_dim,
+                                   device=self.device, dtype=dtype)
+            K_padded[:, :, :3] = K_gravity
+            R_padded[:, :3, :3] = R_gravity_matrix
+            # Apply valid_mask to W (identity for invalid samples)
+            W_masked = torch.where(
+                valid_mask.unsqueeze(-1).unsqueeze(-1), ImKH, I_matrix
+            )
+            # Zero out K for invalid samples to ensure noise_inj = 0
+            K_padded = torch.where(
+                valid_mask.unsqueeze(-1).unsqueeze(-1), K_padded, torch.zeros_like(K_padded)
+            )
+            return delta_x_gravity, P_error_new, (W_masked, K_padded, R_padded)
+
+        return delta_x_gravity, P_error_new, None
 
     def inject_correction(
         self,
@@ -785,6 +1341,19 @@ class ErrorStateKalmanFilter(nn.Module):
                 - P_error_final: (Batch, 15, 15)
                 - tcn_features: Dict with keys "body_velocity" (Batch, 3), "zupt_flag" (Batch, 1), "innovation" (Batch, 6), "mahalanobis" (Batch, 1)
         """
+        batch_size = pos_w.shape[0]
+        caching_enabled = getattr(self, '_cache_enabled', False)
+
+        # --- 0. Initialize Caching ---
+        if caching_enabled:
+            # Cache P_init on first step
+            if self._cache_step == 0:
+                self._cache_P_init = P_error.clone()
+            # Initialize cache accumulators for tracking combined update matrices
+            cache_accum = self._init_cache_accumulators(batch_size, pos_w.dtype)
+        else:
+            cache_accum = None
+
         # --- 1. Prediction Step ---
         pos_w_pred, vel_w_pred, quat_b_to_w_pred, gyro_bias_b_pred, accel_bias_b_pred = (
             self._propagate_nominal_state(
@@ -793,11 +1362,15 @@ class ErrorStateKalmanFilter(nn.Module):
         )
         P_error_pred = self.predict(P_error, quat_b_to_w, accel_b_raw, accel_bias_b)
 
+        # Compute F, Q for caching (same computation as in predict())
+        if caching_enabled:
+            F_cache, Q_cache = self.compute_F_Q_matrices(quat_b_to_w, accel_b_raw, accel_bias_b)
+
         # --- 2. Update Step ---
         P_error_final = P_error_pred
-        total_delta_x = torch.zeros(pos_w.shape[0], self.error_state_dim, device=self.device, dtype=pos_w.dtype)
-        innovation_output = torch.zeros(pos_w.shape[0], self.obs_dim, device=self.device, dtype=pos_w.dtype)
-        mahalanobis_output = torch.zeros(pos_w.shape[0], device=self.device, dtype=pos_w.dtype)
+        total_delta_x = torch.zeros(batch_size, self.error_state_dim, device=self.device, dtype=pos_w.dtype)
+        innovation_output = torch.zeros(batch_size, self.obs_dim, device=self.device, dtype=pos_w.dtype)
+        mahalanobis_output = torch.zeros(batch_size, device=self.device, dtype=pos_w.dtype)
 
         # Determine if ZUPT should be applied.
         # TCN outputs logits for BCEWithLogitsLoss compatibility; apply sigmoid for probability
@@ -823,15 +1396,21 @@ class ErrorStateKalmanFilter(nn.Module):
             # Enable ZARU only for ESKF-TCN (when using TCN-based ZUPT)
             use_zaru = self.use_tcn_zupt
 
-            delta_x_stationary, P_after_stationary = self._calculate_stationary_update(
+            delta_x_stationary, P_after_stationary, zupt_update_mats = self._calculate_stationary_update(
                 vel_w_pred[zupt_mask],
                 P_error_pred[zupt_mask],
                 gyro_pred[zupt_mask],
                 tcn_zupt_prob=zupt_prob_to_pass,
-                use_zaru=use_zaru
+                use_zaru=use_zaru,
+                return_update_matrices=caching_enabled,
             )
             total_delta_x[zupt_mask] += delta_x_stationary
             P_error_final[zupt_mask] = P_after_stationary
+
+            # Accumulate update noise for masked samples
+            if caching_enabled and zupt_update_mats is not None:
+                W_zupt, K_zupt, R_zupt = zupt_update_mats
+                self._accumulate_update_noise(cache_accum, W_zupt, K_zupt, R_zupt, mask=zupt_mask)
 
         # Apply TCN-based corrections or standard measurement update.
         if tcn_output is not None:
@@ -851,12 +1430,18 @@ class ErrorStateKalmanFilter(nn.Module):
             if torch.any(is_zupt):
                 vel_corr_body = torch.where(is_zupt.unsqueeze(-1), torch.zeros_like(vel_corr_body), vel_corr_body)
 
-            delta_x_tcn, P_after_tcn = self._apply_tcn_velocity_correction(
+            delta_x_tcn, P_after_tcn, tcn_vel_update_mats = self._apply_tcn_velocity_correction(
                 vel_w_pred, P_error_final, vel_corr_body, quat_b_to_w_pred,
-                R_vel_diag=R_accel
+                R_vel_diag=R_accel,
+                return_update_matrices=caching_enabled,
             )
             total_delta_x += delta_x_tcn
             P_error_final = P_after_tcn
+
+            # Accumulate update noise
+            if caching_enabled and tcn_vel_update_mats is not None:
+                W_tcn, K_tcn, R_tcn = tcn_vel_update_mats
+                self._accumulate_update_noise(cache_accum, W_tcn, K_tcn, R_tcn)
 
             # 2. Gravity Alignment Update
             # Skip during warmup period to let TCN stabilize before trusting its gravity predictions
@@ -878,12 +1463,18 @@ class ErrorStateKalmanFilter(nn.Module):
                     R_accel
                 )
 
-                delta_x_gravity, P_after_gravity = self._apply_gravity_alignment_update(
+                delta_x_gravity, P_after_gravity, gravity_update_mats = self._apply_gravity_alignment_update(
                     P_error_final, quat_b_to_w_pred, gravity_measured_b,
-                    R_gravity_diag=R_gravity_diag, accel_b_raw=accel_b_raw
+                    R_gravity_diag=R_gravity_diag, accel_b_raw=accel_b_raw,
+                    return_update_matrices=caching_enabled,
                 )
                 total_delta_x += delta_x_gravity
                 P_error_final = P_after_gravity
+
+                # Accumulate update noise
+                if caching_enabled and gravity_update_mats is not None:
+                    W_grav, K_grav, R_grav = gravity_update_mats
+                    self._accumulate_update_noise(cache_accum, W_grav, K_grav, R_grav)
 
             # 3. Standard Measurement Update
             R_tcn_override = torch.diag_embed(tcn_cov_diag) if tcn_cov_diag is not None else None
@@ -891,19 +1482,25 @@ class ErrorStateKalmanFilter(nn.Module):
             # Pass gating threshold from Config
             gating_thresh = Config.ESKFTCN.MAHALANOBIS_GATE_THRESHOLD
 
-            delta_x_up, P_after_up, innovation, mahalanobis_sq = self.update(
+            delta_x_up, P_after_up, innovation, mahalanobis_sq, meas_update_mats = self.update(
                 P_error_final,
                 quat_b_to_w_pred,
                 accel_bias_b_pred,
                 gyro_bias_b_pred,
                 measurement,
                 R_override=R_tcn_override,
-                gating_threshold=gating_thresh
+                gating_threshold=gating_thresh,
+                return_update_matrices=caching_enabled,
             )
             total_delta_x += delta_x_up
             P_error_final = P_after_up
             innovation_output = innovation
             mahalanobis_output = mahalanobis_sq
+
+            # Accumulate update noise
+            if caching_enabled and meas_update_mats is not None:
+                W_meas, K_meas, R_meas = meas_update_mats
+                self._accumulate_update_noise(cache_accum, W_meas, K_meas, R_meas)
         else:
             # Pure ESKF mode (without TCN)
             # Recompute necessary variables for innovation
@@ -943,15 +1540,21 @@ class ErrorStateKalmanFilter(nn.Module):
                     P_virtual_full = P_error_final.clone()
 
                     # Apply update to masked samples
-                    delta_x_virtual, P_after_virtual, _, _ = self.update(
+                    delta_x_virtual, P_after_virtual, _, _, virtual_update_mats = self.update(
                         P_error_final[non_zupt_mask],
                         quat_b_to_w_pred[non_zupt_mask],
                         accel_bias_b_pred[non_zupt_mask],
                         gyro_bias_b_pred[non_zupt_mask],
                         measurement[non_zupt_mask],
                         R_override=R_virtual[non_zupt_mask],
-                        gating_threshold=None  # No gating for virtual measurements
+                        gating_threshold=None,  # No gating for virtual measurements
+                        return_update_matrices=caching_enabled,
                     )
+
+                    # Accumulate update noise for non-ZUPT samples in pure ESKF mode
+                    if caching_enabled and virtual_update_mats is not None:
+                        W_virt, K_virt, R_virt = virtual_update_mats
+                        self._accumulate_update_noise(cache_accum, W_virt, K_virt, R_virt, mask=non_zupt_mask)
 
                     # Assign back to full batch tensor with learned correction weights
                     # Weights are learnable, initialized from Allan variance ratios
@@ -1008,134 +1611,13 @@ class ErrorStateKalmanFilter(nn.Module):
             "mahalanobis": mahalanobis_output.unsqueeze(-1),
         }
 
+        # --- 5. Cache matrices for parallel covariance computation ---
+        if caching_enabled:
+            self._cache_step_matrices(
+                F_cache,
+                Q_cache,
+                cache_accum['W_combined'],
+                cache_accum['noise_accumulated'],
+            )
+
         return (pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new, accel_bias_b_new, P_error_final, tcn_features)
-
-
-if __name__ == "__main__":
-    # This test case verifies the functionality and tensor shapes of the ErrorStateKalmanFilter.
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    dt_val = 0.01
-
-    # --- Test with TCN integration (simulated TCN output) ---
-    print("\n--- Testing ESKF with TCN integration ---")
-    # Instantiate ESKF with TCN-based ZUPT enabled.
-    eskf = ErrorStateKalmanFilter(dt=dt_val, device=device, use_tcn_zupt=True)
-
-    batch_size = 8192
-    # Initial nominal state: zero position/velocity, identity quaternion, zero biases.
-    pos_w_init = torch.zeros(batch_size, 3, device=device)
-    vel_w_init = torch.zeros(batch_size, 3, device=device)
-    quat_b_to_w_init = torch.zeros(batch_size, 4, device=device)
-    quat_b_to_w_init[:, 0] = 1.0
-    gyro_bias_b_init = torch.zeros(batch_size, 3, device=device)
-    accel_bias_b_init = torch.zeros(batch_size, 3, device=device)
-    # Initial error covariance with some uncertainty.
-    P_error_init = torch.eye(15, device=device).unsqueeze(0).repeat(batch_size, 1, 1) * 0.1
-
-    # Dummy IMU data for one time step.
-    accel_dummy = torch.randn(batch_size, 3, device=device) * 0.1
-    accel_dummy[0, 2] += Config.GRAVITY_MAGNITUDE  # Simulate near-static condition for ZUPT test
-    gyro_dummy = torch.randn(batch_size, 3, device=device) * 0.01
-    force_dummy = torch.rand(batch_size, 1, device=device)
-    measurement_dummy = torch.cat([accel_dummy, gyro_dummy], dim=-1)
-
-    # Dummy TCN output.
-    tcn_out_dummy = {
-        "vel_corr": torch.randn(batch_size, 3, device=device) * 0.01,
-        "covariance_R": torch.randn(batch_size, 6, device=device),
-        "zupt_prob": torch.rand(batch_size, 1, device=device),
-    }
-
-    from cProfile import Profile
-
-    profiler = Profile()
-    profiler.run('(pos_w_out, vel_w_out, quat_b_to_w_out, gyro_bias_b_out, accel_bias_b_out, P_error_out, tcn_feats_out) = eskf.forward(pos_w_init, vel_w_init, quat_b_to_w_init, gyro_bias_b_init, accel_bias_b_init, P_error_init, gyro_dummy, accel_dummy, force_dummy, measurement_dummy, tcn_output=tcn_out_dummy)')
-
-    from pstats import Stats
-
-    stats = Stats(profiler)
-    stats.strip_dirs()
-    stats.sort_stats('cumulative')
-    stats.print_stats(20)
-
-    # Run one forward pass.
-    (pos_w_out, vel_w_out, quat_b_to_w_out,
-     gyro_bias_b_out, accel_bias_b_out, P_error_out, tcn_feats_out) = eskf.forward(
-        pos_w_init, vel_w_init, quat_b_to_w_init, gyro_bias_b_init, accel_bias_b_init, P_error_init,
-        gyro_dummy, accel_dummy, force_dummy, measurement_dummy, tcn_output=tcn_out_dummy)
-
-    print(f"Updated Position (p) shape: {pos_w_out.shape}")
-    print(f"Updated Velocity (v) shape: {vel_w_out.shape}")
-    print(f"Updated Quaternion (q) shape: {quat_b_to_w_out.shape}")
-    print(f"Updated Gyro Bias (bg) shape: {gyro_bias_b_out.shape}")
-    print(f"Updated Accel Bias (ba) shape: {accel_bias_b_out.shape}")
-    print(f"Final Error Covariance (P) shape: {P_error_out.shape}")
-    print("TCN Features:")
-    for k, v in tcn_feats_out.items():
-        print(f"  - '{k}': {v.shape}")
-    print("\nESKF with TCN integration tested successfully.")
-
-    # --- Test without TCN ZUPT (using traditional ZUPT detector) ---
-    print("\n--- Testing ESKF with traditional ZUPT ---")
-    eskf_no_tcn_zupt = ErrorStateKalmanFilter(dt=dt_val, device=device, use_tcn_zupt=False, use_zupt=True)
-    (_, _, _, _, _, P_error_out_no_tcn, _) = eskf_no_tcn_zupt.forward(
-        pos_w_init, vel_w_init, quat_b_to_w_init, gyro_bias_b_init, accel_bias_b_init,
-        P_error_init, gyro_dummy, accel_dummy, force_dummy, measurement_dummy, tcn_output=None
-    )
-    print(f"Final P_error shape (no TCN ZUPT): {P_error_out_no_tcn.shape}")
-    print("ESKF with traditional ZUPT tested successfully.")
-
-    # --- Test Pure ESKF mode with learnable virtual measurement weights ---
-    print("\n--- Testing Pure ESKF with learnable virtual measurement weights ---")
-    eskf_pure = ErrorStateKalmanFilter(
-        dt=dt_val, device=device,
-        use_tcn_zupt=False, use_zupt=False,  # Disable ZUPT to ensure virtual meas are used
-        use_virtual_measurements=True  # Enable learnable weights
-    )
-
-    # Verify learnable weights exist and have correct shape
-    print(f"Virtual measurement weights shape: {eskf_pure.virtual_meas_weights.shape}")
-    print(f"Initial weights (from Allan variance):")
-    print(f"  Position:    {eskf_pure.virtual_meas_weights[0:3].tolist()}")
-    print(f"  Velocity:    {eskf_pure.virtual_meas_weights[3:6].tolist()}")
-    print(f"  Orientation: {eskf_pure.virtual_meas_weights[6:9].tolist()}")
-    print(f"  Gyro bias:   {eskf_pure.virtual_meas_weights[9:12].tolist()}")
-    print(f"  Accel bias:  {eskf_pure.virtual_meas_weights[12:15].tolist()}")
-
-    # Create motion data (not stationary) to trigger virtual measurements
-    accel_motion = torch.randn(batch_size, 3, device=device) * 2.0  # High motion
-    accel_motion[:, 2] += Config.GRAVITY_MAGNITUDE
-    gyro_motion = torch.randn(batch_size, 3, device=device) * 0.5  # High angular rate
-    measurement_motion = torch.cat([accel_motion, gyro_motion], dim=-1)
-
-    # Test forward pass with virtual measurements
-    # Note: Gradients flow through state outputs (quat, biases), NOT through P_error
-    # because virtual_meas_weights multiplies delta_x which affects state, not covariance
-    (pos_out, vel_out, quat_out, gyro_bias_out, accel_bias_out, P_error_pure, _) = eskf_pure.forward(
-        pos_w_init, vel_w_init, quat_b_to_w_init, gyro_bias_b_init, accel_bias_b_init,
-        P_error_init, gyro_motion, accel_motion, force_dummy, measurement_motion, tcn_output=None
-    )
-    print(f"Final P_error shape (pure ESKF): {P_error_pure.shape}")
-
-    # Verify weights are learnable (have gradients)
-    # Gradient flows: virtual_meas_weights -> delta_x -> inject_correction -> state outputs
-    # Use quaternion/bias outputs since position/velocity weights are blocked (set to 0)
-    loss = quat_out.sum() + gyro_bias_out.sum() + accel_bias_out.sum()
-    loss.backward()
-    has_grad = eskf_pure.virtual_meas_weights.grad is not None
-    print(f"Weights have gradients: {has_grad}")
-    if has_grad:
-        grad = eskf_pure.virtual_meas_weights.grad
-        print(f"Gradient norm: {grad.norm().item():.6f}")
-        # Check which weight groups have non-zero gradients
-        print(f"  Position grad (should be 0):    {grad[0:3].norm().item():.6f}")
-        print(f"  Velocity grad (should be 0):    {grad[3:6].norm().item():.6f}")
-        print(f"  Orientation grad:               {grad[6:9].norm().item():.6f}")
-        print(f"  Gyro bias grad:                 {grad[9:12].norm().item():.6f}")
-        print(f"  Accel bias grad:                {grad[12:15].norm().item():.6f}")
-    else:
-        print("No gradients (virtual measurement path not triggered)")
-
-    print("Pure ESKF with learnable weights tested successfully.")

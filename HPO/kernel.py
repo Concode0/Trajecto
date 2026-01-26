@@ -62,7 +62,7 @@ class HPOKernel:
 
     # ASHA Settings - Optimized for Trajecto training (epochs scale)
     # Rung progression: 5 -> 10 -> 20 -> 40 -> 80 epochs
-    RUNGS = [5, 10, 20, 40, 80]
+    RUNGS = [5, 10, 20, 40, 80, 120]
     REDUCTION_FACTOR = 2
 
     # TPE Settings
@@ -87,7 +87,7 @@ class HPOKernel:
 
         # Regularization weight: Tighter range around current default (1e-7)
         # This penalizes large TCN velocity corrections
-        "reg_weight": {"type": "log_float", "range": (-7.5, -6.0)},  # 3e-8 to 1e-6
+        "reg_weight": {"type": "log_float", "range": (-4.5, -2.0)},  # 3e-8 to 1e-6
 
         # === ESKF Parameters ===
         # Mahalanobis threshold: Narrowed to practical range
@@ -102,7 +102,7 @@ class HPOKernel:
 
         # TCN channels: Expanded to include higher capacity options
         # Current default: 96, add 64 (lighter), 128 (heavier) for exploration
-        "tcn_channel_size": {"type": "categorical", "values": [64, 96, 128]},
+        "tcn_channel_size": {"type": "categorical", "values": [96]},
 
         # === Loss Weights (DWA will adjust these, but initial values matter) ===
         # Magnitude loss initial weight

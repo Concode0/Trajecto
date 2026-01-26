@@ -76,7 +76,7 @@ FILTER_ORDER = 4
 SEGMENTATION_THRESHOLD = 0.01  # GT iPad screen force (0-1 normalized): exclude true zeros, keep actual writing (was: 0)
 SEGMENTATION_MARGIN = 30
 PIXEL_TO_METER = 0.0254 / 132.0  # iPad Retina display: 264 PPI ( 132 )
-MAX_SEQUENCE_LENGTH = int(TARGET_SAMPLING_RATE_HZ * 6.0)
+MAX_SEQUENCE_LENGTH = int(TARGET_SAMPLING_RATE_HZ * 35.0)
 TRAIN_VAL_SPLIT = 1.0
 
 SYNC_WINDOW_S = 3.0  # Window for correlation in  (reduced from 5.0 to support sequences ≥6s)

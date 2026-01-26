@@ -325,13 +325,25 @@ class BaseFilterTCNModel(nn.Module):
         filter_vel_w_seq: List[torch.Tensor] = []
         filter_innovation_seq: List[torch.Tensor] = []
 
+        # --- Hybrid CPU/GPU Mode (early init for buffer allocation) ---
+        # When enabled, keeps ESKF state tensors on CPU to avoid GPU kernel overhead
+        # for small 15x15 matrix operations. TCN still runs on GPU.
+        cpu_device = torch.device('cpu')
+        use_cpu_state = (
+            Config.ESKFTCN.CPU_STATE_PROPAGATION
+            and self.training
+            and batch_size >= Config.ESKFTCN.CPU_STATE_PROPAGATION_BATCH_THRESHOLD
+        )
+
         # Buffer to store TCN input features for the entire sequence.
         # This allows for efficient windowing for the TCN.
+        # In hybrid mode: features are computed on CPU, then window is transferred to GPU for TCN
+        feature_device = cpu_device if use_cpu_state else self.device
         tcn_feature_seq = torch.zeros(
             batch_size,
             seq_len,
             self.tcn_input_size,
-            device=self.device,
+            device=feature_device,
             dtype=imu_data_norm.dtype,
         )
         # Mask to indicate which time steps had valid TCN outputs (i.e., after RF).
@@ -339,25 +351,90 @@ class BaseFilterTCNModel(nn.Module):
             batch_size, seq_len, dtype=torch.bool, device=self.device
         )
 
+        # In hybrid mode: prepare CPU copies of input data and move state/filter to CPU
+        if use_cpu_state:
+            imu_data_raw_cpu = imu_data_raw.cpu()
+            imu_data_norm_cpu = imu_data_norm.cpu()
+            # Move initial state to CPU
+            state_tuple = tuple(s.cpu() for s in state_tuple)
+            # Move filter to CPU for sequential loop (avoids GPU kernel overhead for small 15x15 ops)
+            # TCN stays on GPU for efficient inference
+            self.filter.to(cpu_device)
+
         # --- TCN Warm-Start ---
         # Pre-fill feature buffer with first feature after t=0 to provide
         # meaningful context when TCN starts. Without this, early TCN windows
         # would contain zeros, reducing prediction quality.
         first_feature_stored = False
 
+        # --- Stride-based TCN Updates ---
+        # Run TCN every N timesteps to reduce computation (same for training and inference)
+        # ESKF physics still runs at full rate; cached TCN output is reused via zero-order hold
+        tcn_update_stride = Config.ESKFTCN.TCN_UPDATE_STRIDE
+        cached_tcn_output: Optional[Dict[str, torch.Tensor]] = None
+
+        # --- Block-Parallel Scan: Initialize caching ---
+        # When enabled, ESKF caches F, Q, W, noise_inj matrices at each step
+        # for O(log T) parallel covariance computation after the loop
+        use_block_parallel = Config.ESKFTCN.USE_BLOCK_PARALLEL and self.training
+        if use_block_parallel and hasattr(self.filter, 'init_cache'):
+            self.filter.init_cache(batch_size, seq_len, dtype=imu_data_raw.dtype)
+
+        # --- Hybrid CPU/GPU Mode: Pre-allocate CPU tensors and setup ---
+        # Check if we can use pinned memory (CUDA only, not MPS)
+        use_pinned_memory = use_cpu_state and torch.cuda.is_available() and self.device == "cuda"
+
+        if use_cpu_state:
+            # Create CPU copies of model buffers for feature computation on CPU
+            gravity_w_cpu = self.gravity_w.cpu()
+            pen_tip_offset_cpu = self.pen_tip_offset_b.detach().cpu()
+            measurement_noise_std_cpu = self.measurement_noise_std.cpu()
+
+        if use_pinned_memory:
+            # Pre-allocate PINNED memory buffer for TCN input window transfers
+            # Pinned memory enables faster CPU→GPU DMA transfers (2-3x speedup)
+            tcn_window_pinned = torch.empty(
+                batch_size, receptive_field, self.tcn_input_size,
+                dtype=imu_data_norm.dtype, pin_memory=True
+            )
+            # Pre-allocate pinned buffer for TCN output (GPU→CPU transfer)
+            tcn_output_pinned = {
+                "vel_corr": torch.empty(batch_size, 3, dtype=imu_data_norm.dtype, pin_memory=True),
+                "zupt_prob": torch.empty(batch_size, 1, dtype=imu_data_norm.dtype, pin_memory=True),
+                "covariance_R": torch.empty(batch_size, 6, dtype=imu_data_norm.dtype, pin_memory=True),
+                "gravity_b": torch.empty(batch_size, 3, dtype=imu_data_norm.dtype, pin_memory=True),
+            }
+
         # Iterate through the sequence, applying the filter step by step.
         for t in range(seq_len):
             # Extract raw IMU data for the current time step.
-            accel_b_raw = imu_data_raw[:, t, :3]
-            gyro_b_raw = imu_data_raw[:, t, 3:6]
-            force_raw = imu_data_raw[:, t, 6:]
+            # In hybrid mode: use CPU tensors for filter step
+            if use_cpu_state:
+                accel_b_raw = imu_data_raw_cpu[:, t, :3]
+                gyro_b_raw = imu_data_raw_cpu[:, t, 3:6]
+                force_raw = imu_data_raw_cpu[:, t, 6:]
+            else:
+                accel_b_raw = imu_data_raw[:, t, :3]
+                gyro_b_raw = imu_data_raw[:, t, 3:6]
+                force_raw = imu_data_raw[:, t, 6:]
 
             tcn_output: Optional[Dict[str, torch.Tensor]] = None
-            # TCN prediction: only if enough history (at least receptive_field steps) is available.
-            if t >= receptive_field:
+            # TCN prediction: only if enough history AND at stride boundary
+            # This reduces TCN computation by running only every N timesteps
+            if t >= receptive_field and (t - receptive_field) % tcn_update_stride == 0:
                 # Create a sliding window of features for the TCN.
                 start_idx = t - receptive_field
                 tcn_input_window = tcn_feature_seq[:, start_idx:t, :].clone()
+
+                # In hybrid mode: transfer window to GPU
+                if use_cpu_state:
+                    if use_pinned_memory:
+                        # Copy to pinned buffer, then async transfer to GPU (faster DMA)
+                        tcn_window_pinned.copy_(tcn_input_window)
+                        tcn_input_window = tcn_window_pinned.to(self.device, non_blocking=True)
+                    else:
+                        # Standard transfer (no pinned memory on MPS/CPU)
+                        tcn_input_window = tcn_input_window.to(self.device)
 
                 # Get predictions from the TCN. The TCN typically outputs a sequence
                 # of corrections/parameters; we take the latest prediction.
@@ -366,13 +443,46 @@ class BaseFilterTCNModel(nn.Module):
                 )
                 tcn_output = {k: v[:, -1, :] if v.dim() == 3 else v[:, -1] for k, v in tcn_output_seq.items()}
 
+                # In hybrid mode: transfer TCN output to CPU for filter step
+                if use_cpu_state:
+                    if use_pinned_memory:
+                        # Use pre-allocated pinned buffers for faster GPU→CPU transfer
+                        tcn_output_cpu = {}
+                        for k, v in tcn_output.items():
+                            if k in tcn_output_pinned:
+                                tcn_output_pinned[k].copy_(v, non_blocking=True)
+                                tcn_output_cpu[k] = tcn_output_pinned[k].clone()
+                            else:
+                                tcn_output_cpu[k] = v.cpu()
+                        # Sync to ensure transfer completes before filter uses it
+                        torch.cuda.synchronize()
+                    else:
+                        # Standard transfer (no pinned memory on MPS/CPU)
+                        tcn_output_cpu = {k: v.cpu() for k, v in tcn_output.items()}
+                    # Cache CPU version for zero-order hold
+                    cached_tcn_output = tcn_output_cpu
+                else:
+                    # Cache for zero-order hold (reused in non-stride timesteps)
+                    cached_tcn_output = tcn_output
+
                 # Store TCN predictions for later use or loss calculation.
+                # Note: Only actual TCN outputs are stored (not zero-order held values)
+                # Always store GPU tensors for loss computation
                 pred_vel_resid_b_seq.append(tcn_output["vel_corr"])
                 pred_zupt_prob_seq.append(tcn_output["zupt_prob"])
                 pred_covariance_R_seq.append(tcn_output["covariance_R"])
                 if "gravity_b" in tcn_output:
                     pred_gravity_b_seq.append(tcn_output["gravity_b"])
                 tcn_output_mask[:, t] = True
+
+                # For filter step, use CPU version in hybrid mode
+                if use_cpu_state:
+                    tcn_output = tcn_output_cpu
+            elif cached_tcn_output is not None:
+                # Zero-order hold: reuse last TCN output for ESKF update
+                # Note: tcn_output_mask stays False for held timesteps
+                # Note: Do NOT append to pred_*_seq (only actual TCN outputs are stored)
+                tcn_output = cached_tcn_output
 
             # Perform one step of the Kalman filter (prediction and update).
             # The tcn_output is passed to allow for closed-loop adaptation.
@@ -395,9 +505,21 @@ class BaseFilterTCNModel(nn.Module):
             # --- Feature Engineering for the *next* TCN input ---
             # These features are crucial for the TCN to learn effective corrections.
             # They are derived from normalized IMU data and current filter estimates.
-            accel_b_norm_t = imu_data_norm[:, t, :3]
-            gyro_b_norm_t = imu_data_norm[:, t, 3:6]
-            force_norm_t = imu_data_norm[:, t, 6:]
+            # In hybrid mode: use CPU tensors for feature computation
+            if use_cpu_state:
+                accel_b_norm_t = imu_data_norm_cpu[:, t, :3]
+                gyro_b_norm_t = imu_data_norm_cpu[:, t, 3:6]
+                force_norm_t = imu_data_norm_cpu[:, t, 6:]
+                gravity_w_local = gravity_w_cpu
+                pen_tip_offset_local = pen_tip_offset_cpu
+                measurement_noise_local = measurement_noise_std_cpu
+            else:
+                accel_b_norm_t = imu_data_norm[:, t, :3]
+                gyro_b_norm_t = imu_data_norm[:, t, 3:6]
+                force_norm_t = imu_data_norm[:, t, 6:]
+                gravity_w_local = self.gravity_w
+                pen_tip_offset_local = self.pen_tip_offset_b
+                measurement_noise_local = self.measurement_noise_std
 
             # Rotate current quaternion to get world-to-body rotation matrix.
             rot_mat_b_to_w_t = quaternion_to_rotation_matrix(quat_b_to_w)
@@ -406,7 +528,7 @@ class BaseFilterTCNModel(nn.Module):
             # Calculate estimated gravity vector in the body frame and normalize it.
             # This provides a sense of the current orientation relative to gravity.
             gravity_b_raw = (
-                rot_mat_w_to_b_t @ self.gravity_w.expand(batch_size, -1).unsqueeze(-1)
+                rot_mat_w_to_b_t @ gravity_w_local.expand(batch_size, -1).unsqueeze(-1)
             ).squeeze(-1)
             # Unit normalize (÷ g) then scale to match z-score feature range
             # Unit-normalized gravity is in [-1, +1], z-score features are in [-3, +3]
@@ -417,7 +539,7 @@ class BaseFilterTCNModel(nn.Module):
             angular_velocity_b = gyro_b_raw - gyro_bias_b
             # Tangential velocity of a point (pen tip) due to rotation relative to IMU origin.
             tangential_vel_b = torch.cross(
-                angular_velocity_b, self.pen_tip_offset_b.unsqueeze(0), dim=-1
+                angular_velocity_b, pen_tip_offset_local.unsqueeze(0), dim=-1
             )
             # Combined pen tip velocity in body frame (filter's linear velocity + tangential).
             pen_tip_vel_b = tcn_features_from_filter["body_velocity"] + tangential_vel_b
@@ -436,7 +558,7 @@ class BaseFilterTCNModel(nn.Module):
             # Safety epsilon 1e-3: prevents numerical explosion (ARW ~7e-4, VRW ~9e-3)
             # CLAMP to prevent explosion: gyro innovation can reach 100+ during motion
             innovation_norm = torch.clamp(
-                raw_innovation / (self.measurement_noise_std + 1e-3),
+                raw_innovation / (measurement_noise_local + 1e-3),
                 min=-self.innovation_clamp,
                 max=self.innovation_clamp
             )
@@ -477,9 +599,13 @@ class BaseFilterTCNModel(nn.Module):
                 rot_mat_b_to_w_t @ pen_tip_vel_b.unsqueeze(-1)
             ).squeeze(-1)
             filter_vel_w_seq.append(filter_vel_w)
-            
+
             # Log covariance
             P_error_seq.append(filter_output[-2])
+
+        # In hybrid mode: move filter back to GPU for next batch and parallel P computation
+        if use_cpu_state:
+            self.filter.to(self.device)
 
         # --- Helper for padding sequences ---
         def pad_sequence(
@@ -498,31 +624,104 @@ class BaseFilterTCNModel(nn.Module):
                 )
             # Calculate how many initial time steps were skipped (due to TCN receptive field).
             num_missing = seq_len - len(seq)
-            # Create padding tensor for the skipped steps.
-            padding_tensor = torch.zeros(
-                batch_size, num_missing, *shape_suffix, device=self.device, dtype=dtype
-            )
+            # Stack the sequence first to determine device (may be CPU in hybrid mode)
             stacked_seq = torch.stack(seq, dim=1)
+            # Create padding tensor on same device as stacked sequence
+            padding_tensor = torch.zeros(
+                batch_size, num_missing, *shape_suffix, device=stacked_seq.device, dtype=dtype
+            )
             return torch.cat([padding_tensor, stacked_seq], dim=1)
+
+        def pad_sequence_with_hold(
+            seq: List[torch.Tensor],
+            final_dim: Union[int, Tuple[int, ...]],
+            dtype: torch.dtype,
+            stride: int,
+            start_offset: int,  # receptive_field
+        ) -> torch.Tensor:
+            """Pads a strided TCN sequence with zero-order hold interpolation.
+
+            TCN outputs are collected at stride intervals starting from start_offset.
+            This function expands them to fill all timesteps using zero-order hold
+            (each value is held until the next TCN output).
+
+            Args:
+                seq: List of TCN outputs (one per stride step).
+                final_dim: Output tensor dimension(s) after batch and seq dims.
+                dtype: Data type for output tensor.
+                stride: TCN update stride (e.g., 4 = TCN runs every 4 timesteps).
+                start_offset: First timestep with TCN output (receptive_field).
+
+            Returns:
+                Tensor of shape (batch_size, seq_len, *final_dim) with held values.
+            """
+            if isinstance(final_dim, int):
+                shape_suffix = (final_dim,)
+            else:
+                shape_suffix = final_dim
+
+            output = torch.zeros(
+                batch_size, seq_len, *shape_suffix, device=self.device, dtype=dtype
+            )
+
+            if not seq:
+                return output
+
+            # Fill with zero-order hold: each TCN output fills from its timestep
+            # until the next TCN output (or end of sequence)
+            for i, tensor in enumerate(seq):
+                # Actual timestep where this TCN output was computed
+                actual_t = start_offset + i * stride
+                # Next timestep where TCN will compute (or end of sequence)
+                next_t = min(start_offset + (i + 1) * stride, seq_len)
+                if actual_t < seq_len:
+                    # Expand tensor to fill [actual_t, next_t) range
+                    output[:, actual_t:next_t, ...] = tensor.unsqueeze(1).expand(
+                        -1, next_t - actual_t, *shape_suffix
+                    )
+
+            return output
 
         # --- Stack and process collected sequences ---
         raw_trajectory_w = torch.stack(positions_w_seq, dim=1)
         quaternions_b_to_w = torch.stack(quaternions_b_to_w_seq, dim=1)
+
+        # In hybrid mode: transfer stacked tensors from CPU to GPU for loss computation
+        # Use non_blocking for overlapping transfers (sync happens at loss computation)
+        if use_cpu_state:
+            raw_trajectory_w = raw_trajectory_w.to(self.device, non_blocking=True)
+            quaternions_b_to_w = quaternions_b_to_w.to(self.device, non_blocking=True)
+
         # Convert all quaternions in the sequence to rotation matrices (body to world).
         rot_mat_b_to_w = quaternion_to_rotation_matrix(
             quaternions_b_to_w.reshape(-1, 4)
         ).view(batch_size, seq_len, 3, 3)
 
-        # Pad TCN prediction sequences.
-        pred_vel_resid_b = pad_sequence(pred_vel_resid_b_seq, 3, imu_data_raw.dtype)
-        pred_zupt_prob = pad_sequence(pred_zupt_prob_seq, 1, imu_data_raw.dtype)
+        # Pad TCN prediction sequences with zero-order hold for strided outputs.
+        # TCN runs at stride intervals; held values fill gaps between actual outputs.
+        stride = tcn_update_stride
+        pred_vel_resid_b = pad_sequence_with_hold(
+            pred_vel_resid_b_seq, 3, imu_data_raw.dtype, stride, receptive_field
+        )
+        pred_zupt_prob = pad_sequence_with_hold(
+            pred_zupt_prob_seq, 1, imu_data_raw.dtype, stride, receptive_field
+        )
         # Note: If TCN predicts R as a full matrix, final_dim would be different.
         # Assuming diagonal elements or specific covariance parameterization.
-        pred_covariance_R = pad_sequence(pred_covariance_R_seq, 6, imu_data_raw.dtype)
-        pred_gravity_b = pad_sequence(pred_gravity_b_seq, 3, imu_data_raw.dtype)  # Gravity direction
+        pred_covariance_R = pad_sequence_with_hold(
+            pred_covariance_R_seq, 6, imu_data_raw.dtype, stride, receptive_field
+        )
+        pred_gravity_b = pad_sequence_with_hold(
+            pred_gravity_b_seq, 3, imu_data_raw.dtype, stride, receptive_field
+        )  # Gravity direction
         filter_innovation = pad_sequence(filter_innovation_seq, 6, imu_data_raw.dtype)
         stacked_filter_vel_w = torch.stack(filter_vel_w_seq, dim=1)
-        
+
+        # In hybrid mode: transfer CPU tensors to GPU for loss computation (non-blocking)
+        if use_cpu_state:
+            filter_innovation = filter_innovation.to(self.device, non_blocking=True)
+            stacked_filter_vel_w = stacked_filter_vel_w.to(self.device, non_blocking=True)
+
         # Pad and stack P_error sequence
         # ESKF uses error_state_dim (15)
         if hasattr(self.filter, 'error_state_dim'):
@@ -531,10 +730,31 @@ class BaseFilterTCNModel(nn.Module):
             dim = 15  # ESKF default
 
         cov_shape = (dim, dim)
-        if P_error_seq:
-            cov_shape = P_error_seq[0].shape[1:]  # Override if sequence is non-empty
 
-        stacked_P_error = pad_sequence(P_error_seq, cov_shape, imu_data_raw.dtype)
+        # --- Block-Parallel Scan: Compute covariances in O(log T) ---
+        if use_block_parallel and hasattr(self.filter, 'finalize_cache'):
+            cache = self.filter.finalize_cache()
+            if cache is not None and cache.P_init is not None:
+                # Use parallel scan for covariance computation
+                stacked_P_error = self.filter.parallel_covariance_from_cache(
+                    cache, block_size=Config.ESKFTCN.BLOCK_SIZE
+                )
+            else:
+                # Fallback to sequential if cache is invalid
+                if P_error_seq:
+                    cov_shape = P_error_seq[0].shape[1:]
+                stacked_P_error = pad_sequence(P_error_seq, cov_shape, imu_data_raw.dtype)
+                # In hybrid mode: transfer to GPU for loss computation (non-blocking)
+                if use_cpu_state and stacked_P_error.device.type == 'cpu':
+                    stacked_P_error = stacked_P_error.to(self.device, non_blocking=True)
+        else:
+            # Standard sequential covariance stacking
+            if P_error_seq:
+                cov_shape = P_error_seq[0].shape[1:]  # Override if sequence is non-empty
+            stacked_P_error = pad_sequence(P_error_seq, cov_shape, imu_data_raw.dtype)
+            # In hybrid mode: transfer to GPU for loss computation (non-blocking)
+            if use_cpu_state and stacked_P_error.device.type == 'cpu':
+                stacked_P_error = stacked_P_error.to(self.device, non_blocking=True)
 
         # --- Final Trajectory Calculation (Open-loop vs. Closed-loop) ---
         final_pen_tip_trajectory_w: torch.Tensor
@@ -591,3 +811,4 @@ class BaseFilterTCNModel(nn.Module):
             "filter_covariance": stacked_P_error,
             "tcn_output_mask": tcn_output_mask,
         }
+

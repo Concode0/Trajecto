@@ -40,6 +40,7 @@ from model.losses import (
 )
 from model.config import Config
 from model.validation import validate_batch_tensors, validate_loss_dict
+from model.qat_tcn import QATScheduler
 
 
 @dataclass
@@ -57,7 +58,7 @@ class TwoStageConfig:
     stage1_lr: float = Config.TWO_STAGE.STAGE1_LR
     stage1_batch_size: int = Config.TWO_STAGE.STAGE1_BATCH_SIZE
     stage1_eskf_learnable: bool = Config.TWO_STAGE.STAGE1_ESKF_LEARNABLE
-    stage1_augment_multiplier: int = 5
+    stage1_augment_multiplier: int = 1
 
     # Stage 2: Mixed fine-tune
     stage2_epochs: int = Config.TWO_STAGE.STAGE2_EPOCHS
@@ -91,9 +92,19 @@ class TwoStageConfig:
     # Device (auto-detect: CUDA > MPS > CPU)
     device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
+    # torch.compile optimization (PyTorch 2.0+)
+    # Modes: "default" (balanced), "reduce-overhead" (fast for small models),
+    #        "max-autotune" (slow compile, fastest runtime), None (disabled)
+    compile_mode: Optional[str] = "reduce-overhead"
+    compile_backend: str = "inductor"  # "inductor" (default), "eager", "aot_eager"
+
     # Resume
     resume_stage1: Optional[str] = None
     resume_stage2: Optional[str] = None
+
+    # QAT
+    qat_enabled: bool = Config.ESKFTCN.QAT_ENABLED
+    qat_start_epoch: int = Config.ESKFTCN.QAT_START_EPOCH
 
 
 def freeze_eskf_params(model: nn.Module) -> None:
@@ -110,6 +121,106 @@ def unfreeze_eskf_params(model: nn.Module) -> None:
         if 'filter.R_diag' in name or 'filter.zupt_noise' in name or 'filter.virtual_meas' in name:
             param.requires_grad = True
             print(f"  Unfrozen: {name}")
+
+
+def compile_model(model: nn.Module, config: TwoStageConfig) -> nn.Module:
+    """Apply torch.compile optimization to model components.
+
+    Compiles only the TCN component for faster execution. The TCN has static
+    convolution operations that benefit most from compilation.
+
+    Note:
+    - MPS backend has limited torch.compile support, so compilation is skipped.
+    - ESKF filter is NOT compiled due to dynamic tensor reuse that conflicts
+      with CUDAGraphs optimization (causes "tensor output overwritten" errors).
+    - CUDAGraphs is disabled to avoid tensor caching issues with recurrent state.
+
+    Args:
+        model: The ESKF-TCN model to compile.
+        config: Training configuration with compile settings.
+
+    Returns:
+        The model with compiled components (or original if compilation disabled/failed).
+    """
+    # Skip if compile disabled or not available
+    if config.compile_mode is None:
+        return model
+
+    if not hasattr(torch, 'compile'):
+        print("torch.compile not available (requires PyTorch >= 2.0)")
+        return model
+
+    # Skip on MPS - limited support for torch.compile
+    if config.device == "mps":
+        print("torch.compile skipped on MPS (limited support)")
+        return model
+
+    # Disable CUDAGraphs via environment variable to avoid tensor caching conflicts
+    # with ESKF's recurrent state updates (quaternion multiply, state propagation)
+    import os
+    os.environ["TORCH_CUDAGRAPHS"] = "0"
+
+    try:
+        # Compile TCN component only - has static conv ops, benefits most from compilation
+        model.tcn = torch.compile(
+            model.tcn,
+            backend=config.compile_backend,
+            fullgraph=False,
+            dynamic=False,  # Static shapes for better optimization
+        )
+        print(f"TCN compiled with backend='{config.compile_backend}' (cudagraphs disabled)")
+
+        # NOTE: ESKF filter is intentionally NOT compiled.
+        # The filter has dynamic tensor reuse patterns (quaternion updates, state propagation)
+        # that conflict with CUDAGraphs tensor caching, causing runtime errors.
+        print("ESKF filter: eager mode (dynamic control flow incompatible with compile)")
+
+    except Exception as e:
+        print(f"torch.compile failed (using eager mode): {e}")
+
+    return model
+
+
+def create_dataloader(
+    dataset,
+    batch_size: int,
+    shuffle: bool,
+    device: str,
+) -> DataLoader:
+    """Create DataLoader with device-optimized settings.
+
+    For CUDA: Enables parallel data loading with pinned memory for faster training.
+    For MPS/CPU: Uses single-process loading (MPS has multiprocessing issues).
+
+    Args:
+        dataset: PyTorch dataset to load from.
+        batch_size: Batch size for loading.
+        shuffle: Whether to shuffle data.
+        device: Target device ("cuda", "mps", or "cpu").
+
+    Returns:
+        Configured DataLoader instance.
+    """
+    if device == "cuda":
+        # CUDA: Enable parallel loading for faster training
+        # Note: Colab free tier has limited CPUs, use 2 workers max
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=2,           # Parallel data loading (2 for Colab compatibility)
+            pin_memory=True,         # Faster CPU→GPU transfer
+            persistent_workers=True, # Keep workers alive between epochs
+            prefetch_factor=2,       # Prefetch 2 batches per worker
+        )
+    else:
+        # MPS/CPU: Single-process loading (MPS has fork issues, CPU is often I/O bound anyway)
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=0,
+        )
 
 
 def train_step(
@@ -267,9 +378,18 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
     )
     model = model.to(config.device)
 
+    # Apply torch.compile optimization
+    model = compile_model(model, config)
+
     # Freeze ESKF params explicitly
     print("Freezing ESKF parameters:")
     freeze_eskf_params(model)
+
+    # QAT Scheduler
+    qat_scheduler = QATScheduler(start_epoch=config.qat_start_epoch, enabled=config.qat_enabled)
+    # Dummy input for QAT tracing (B=1, T=100, D=InputSize)
+    dummy_tcn_input = torch.randn(1, 100, Config.ESKFTCN.TCN_INPUT_SIZE).to(config.device)
+    qat_scheduler.set_example_input(dummy_tcn_input)
 
     # Check dataset files exist
     if not os.path.exists(config.sim_dataset_path):
@@ -296,8 +416,8 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
     # Validation on real data
     val_dataset = TrajectoryDataset(config.val_dataset_path, do_augment=False)
 
-    train_loader = DataLoader(sim_dataset, batch_size=config.stage1_batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=config.stage1_batch_size, shuffle=False, num_workers=0)
+    train_loader = create_dataloader(sim_dataset, config.stage1_batch_size, shuffle=True, device=config.device)
+    val_loader = create_dataloader(val_dataset, config.stage1_batch_size, shuffle=False, device=config.device)
 
     # Only optimize non-frozen params
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -325,6 +445,9 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
         freeze_eskf_params(model)  # Re-freeze after loading
 
     for epoch in range(start_epoch, config.stage1_epochs):
+        # Apply QAT if scheduled
+        model = qat_scheduler.step(model, epoch)
+
         model.train()
         epoch_losses = {k: 0.0 for k in ["total", "mag", "cos", "zupt", "cov", "fft", "reg", "delta"]}
 
@@ -427,9 +550,18 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
         model.load_state_dict(checkpoint["model_state_dict"])
         model = model.to(config.device)
 
+        # Apply torch.compile optimization (if not already compiled from Stage 1)
+        model = compile_model(model, config)
+
     # Unfreeze ESKF params
     print("Unfreezing ESKF parameters:")
     unfreeze_eskf_params(model)
+
+    # QAT Scheduler
+    qat_scheduler = QATScheduler(start_epoch=config.qat_start_epoch, enabled=config.qat_enabled)
+    # Dummy input for QAT tracing (B=1, T=100, D=InputSize)
+    dummy_tcn_input = torch.randn(1, 100, Config.ESKFTCN.TCN_INPUT_SIZE).to(config.device)
+    qat_scheduler.set_example_input(dummy_tcn_input)
 
     # Check dataset files exist
     if not os.path.exists(config.sim_dataset_path):
@@ -468,8 +600,8 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
     mixed_dataset = MixedDataset(sim_dataset, real_dataset, sim_ratio=config.stage2_mix_ratio)
     val_dataset = TrajectoryDataset(config.val_dataset_path, do_augment=False)
 
-    train_loader = DataLoader(mixed_dataset, batch_size=config.stage2_batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=config.stage2_batch_size, shuffle=False, num_workers=0)
+    train_loader = create_dataloader(mixed_dataset, config.stage2_batch_size, shuffle=True, device=config.device)
+    val_loader = create_dataloader(val_dataset, config.stage2_batch_size, shuffle=False, device=config.device)
 
     # Separate parameter groups with different LRs
     tcn_params = []
@@ -498,6 +630,9 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
     best_val_loss = float("inf")
 
     for epoch in range(config.stage2_epochs):
+        # Apply QAT if scheduled
+        model = qat_scheduler.step(model, epoch)
+
         model.train()
         epoch_losses = {k: 0.0 for k in ["total", "mag", "cos", "zupt", "cov", "fft", "reg", "delta"]}
 
@@ -511,7 +646,7 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
             # Validate losses and print if NaN/Inf detected
             is_valid, error_msg = validate_loss_dict(losses, epoch, i_batch)
             if not is_valid:
-                print(f"\n⚠️  {error_msg}")
+                print(f"\n{error_msg}")
                 continue
 
             losses["total"].backward()
@@ -586,7 +721,23 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--model-name", type=str, default="eskf_tcn_two_stage")
 
+    # torch.compile options
+    parser.add_argument("--compile", type=str, default="reduce-overhead",
+                        choices=["default", "reduce-overhead", "max-autotune", "none"],
+                        help="torch.compile mode (default: reduce-overhead, 'none' to disable)")
+    parser.add_argument("--compile-backend", type=str, default="inductor",
+                        choices=["inductor", "eager", "aot_eager"],
+                        help="torch.compile backend (default: inductor)")
+
+    # QAT options
+    parser.add_argument("--qat", action="store_true", help="Enable Quantization Aware Training (QAT)")
+    parser.add_argument("--qat-start-epoch", type=int, default=Config.ESKFTCN.QAT_START_EPOCH,
+                        help="Epoch to start QAT (after warmup)")
+
     args = parser.parse_args()
+
+    # Parse compile mode (convert 'none' string to None)
+    compile_mode = None if args.compile == "none" else args.compile
 
     config = TwoStageConfig(
         sim_dataset_path=args.sim_dataset,
@@ -606,6 +757,10 @@ def main():
         model_name=args.model_name,
         resume_stage1=args.resume_stage1,
         resume_stage2=args.resume_stage2,
+        compile_mode=compile_mode,
+        compile_backend=args.compile_backend,
+        qat_enabled=args.qat,
+        qat_start_epoch=args.qat_start_epoch,
     )
 
     if args.skip_stage1 or args.resume_stage2:

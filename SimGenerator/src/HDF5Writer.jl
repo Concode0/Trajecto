@@ -133,7 +133,7 @@ end
 Export trajectory samples to HDF5 file.
 
 Format matches model/dataset.py:
-- Each sample as a group: "sim_sample_XXX"
+- Each sample as a group: "sample_XXX"
 - Datasets: sensor_data, gt_pos_data, gt_vel_data, gt_gravity_b_data, pen_down
 - Attributes: sequence_length, original_label
 
@@ -154,7 +154,7 @@ function export_hdf5(path::String, samples::Vector{TrajectoryData};
 
     h5open(path, "w") do f
         for (i, sample) in enumerate(samples)
-            grp_name = "sim_sample_$(lpad(i-1, 3, '0'))"
+            grp_name = "sample_$(lpad(i-1, 3, '0'))"
             grp = create_group(f, grp_name)
 
             # Pad sequences to fixed length and transpose for row-major (Python) storage

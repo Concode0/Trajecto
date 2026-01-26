@@ -64,6 +64,45 @@ function run_single_analysis(sample_id::String)
     println("   ✓ Generated trajectory: $(size(trajectory.pos))")
     println()
 
+    # --- CRLB Analysis ---
+    if MODEL_TYPE in ["eskf", "aekf", "pure_eskf"]
+        println("   > Running CRLB Analysis...")
+        try
+            # Extract sensor data
+            acc = input_stream.sensor[:, 1:3]
+            gyro = input_stream.sensor[:, 4:6]
+            
+            # Use estimated rotation and ZUPT for linearization
+            rot = trajectory.rot
+            zupt = trajectory.zupt .> 0.5 # Threshold probability
+            
+            config = CRLBConfig() # Use defaults
+            crlb = compute_crlb(acc, gyro, rot, zupt, Config.DEFAULT_DT, config)
+            
+            # Compare uncertainties at the end of trajectory
+            final_crlb_pos = norm(crlb.std_pos[end, :])
+            final_est_std = sqrt(tr(trajectory.cov[end, 1:3, 1:3]))
+            
+            # Calculate actual error (drift)
+            drift = norm(trajectory.pos[end, :] - trajectory.pos[1, :]) # Simplified drift
+            # Or better: error w.r.t Ground Truth (if aligned) - but here we check drift/uncertainty consistency
+            
+            println("     CRLB Position Std (End): $(round(final_crlb_pos * 1000, digits=2)) mm")
+            println("     Est. Position Std (End): $(round(final_est_std * 1000, digits=2)) mm")
+            println("     Actual Drift (End):      $(round(drift * 1000, digits=2)) mm")
+            
+            if final_est_std < final_crlb_pos
+                println("     ⚠ WARNING: Estimator is over-confident (Est < CRLB)")
+            else
+                println("     ✓ Estimator is consistent (Est >= CRLB)")
+            end
+        catch e
+            println("     ⚠ CRLB Analysis failed: $e")
+        end
+        println()
+    end
+    # ---------------------
+
     println("[3/3] Application Layer: Launching Dashboard...")
     app = MakieDashboard()
     run_app(app, trajectory, input_stream)

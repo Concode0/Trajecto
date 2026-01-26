@@ -156,29 +156,73 @@ function AbstractLayers.predict_trajectory(estimator::TrajectoEstimator, input_d
         
         pred_pos_py = nothing
         pred_cov_py = nothing
+        pred_rot_py = nothing
+        pred_zupt_py = nothing
+        
+        seq_len = 0
         
         if estimator.model_type == "tcn"
             # OnlyTCN returns tensor directly
             pred_pos_py = output.squeeze(0) # (Seq, 3)
+            seq_len = pred_pos_py.shape[0]
             # Dummy covariance
-            seq_len = pred_pos_py.shape[0]
-            # Create a zero covariance matrix (Seq, 15, 15)
             pred_cov_py = engine.torch.zeros(seq_len, 15, 15)
-        elseif estimator.model_type in ["pure_eskf", "pure_integration"]
-            # Baseline models return only position
-            pred_pos_py = output["pred_pos_w"].squeeze(0) # (Seq, 3)
-            # Dummy covariance for baselines
+            # Dummy rotation (Identity)
+            pred_rot_py = engine.torch.eye(3).unsqueeze(0).repeat(seq_len, 1, 1)
+            # Dummy ZUPT (Zeros)
+            pred_zupt_py = engine.torch.zeros(seq_len)
+            
+        elseif estimator.model_type == "pure_integration"
+            # Baseline models return only position usually, but let's check
+            # Assuming it returns a Dict or just position
+            if pyisinstance(output, AbstractDict)
+                 pred_pos_py = output["pred_pos_w"].squeeze(0)
+            else
+                 pred_pos_py = output.squeeze(0)
+            end
+            
             seq_len = pred_pos_py.shape[0]
             pred_cov_py = engine.torch.zeros(seq_len, 15, 15)
+            pred_rot_py = engine.torch.eye(3).unsqueeze(0).repeat(seq_len, 1, 1)
+            pred_zupt_py = engine.torch.zeros(seq_len)
+
         else
-            # Hybrid models (ESKF-TCN, AEKF-TCN) return Dict with covariance
+            # Hybrid models (ESKF-TCN, AEKF-TCN, Pure-ESKF) return Dict
             pred_pos_py = output["pred_pos_w"].squeeze(0) # (Seq, 3)
-            pred_cov_py = output["filter_covariance"].squeeze(0) # (Seq, 15, 15) or (Seq, 16, 16)
+            seq_len = pred_pos_py.shape[0]
+            
+            # Covariance
+            if "filter_covariance" in output
+                pred_cov_py = output["filter_covariance"].squeeze(0) # (Seq, 15, 15)
+            else
+                pred_cov_py = engine.torch.zeros(seq_len, 15, 15)
+            end
+            
+            # Rotation (Quaternion -> Matrix)
+            if "filter_quat" in output
+                # (Seq, 4)
+                quats = output["filter_quat"].squeeze(0)
+                # Use scipy if available or rotation_utils
+                # We can use model.rotation_utils.quaternion_to_rotation_matrix
+                rot_utils = pyimport("model.rotation_utils")
+                pred_rot_py = rot_utils.quaternion_to_rotation_matrix(quats) # (Seq, 3, 3)
+            else
+                 pred_rot_py = engine.torch.eye(3).unsqueeze(0).repeat(seq_len, 1, 1)
+            end
+            
+            # ZUPT Probability
+            if "pred_zupt_prob" in output
+                pred_zupt_py = output["pred_zupt_prob"].squeeze(0).squeeze(-1) # (Seq,)
+            else
+                pred_zupt_py = engine.torch.zeros(seq_len)
+            end
         end
         
         return (
             pos = pyconvert(Array, pred_pos_py),
-            cov = pyconvert(Array, pred_cov_py)
+            cov = pyconvert(Array, pred_cov_py),
+            rot = pyconvert(Array, pred_rot_py),
+            zupt = pyconvert(Array, pred_zupt_py)
         )
     end
 end

@@ -30,8 +30,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs for tuning run")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--dataset", type=str, default="data/dataset.h5")
-    parser.add_argument("--val_dataset", type=str, default="data/validation_dataset.h5")
+    parser.add_argument("--dataset", type=str, default="data/hpo_dataset.h5")
+    parser.add_argument("--val_dataset", type=str, default="data/hpo_dataset.h5")
 
     # Hyperparameters from HPO/kernel.py PARAM_SPACE
     # Architecture
@@ -97,10 +97,10 @@ def main():
     try:
         # Run Training
         final_loss = train(config)
-        
+
         # Report Result to HPO Agent
         print(f"FINAL_LOSS: {final_loss}")
-        
+
     except Exception as e:
         print(f"Training failed with error: {e}", file=sys.stderr)
         # Return a high loss to indicate failure, or let the agent handle the non-zero exit code

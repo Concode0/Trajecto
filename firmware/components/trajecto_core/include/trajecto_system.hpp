@@ -22,6 +22,10 @@ public:
         eskf_.initialize(accel_init);
         last_innovation_.setZero();
         initialized_ = true;
+
+        // Reset stride-based TCN control
+        step_counter_ = 0;
+        tcn_output_valid_ = false;
     }
 
     void step(const Eigen::Vector3f& accel, const Eigen::Vector3f& gyro, float force) {
@@ -36,7 +40,19 @@ public:
 
         eskf_.predict(gyro, accel);
 
-        TCNOutput tcn_out = tcn_.process_step(accel, gyro, force, eskf_, last_innovation_, is_zupt_heuristic);
+        // Stride-based TCN: run only every N timesteps (zero-order hold, matches Python training)
+        TCNOutput tcn_out;
+        if (step_counter_ % TCN_UPDATE_STRIDE == 0) {
+            tcn_out = tcn_.process_step(accel, gyro, force, eskf_, last_innovation_, is_zupt_heuristic);
+            cached_tcn_out_ = tcn_out;  // Cache for zero-order hold
+            tcn_output_valid_ = true;
+        } else if (tcn_output_valid_) {
+            tcn_out = cached_tcn_out_;  // Reuse cached output
+        } else {
+            // No valid TCN output yet (initial timesteps before first TCN run)
+            tcn_out.valid = false;
+        }
+        step_counter_++;
 
         Eigen::Matrix<float, 6, 1> R_diag;
         R_diag.setConstant(1e-4f);
@@ -90,6 +106,11 @@ private:
     Eigen::Matrix<float, 6, 1> last_innovation_;
     bool initialized_ = false;
     float zupt_prob_ = 0.0f;
+
+    // Stride-based TCN control (matches Python training: TCN runs every 4 timesteps)
+    int step_counter_ = 0;           // Counts timesteps for stride control
+    TCNOutput cached_tcn_out_;       // Zero-order hold: cached TCN output
+    bool tcn_output_valid_ = false;  // Whether we have a valid cached output
 };
 
 } // namespace trajecto

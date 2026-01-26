@@ -46,7 +46,7 @@ println("[1/4] Loading data from HDF5...")
 loader = HDF5Perception(h5_path)
 input_stream = process_input(loader, sample_id)
 println("   ✓ Loaded sensor data: $(size(input_stream.sensor))")
-println("   ✓ Loaded ground truth: $(size(input_stream.ground_truth))")
+println("   ✓ Loaded ground truth: $(size(input_stream.gt_pos))")
 println()
 
 # Define models to compare
@@ -57,7 +57,7 @@ models_config = [
 ]
 
 # Storage for results
-results = Dict()
+results_for_dashboard = []
 
 # Run each model
 for (idx, config) in enumerate(models_config)
@@ -71,7 +71,7 @@ for (idx, config) in enumerate(models_config)
         trajectory = predict_trajectory(estimator, input_stream.sensor)
 
         # Store results
-        results[config.name] = trajectory
+        push!(results_for_dashboard, (name=config.name, trajectory=trajectory))
 
         println("   ✓ Generated trajectory: $(size(trajectory.pos))")
 
@@ -83,7 +83,7 @@ for (idx, config) in enumerate(models_config)
 
     catch e
         println("   ✗ Error: $e")
-        results[config.name] = nothing
+        push!(results_for_dashboard, (name=config.name, trajectory=nothing))
     end
     println()
 end
@@ -93,11 +93,11 @@ println("=" ^ 80)
 println("COMPARISON SUMMARY")
 println("=" ^ 80)
 
-for (idx, config) in enumerate(models_config)
-    traj = results[config.name]
-    if traj !== nothing
+for res in results_for_dashboard
+    if res.trajectory !== nothing
+        traj = res.trajectory
         drift = sqrt(sum((traj.pos[end, :] - traj.pos[1, :]).^2)) * 1000
-        println("$(config.name):")
+        println("$(res.name):")
         println("  Drift: $(round(drift, digits=2)) mm")
 
         # Calculate path length
@@ -116,18 +116,8 @@ println("=" ^ 80)
 println("Launching interactive dashboard for visual comparison...")
 println()
 
-# Launch dashboard with the best model (ESKF-TCN if available)
-best_model = "ESKF-TCN Hybrid"
-if results[best_model] !== nothing
-    app = MakieDashboard()
-    run_app(app, results[best_model], input_stream)
-else
-    println("Warning: ESKF-TCN model not available, launching Pure ESKF instead")
-    if results["Pure ESKF"] !== nothing
-        app = MakieDashboard()
-        run_app(app, results["Pure ESKF"], input_stream)
-    end
-end
+app = MakieDashboard()
+run_app_comparison(app, results_for_dashboard, input_stream)
 
 println()
 println("Analysis complete.")

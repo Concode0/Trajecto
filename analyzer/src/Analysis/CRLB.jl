@@ -109,6 +109,7 @@ function compute_crlb(acc::AbstractMatrix, gyro::AbstractMatrix, rot::AbstractAr
         F[1:3, 4:6] .= I(3) * dt
         
         # Vel -> Att: -R_wb * skew(a_b)
+        # Matches Body-Frame Error definition: delta_v_dot = ... - R * skew(a_b) * delta_theta_b
         R_mat = SMatrix{3,3}(R_wb)
         S_a = skew(a_b)
         F[4:6, 7:9] = -R_mat * S_a * dt
@@ -116,8 +117,9 @@ function compute_crlb(acc::AbstractMatrix, gyro::AbstractMatrix, rot::AbstractAr
         # Vel -> AccBias: -R_wb
         F[4:6, 10:12] = -R_mat * dt
         
-        # Att -> GyroBias: -R_wb (assuming global error def)
-        F[7:9, 13:15] = -R_mat * dt
+        # Att -> GyroBias: -I (Body-Frame Error)
+        # Matches ESKF.py: delta_theta_dot = ... - delta_gyro_bias
+        F[7:9, 13:15] = -I(3) * dt
         
         # 3. Process Noise Q
         Q = zeros(15, 15)

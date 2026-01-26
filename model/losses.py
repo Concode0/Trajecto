@@ -222,6 +222,8 @@ def sliding_window_delta_loss(
 ) -> torch.Tensor:
     """Semi-loop closure loss via sliding window delta position comparison.
 
+    Vectorized implementation using advanced indexing instead of nested loops.
+
     For each window [t, t+W]:
         delta_pred = pred_pos[t+W] - pred_pos[t]
         delta_gt = gt_pos[t+W] - gt_pos[t]
@@ -241,7 +243,7 @@ def sliding_window_delta_loss(
     Returns:
         Scalar loss value
     """
-    _, T, _ = pred_pos.shape
+    B, T, _ = pred_pos.shape
     device = pred_pos.device
     total_loss = torch.tensor(0.0, device=device)
 
@@ -249,25 +251,33 @@ def sliding_window_delta_loss(
         if T <= w_size:
             continue
 
-        window_loss = torch.tensor(0.0, device=device)
-        count = 0
+        # Generate all window start indices with stride
+        start_indices = torch.arange(0, T - w_size, stride, device=device)
+        end_indices = start_indices + w_size
+        num_windows = len(start_indices)
 
-        for t in range(0, T - w_size, stride):
-            # Check both endpoints are valid
-            valid = mask[:, t] & mask[:, t + w_size]
-            if not valid.any():
-                continue
+        if num_windows == 0:
+            continue
 
-            # Compute deltas (displacement over window)
-            delta_pred = pred_pos[valid, t + w_size] - pred_pos[valid, t]
-            delta_gt = gt_pos[valid, t + w_size] - gt_pos[valid, t]
+        # Vectorized validity check: [B, num_windows]
+        valid_start = mask[:, start_indices]  # [B, num_windows]
+        valid_end = mask[:, end_indices]      # [B, num_windows]
+        valid_windows = valid_start & valid_end
 
-            # L1 loss on displacement error
-            window_loss = window_loss + F.l1_loss(delta_pred, delta_gt, reduction='mean')
-            count += 1
+        # Vectorized delta computation: [B, num_windows, 3]
+        delta_pred = pred_pos[:, end_indices] - pred_pos[:, start_indices]
+        delta_gt = gt_pos[:, end_indices] - gt_pos[:, start_indices]
 
-        if count > 0:
-            total_loss = total_loss + w_weight * (window_loss / count)
+        # L1 loss per window per batch: [B, num_windows]
+        window_losses = F.l1_loss(delta_pred, delta_gt, reduction='none').mean(dim=-1)
+
+        # Apply mask and average over valid windows
+        masked_losses = window_losses * valid_windows.float()
+        valid_count = valid_windows.float().sum()
+
+        if valid_count > 0:
+            window_loss = masked_losses.sum() / valid_count
+            total_loss = total_loss + w_weight * window_loss
 
     return total_loss
 

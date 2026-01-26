@@ -316,9 +316,16 @@ def convert_to_tflite(
     converter = tf.lite.TFLiteConverter.from_saved_model(tf_model_dir)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative_dataset_gen
-    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    converter.inference_input_type = tf.int8
-    converter.inference_output_type = tf.int8
+    # Use INT8 for internal ops but keep FP32 for I/O (firmware uses float tensors)
+    # This provides INT8 speedup while avoiding quantization/dequantization in firmware
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,  # For FP32 I/O ops
+        tf.lite.OpsSet.TFLITE_BUILTINS_INT8  # For INT8 internal ops
+    ]
+    # Keep FP32 I/O - firmware copies float data directly to input tensors
+    # (see tcn_wrapper.cpp: std::memcpy(input_feat->data.f, features.data(), ...))
+    converter.inference_input_type = tf.float32
+    converter.inference_output_type = tf.float32
 
     tflite_model = converter.convert()
 
@@ -367,7 +374,8 @@ def generate_cpp_header(
         f.write("// TCN Architecture\n")
         f.write(f"constexpr int TCN_INPUT_SIZE = {input_size};\n")
         f.write(f"constexpr int TCN_NUM_LAYERS = {len(state_shapes)};\n")
-        f.write(f"constexpr float DT = {Config.DT:.10f}f;\n\n")
+        f.write(f"constexpr float DT = {Config.DT:.10f}f;\n")
+        f.write(f"constexpr int TCN_UPDATE_STRIDE = {Config.ESKFTCN.TCN_UPDATE_STRIDE};\n\n")
 
         # State buffer dimensions
         f.write("// State Buffer Dimensions {channels, history}\n")
@@ -392,13 +400,37 @@ def generate_cpp_header(
         f.write(", ".join(f"{x:.8f}f" for x in pen_offset))
         f.write("};\n\n")
 
-        # Velocity correction scale
-        f.write("// Velocity Correction Scale (m/s)\n")
+        # Velocity normalization
+        f.write("// Velocity Normalization (isotropic, from Python config)\n")
+        f.write(f"constexpr float VEL_STD_L2 = {Config.VEL_STD_L2:.15f}f;\n")
         f.write(f"constexpr float VEL_CORRECTION_SCALE = {Config.VEL_CORRECTION_SCALE:.8f}f;\n\n")
+
+        # Innovation normalization (Allan variance based)
+        f.write("// Innovation Normalization (Allan variance based)\n")
+        max_vrw = max(Config.VRW_X, Config.VRW_Y, Config.VRW_Z)
+        max_arw = max(Config.ARW_X, Config.ARW_Y, Config.ARW_Z)
+        f.write(f"constexpr float MAX_VRW = {max_vrw:.4e}f;  // max(VRW_X, VRW_Y, VRW_Z)\n")
+        f.write(f"constexpr float MAX_ARW = {max_arw:.4e}f;  // max(ARW_X, ARW_Y, ARW_Z)\n")
+        f.write(f"constexpr float INNOVATION_CLAMP_RANGE = {Config.INNOVATION_CLAMP_RANGE:.1f}f;\n\n")
 
         # Physical constants
         f.write("// Physical Constants\n")
-        f.write(f"constexpr float GRAVITY_MAGNITUDE = {Config.GRAVITY_MAGNITUDE:.6f}f;\n\n")
+        f.write(f"constexpr float GRAVITY_MAGNITUDE = {Config.GRAVITY_MAGNITUDE:.6f}f;\n")
+        f.write(f"constexpr float GRAVITY_NORM_SCALE = {Config.GRAVITY_NORM_SCALE:.1f}f;\n\n")
+
+        # ESKF Parameters (centralized - previously hardcoded in eskf.cpp)
+        f.write("// ESKF Parameters (from Config.ESKFTCN)\n")
+        f.write(f"constexpr float ZUPT_NOISE_STD = {Config.ESKFTCN.ZUPT_NOISE_STD:.6f}f;\n")
+        f.write(f"constexpr float TCN_VEL_NOISE_STD = {Config.ESKFTCN.TCN_VEL_NOISE_STD:.6f}f;\n")
+        f.write(f"constexpr float MAHALANOBIS_GATE_THRESHOLD = {Config.ESKFTCN.MAHALANOBIS_GATE_THRESHOLD_IMU:.1f}f;\n")
+        f.write(f"constexpr float ZUPT_HARD_RESET_THRESHOLD = {Config.ESKFTCN.ZUPT_HARD_RESET_THRESHOLD:.2f}f;\n\n")
+
+        # Allan Variance noise parameters (for ESKF process noise)
+        f.write("// Allan Variance Noise Parameters (for ESKF Q matrix)\n")
+        f.write(f"constexpr float VRW_X = {Config.VRW_X:.4e}f, VRW_Y = {Config.VRW_Y:.4e}f, VRW_Z = {Config.VRW_Z:.4e}f;\n")
+        f.write(f"constexpr float ARW_X = {Config.ARW_X:.4e}f, ARW_Y = {Config.ARW_Y:.4e}f, ARW_Z = {Config.ARW_Z:.4e}f;\n")
+        f.write(f"constexpr float GYRO_BI_X = {Config.GYRO_BI_X:.4e}f, GYRO_BI_Y = {Config.GYRO_BI_Y:.4e}f, GYRO_BI_Z = {Config.GYRO_BI_Z:.4e}f;\n")
+        f.write(f"constexpr float ACCEL_BI_X = {Config.ACCEL_BI_X:.4e}f, ACCEL_BI_Y = {Config.ACCEL_BI_Y:.4e}f, ACCEL_BI_Z = {Config.ACCEL_BI_Z:.4e}f;\n\n")
 
         f.write("} // namespace trajecto\n")
 

@@ -100,8 +100,9 @@ struct SimulationParams
 
     # Grip style and handedness
     grip_style::Union{GripStyleParams, Nothing}  # nothing = random selection
-    handedness::HandednessParams
+    handedness::Union{HandednessParams, Nothing} # nothing = random selection
     randomize_grip::Bool  # If true, randomly select grip style for each sample
+    randomize_handedness::Bool # If true, randomly select handedness for each sample
 
     # World rotation augmentation
     world_rotation_params::WorldRotationParams
@@ -123,7 +124,8 @@ const DEFAULT_SIM_PARAMS = SimulationParams(
     true,  # use_ik
     DEFAULT_GRIP_STYLE,  # grip_style
     DEFAULT_HANDEDNESS,  # handedness
-    false,  # randomize_grip
+    true,  # randomize_grip
+    true,  # randomize_handedness
     DEFAULT_WORLD_ROTATION_PARAMS,  # world rotation augmentation
     DEFAULT_TREMOR_PARAMS,
     DEFAULT_PINK_NOISE_PARAMS,
@@ -180,12 +182,19 @@ function generate_sample(; num_strokes::Int=DEFAULT_NUM_STROKES,
         sim_params.grip_style
     end
 
+    # Determine handedness
+    handedness = if sim_params.randomize_handedness || sim_params.handedness === nothing
+        rand(rng) < 0.5 ? RIGHT_HAND_PARAMS : LEFT_HAND_PARAMS
+    else
+        sim_params.handedness
+    end
+
     # Layer 2: Posture - Generate orientation with grip style and handedness
     # Uses rotated trajectory so orientation is relative to rotated world frame
     orientation = if sim_params.use_ik
         generate_orientation_with_style(trajectory_rotated;
                                         grip_style=grip_style,
-                                        handedness=sim_params.handedness,
+                                        handedness=handedness,
                                         arm_params=sim_params.arm_params,
                                         joint_limits=sim_params.joint_limits,
                                         ik_params=sim_params.ik_params,
@@ -238,7 +247,7 @@ function generate_sample(; num_strokes::Int=DEFAULT_NUM_STROKES,
         max_vel,
         path_length,
         string(grip_style.style),
-        string(sim_params.handedness.hand)
+        string(handedness.hand)
     )
 
     # Package as TrajectoryData (use rotated world-frame data)

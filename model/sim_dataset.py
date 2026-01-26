@@ -54,7 +54,7 @@ class SimulatedDataset(Dataset):
 
         print(f"Loading simulated dataset from {sim_file}...")
         with h5py.File(sim_file, "r") as f:
-            keys = [k for k in f.keys() if k.startswith("sim_sample_")]
+            keys = [k for k in f.keys() if k.startswith("sample_")]
             for key in tqdm(keys, desc="Caching sim dataset"):
                 sensor = f[key]["sensor_data"][:]
                 pos = f[key]["gt_pos_data"][:]

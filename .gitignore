@@ -21,6 +21,12 @@ acquired_data_long/
 checkpoints/
 hpo_checkpoints/
 firmware/.cache/
+COMPLETE_WORKFLOW.md
 
 # Virtual environments
 .venv
+
+# Large files and logs
+*.zip
+*.log
+config_statistics.txt

@@ -8,6 +8,7 @@ This script creates a small mixed dataset by sampling from:
 The mixed dataset is used for fast HPO iterations before full-scale training.
 """
 
+import sys, os
 import argparse
 import random
 from pathlib import Path
@@ -17,8 +18,9 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-from model.config import Config
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
+from model.config import Config
 
 def list_samples(h5_file: h5py.File) -> List[str]:
     """List all sample keys in an HDF5 file.

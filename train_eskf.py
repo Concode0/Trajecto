@@ -37,6 +37,7 @@ from model.losses import (
 )
 from model.config import Config
 from model.validation import validate_batch_tensors, validate_loss_dict
+from model.qat_tcn import QATScheduler, PT2E_AVAILABLE
 
 
 # =============================================================================
@@ -90,6 +91,10 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     model_name: str = "eskf_tcn_dwa_gyro"
     resume_path: Optional[str] = None
+
+    # Quantization-Aware Training (QAT)
+    qat_enabled: bool = Config.ESKFTCN.QAT_ENABLED
+    qat_start_epoch: int = Config.ESKFTCN.QAT_START_EPOCH
 
     # Device (auto-detect: CUDA > MPS > CPU)
     device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -293,8 +298,28 @@ def train(config: TrainConfig, check_grads: bool = False, model: Optional[nn.Mod
         return_normalized=True
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0)
+    # Data loader optimization: use multiple workers for parallel data loading
+    # pin_memory speeds up GPU transfers (only useful for CUDA)
+    num_workers = 4 if config.device != "mps" else 0  # MPS has issues with multiprocessing
+    pin_memory = config.device == "cuda"
+    persistent = num_workers > 0
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+    )
 
     if model is None:
         model = ESKFTCN_model(
@@ -313,9 +338,24 @@ def train(config: TrainConfig, check_grads: bool = False, model: Optional[nn.Mod
     if hasattr(torch, 'compile') and config.device != "mps":
         try:
             model.filter = torch.compile(model.filter, mode="reduce-overhead")
-            print("✓ ESKF compiled with torch.compile for faster execution")
+            print("ESKF compiled with torch.compile for faster execution")
         except Exception as e:
-            print(f"⚠ torch.compile failed (using eager mode): {e}")
+            print(f"torch.compile failed (using eager mode): {e}")
+
+    # Initialize QAT Scheduler
+    qat_scheduler = None
+    if config.qat_enabled:
+        if PT2E_AVAILABLE:
+            qat_scheduler = QATScheduler(
+                start_epoch=config.qat_start_epoch,
+                enabled=True
+            )
+            # Create example input for QAT export (B, T, D)
+            example_input = torch.randn(1, 100, model.tcn_input_size).to(config.device)
+            qat_scheduler.set_example_input(example_input)
+            print(f"QAT enabled: will activate at epoch {config.qat_start_epoch}")
+        else:
+            print("Warning: QAT requested but PT2E not available (requires PyTorch >= 2.1)")
 
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=1e-6)
@@ -339,6 +379,10 @@ def train(config: TrainConfig, check_grads: bool = False, model: Optional[nn.Mod
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
     for epoch in range(start_epoch, config.epochs):
+        # QAT: Check if we should activate quantization-aware training at this epoch
+        if qat_scheduler is not None:
+            model = qat_scheduler.step(model, epoch)
+
         model.train()
 
         # Accumulators for DWA calculation
@@ -357,7 +401,7 @@ def train(config: TrainConfig, check_grads: bool = False, model: Optional[nn.Mod
             # Validate losses and print if NaN/Inf detected
             is_valid, error_msg = validate_loss_dict(losses, epoch, i_batch)
             if not is_valid:
-                print(f"\n⚠️  {error_msg}")
+                print(f"\n{error_msg}")
                 continue
 
             # (Optional) Gradient Check
@@ -408,17 +452,22 @@ def train(config: TrainConfig, check_grads: bool = False, model: Optional[nn.Mod
         if val_losses["total"] < best_val_loss:
             best_val_loss = val_losses["total"]
             save_path = Path(config.checkpoint_dir) / f"{config.model_name}_best.pth"
-            torch.save({
+            checkpoint_data = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "val_loss": val_losses["total"],
                 "config": config,
-            }, save_path)
-            print(f"  Saved best model.")
+            }
+            # Save QAT state if active
+            if qat_scheduler is not None:
+                checkpoint_data["qat_active"] = qat_scheduler.is_active()
+            torch.save(checkpoint_data, save_path)
+            print(f"  Saved best model." + (" [QAT]" if qat_scheduler and qat_scheduler.is_active() else ""))
 
-    print(f"Training complete. Best val_loss: {best_val_loss:.4f}")
+    qat_status = " (QAT trained)" if (qat_scheduler and qat_scheduler.is_active()) else ""
+    print(f"Training complete{qat_status}. Best val_loss: {best_val_loss:.4f}")
     return best_val_loss
 
 
@@ -429,7 +478,7 @@ def main():
     parser.add_argument("--val-dataset", type=str, default="data/dataset.h5")
     # Training
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--resume", type=str, default=None)
     # Loss weights (Initial/Fallback)
@@ -443,6 +492,10 @@ def main():
     parser.add_argument("--no-delta-loss", action="store_true", help="Disable delta loss")
     parser.add_argument("--w-delta", type=float, default=Config.DELTA_LOSS.WEIGHT)
     parser.add_argument("--check-grads", action="store_true")
+    # QAT (Quantization-Aware Training)
+    parser.add_argument("--qat", action="store_true", help="Enable Quantization-Aware Training")
+    parser.add_argument("--qat-start-epoch", type=int, default=Config.ESKFTCN.QAT_START_EPOCH,
+                        help=f"Epoch to start QAT (default: {Config.ESKFTCN.QAT_START_EPOCH})")
 
     args = parser.parse_args()
 
@@ -460,7 +513,9 @@ def main():
         w_reg=args.w_reg,
         use_delta_loss=not args.no_delta_loss,
         w_delta=args.w_delta,
-        resume_path=args.resume
+        resume_path=args.resume,
+        qat_enabled=args.qat,
+        qat_start_epoch=args.qat_start_epoch
     )
 
     train(config, check_grads=args.check_grads)

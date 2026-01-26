@@ -47,12 +47,12 @@ class Config:
     # =========================================================================
     # To regenerate: python utils/compute_config_statistics.py
     # Dataset: data/dataset.h5 (42 samples, 12,600 timesteps)
-    # Last updated: 2026-01-05
+    # Last updated: 2026-01-20
     # =========================================================================
 
     # --- Velocity Statistics (from ground truth) ---
     # L2 norm of per-axis velocity std, used for isotropic body-frame normalization
-    VEL_STD_L2 = 0.152273716759559  # m/s
+    VEL_STD_L2 = 0.0994355743293535  # m/s
 
     # Velocity correction scale for log1p activation
     # With log1p: output = sign(x) * log1p(|x|) * scale
@@ -81,6 +81,11 @@ class Config:
     class ESKFTCN:
         # TCN Architecture
         TCN_INPUT_SIZE = 16
+
+        # TCN Update Stride (12.5Hz = stride 4 at 50Hz base rate)
+        # Run TCN every N timesteps (both training and inference)
+        # ESKF physics still runs at full 50Hz rate
+        TCN_UPDATE_STRIDE = 4
         TCN_CHANNELS = [96, 96, 96, 96]
         KERNEL_SIZE = 3
         DROPOUT = 0.15
@@ -90,10 +95,24 @@ class Config:
         TCN_STATIC_DILATIONS = [4, 8]
         USE_SEPARABLE_CONV = False
 
+        # Make more directed dilation factors, current system see 39/50 ->  0.78s ( it may be little tight... )
+
+        # --- ESKF Noise Parameters (centralized for Python & C++ parity) ---
+        # ZUPT measurement noise std (m/s) - used when applying zero-velocity constraint
+        ZUPT_NOISE_STD = 0.01
+        # TCN velocity correction noise std (m/s) - base noise for TCN pseudo-measurements
+        TCN_VEL_NOISE_STD = 0.05
+        # Mahalanobis distance threshold for outlier rejection in IMU update
+        # Chi-squared 6-DOF 95% = 12.59, 99% = 16.81; using 8.0 for tighter gating
+        # we suggests high threshold, this is just a fail safe not a performancer.
+        MAHALANOBIS_GATE_THRESHOLD_IMU = 8.0
+        # ZUPT hard reset threshold - directly zero velocity when zupt_prob >= this
+        ZUPT_HARD_RESET_THRESHOLD = 0.98
+
         # ZUPT Configuration
         USE_ZUPT = False  # Classic threshold-based ZUPT
         USE_TCN_ZUPT = True  # TCN-predicted ZUPT
-        ZUPT_NOISE_STD_ESKF = [0.01, 0.01, 0.01]
+        ZUPT_NOISE_STD_ESKF = [0.01, 0.01, 0.01]  # Legacy: per-axis (use ZUPT_NOISE_STD instead)
         # Gradual velocity decay parameters (replaces hard reset)
         # decay_weight = clamp((zupt_prob - onset) / (1 - onset), 0, 1) ^ exponent
         ZUPT_DECAY_ONSET = 0.5      # Start decay when zupt_prob > this value
@@ -107,7 +126,7 @@ class Config:
         # ESKF Learnable Parameters (BPTT Control)
         # Set to False to disable backpropagation through ESKF parameters for faster training
         # This makes R_diag, zupt_noise_std, and virtual_meas_weights fixed (non-learnable)
-        ESKF_LEARNABLE_PARAMS = True
+        ESKF_LEARNABLE_PARAMS = False
 
         # Virtual Measurement Correction Weights (for blind period / pure ESKF mode)
         # These are learnable but initialized from Allan variance ratios:
@@ -135,6 +154,19 @@ class Config:
         QAT_ENABLED = False  # Toggle QAT during training
         QAT_BACKEND = "qnnpack"  # "qnnpack" for ARM, "fbgemm" for x86
         QAT_START_EPOCH = 10  # Start QAT after N epochs of FP32 warmup
+
+        # --- Block-Parallel Scan Configuration ---
+        # Accelerates covariance propagation using associative scan
+        # P[t+1] = F @ P[t] @ F^T + Q computed in O(log T) parallel depth
+        USE_BLOCK_PARALLEL = True  # Enable parallel covariance computation
+        BLOCK_SIZE = 64  # Block size for blocked parallel scan
+        USE_DOUBLE_PRECISION = False  # Use float64 for scan (better stability, slower)
+
+        # --- Device Optimization Configuration ---
+        # Hybrid CPU/GPU mode: Run sequential nominal state on CPU, parallel P scan on GPU
+        # This avoids GPU kernel launch overhead for O(1) ops while leveraging GPU for batched matmul
+        CPU_STATE_PROPAGATION = True  # Run nominal state propagation on CPU
+        CPU_STATE_PROPAGATION_BATCH_THRESHOLD = 1  # Min batch size to use CPU path (1 = always)
 
     # --- Loss Parameters ---
     class LOSS:
@@ -171,7 +203,7 @@ class Config:
         # Stage 1: Sim pretrain (ESKF frozen)
         STAGE1_EPOCHS = 150
         STAGE1_LR = 1e-3
-        STAGE1_BATCH_SIZE = 32
+        STAGE1_BATCH_SIZE = 64
         STAGE1_ESKF_LEARNABLE = False
 
         # Stage 2: Mixed fine-tune (ESKF unfrozen)
@@ -184,8 +216,8 @@ class Config:
     # === Delta Loss (Semi-Loop Closure) ===
     class DELTA_LOSS:
         ENABLED = True
-        WINDOW_SIZES = [25, 100, 250]  # timesteps (0.5s, 2s, 5s @ 50Hz)
-        WINDOW_WEIGHTS = [0.3, 0.4, 0.3]
+        WINDOW_SIZES = [25, 100]  # timesteps (0.5s, 2s, 5s @ 50Hz)
+        WINDOW_WEIGHTS = [0.3, 0.4]
         STRIDE = 10
         WEIGHT = 0.5  # Fixed weight, not affected by DWA
 

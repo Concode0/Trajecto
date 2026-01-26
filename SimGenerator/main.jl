@@ -33,7 +33,9 @@ function parse_commandline()
         "verbose" => false,
         "stats" => false,
         "visualize" => false,
-        "visualize_path" => nothing
+        "visualize_path" => nothing,
+        "random_grip" => true,
+        "random_handedness" => true
     )
 
     i = 1
@@ -66,6 +68,18 @@ function parse_commandline()
         elseif arg == "--visualize-path"
             args["visualize_path"] = ARGS[i+1]
             i += 2
+        elseif arg == "--no-random-grip"
+            args["random_grip"] = false
+            i += 1
+        elseif arg == "--no-random-handedness"
+            args["random_handedness"] = false
+            i += 1
+        elseif arg == "--random-grip"
+            args["random_grip"] = true
+            i += 1
+        elseif arg == "--random-handedness"
+            args["random_handedness"] = true
+            i += 1
         elseif arg in ["--help", "-h"]
             println("""
 Usage: julia --project=. main.jl [options]
@@ -80,6 +94,10 @@ Options:
   --stats               Compute and print statistics for config.py
   --visualize           Generate visualization for first sample
   --visualize-path PATH Save visualization to specified path
+  --random-grip         Randomize grip style for each sample (default: true)
+  --no-random-grip      Disable randomization of grip style
+  --random-handedness   Randomize handedness for each sample (default: true)
+  --no-random-handedness Disable randomization of handedness
   -h, --help            Show this help message
 
 Examples:
@@ -91,6 +109,9 @@ Examples:
 
   # Generate for training with specific parameters
   julia --project=. main.jl -n 500 --strokes 15 --duration 8.0 -o data/train_sim.h5
+
+  # Generate with random grip and handedness (default)
+  julia --project=. main.jl -n 100
 """)
             exit(0)
         else
@@ -115,10 +136,32 @@ function main()
     println("  Duration:    $(args["duration"]) s")
     println("  Strokes:     $(args["strokes"])")
     println("  Seed:        $(args["seed"])")
+    println("  Random Grip: $(args["random_grip"])")
+    println("  Random Hand: $(args["random_handedness"])")
     println()
 
     # Set random seed
     rng = Random.MersenneTwister(args["seed"])
+
+    # Construct simulation parameters
+    # Copy defaults and apply overrides
+    sim_params = SimulationParams(
+        DEFAULT_SIM_PARAMS.pen_lift_params,
+        DEFAULT_SIM_PARAMS.use_superposition,
+        DEFAULT_SIM_PARAMS.arm_params,
+        DEFAULT_SIM_PARAMS.joint_limits,
+        DEFAULT_SIM_PARAMS.ik_params,
+        DEFAULT_SIM_PARAMS.use_ik,
+        DEFAULT_SIM_PARAMS.grip_style,
+        DEFAULT_SIM_PARAMS.handedness,
+        args["random_grip"],          # Override
+        args["random_handedness"],    # Override
+        DEFAULT_SIM_PARAMS.world_rotation_params,
+        DEFAULT_SIM_PARAMS.tremor_params,
+        DEFAULT_SIM_PARAMS.pink_params,
+        DEFAULT_SIM_PARAMS.baseline_params,
+        DEFAULT_SIM_PARAMS.use_enhanced_noise
+    )
 
     # Generate samples
     println("Generating $(args["samples"]) synthetic samples...")
@@ -129,6 +172,7 @@ function main()
             num_strokes=args["strokes"],
             duration=args["duration"],
             label="sim_sample_$(lpad(i-1, 3, '0'))",
+            sim_params=sim_params,
             rng=rng
         )
 
