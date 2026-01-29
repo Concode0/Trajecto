@@ -378,7 +378,8 @@ class BaseFilterTCNModel(nn.Module):
         # for O(log T) parallel covariance computation after the loop
         use_block_parallel = Config.ESKFTCN.USE_BLOCK_PARALLEL and self.training
         if use_block_parallel and hasattr(self.filter, 'init_cache'):
-            self.filter.init_cache(batch_size, seq_len, dtype=imu_data_raw.dtype)
+            # Cache should be on GPU for parallel computation, even when state is on CPU
+            self.filter.init_cache(batch_size, seq_len, dtype=imu_data_raw.dtype, device=self.device)
 
         # --- Hybrid CPU/GPU Mode: Pre-allocate CPU tensors and setup ---
         # Check if we can use pinned memory (CUDA only, not MPS)
