@@ -418,12 +418,35 @@ def generate_cpp_header(
         f.write(f"constexpr float GRAVITY_MAGNITUDE = {Config.GRAVITY_MAGNITUDE:.6f}f;\n")
         f.write(f"constexpr float GRAVITY_NORM_SCALE = {Config.GRAVITY_NORM_SCALE:.1f}f;\n\n")
 
-        # ESKF Parameters (centralized - previously hardcoded in eskf.cpp)
+        # ESKF Parameters (from Config.ESKFTCN - centralized config)
         f.write("// ESKF Parameters (from Config.ESKFTCN)\n")
         f.write(f"constexpr float ZUPT_NOISE_STD = {Config.ESKFTCN.ZUPT_NOISE_STD:.6f}f;\n")
         f.write(f"constexpr float TCN_VEL_NOISE_STD = {Config.ESKFTCN.TCN_VEL_NOISE_STD:.6f}f;\n")
         f.write(f"constexpr float MAHALANOBIS_GATE_THRESHOLD = {Config.ESKFTCN.MAHALANOBIS_GATE_THRESHOLD_IMU:.1f}f;\n")
-        f.write(f"constexpr float ZUPT_HARD_RESET_THRESHOLD = {Config.ESKFTCN.ZUPT_HARD_RESET_THRESHOLD:.2f}f;\n\n")
+        f.write(f"constexpr float ZUPT_HARD_RESET_THRESHOLD = {Config.ESKFTCN.ZUPT_HARD_RESET_THRESHOLD:.2f}f;\n")
+        f.write(f"constexpr float ZUPT_PROB_THRESHOLD = {Config.ESKFTCN.ZUPT_PROB_THRESHOLD:.2f}f;\n")
+        f.write(f"constexpr float R_MIN = {Config.ESKFTCN.R_MIN:.1e}f;\n")
+        f.write(f"constexpr float R_MAX = {Config.ESKFTCN.R_MAX:.2f}f;\n\n")
+
+        # Motion & Initialization parameters
+        f.write("// Motion & Initialization thresholds (from Config.MOTION)\n")
+        f.write(f"constexpr float INIT_GYRO_VAR_THRESHOLD = {Config.MOTION.INIT_GYRO_VAR_THRESHOLD:.6f}f;\n")
+        f.write(f"constexpr float INIT_ACCEL_RELIABLE_MIN = {Config.MOTION.INIT_ACCEL_RELIABLE_MIN:.2f}f;\n")
+        f.write(f"constexpr float INIT_ACCEL_RELIABLE_MAX = {Config.MOTION.INIT_ACCEL_RELIABLE_MAX:.2f}f;\n")
+        f.write(f"constexpr float INIT_STATIC_MIN_S = {Config.MOTION.INIT_STATIC_MIN_S:.2f}f;\n")
+        f.write(f"constexpr float ACCEL_NORM_DIFF_MAX_CLAMP = {Config.MOTION.ACCEL_NORM_DIFF_MAX_CLAMP:.2f}f;\n")
+        f.write(f"constexpr float MAHALANOBIS_MAX_CLAMP = {Config.MOTION.MAHALANOBIS_MAX_CLAMP:.1e}f;\n")
+        f.write(f"constexpr float S_MATRIX_REGULARIZATION = {Config.MOTION.S_MATRIX_REGULARIZATION:.1e}f;\n")
+        f.write(f"constexpr float VIRTUAL_MEAS_MAX_SCALE = {Config.MOTION.VIRTUAL_MEAS_MAX_SCALE:.4f}f;\n")
+        f.write(f"constexpr float VIRTUAL_MEAS_MIN_SCALE = {Config.MOTION.VIRTUAL_MEAS_MIN_SCALE:.4f}f;\n\n")
+
+        # Covariance Initialization
+        f.write("// Covariance Initialization constants\n")
+        f.write(f"constexpr float INIT_P_POS = {Config.MOTION.INIT_P_POS:.4f}f;\n")
+        f.write(f"constexpr float INIT_P_VEL = {Config.MOTION.INIT_P_VEL:.4f}f;\n")
+        f.write(f"constexpr float INIT_P_ORI_MAX = {Config.MOTION.INIT_P_ORI_MAX:.4f}f;\n")
+        f.write(f"constexpr float INIT_P_GYRO_BIAS_MAX = {Config.MOTION.INIT_P_GYRO_BIAS_MAX:.4f}f;\n")
+        f.write(f"constexpr float INIT_P_ACCEL_BIAS_MAX = {Config.MOTION.INIT_P_ACCEL_BIAS_MAX:.4f}f;\n\n")
 
         # Allan Variance noise parameters (for ESKF process noise)
         f.write("// Allan Variance Noise Parameters (for ESKF Q matrix)\n")
