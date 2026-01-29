@@ -363,17 +363,11 @@ class TCN(nn.Module):
         )
 
         # CRITICAL: Clip covariance output to prevent numerical explosion
-        # Raw TCN output represents log-space values that will be transformed by:
-        #   variance = softplus(output) + 1e-4, then clamped to [1e-4, 3.0]
-        # To fully utilize the valid range without wasting network capacity:
-        #   - min: softplus(-10) + 1e-4 ≈ 1.45e-4 (slightly above floor)
-        #   - max: softplus(2.95) + 1e-4 ≈ 3.0 (matches ESKF/train.py upper bound)
-        # This ensures TCN output directly maps to usable variance range [1e-4, 3.0]
         if "covariance_R" in outputs:
             outputs["covariance_R"] = torch.clamp(
                 outputs["covariance_R"],
                 min=-10.0,
-                max=2.95
+                max=Config.ESKFTCN.MAX_COVARIANCE_VAL
             )
 
         # Gravity direction in body frame: normalize to unit vector

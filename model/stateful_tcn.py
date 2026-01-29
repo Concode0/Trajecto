@@ -94,23 +94,27 @@ class StatefulTCNExport(nn.Module):
         final_feature = current_input.transpose(1, 2)
 
         # Return outputs in a fixed order for ONNX
-        vel_corr = self.output_heads["vel_corr"](final_feature)
-        # Apply tanh + physics scale (matching TCN.py forward pass)
-        vel_corr = torch.tanh(vel_corr) * Config.VEL_CORRECTION_SCALE
-        # Hard-clip velocity correction to prevent extreme values
+        vel_corr_raw = self.output_heads["vel_corr"](final_feature)
+        
+        # Signed log1p: preserves sign, compresses magnitude logarithmically
+        # Better gradient flow than tanh and handles larger dynamic range
+        vel_log_scale = torch.sign(vel_corr_raw) * torch.log1p(torch.abs(vel_corr_raw))
+        # Scale to physical units and clip to reasonable range
         vel_corr = torch.clamp(
-            vel_corr,
+            vel_log_scale * Config.VEL_CORRECTION_SCALE,
             min=-Config.ESKFTCN.VEL_CORR_CLIP_RANGE,
             max=Config.ESKFTCN.VEL_CORR_CLIP_RANGE
         )
+
         cov_R = self.output_heads["covariance_R"](final_feature)
         # CRITICAL: Clip covariance output to prevent numerical explosion
-        # Clamping to [-10, 5] → variance range after softplus: [~4.5e-5, ~150]
+        # Synchronized with training model bounds [Config.ESKFTCN.MAX_COVARIANCE_VAL]
         cov_R = torch.clamp(
             cov_R,
             min=-10.0,
-            max=5.0
+            max=Config.ESKFTCN.MAX_COVARIANCE_VAL
         )
+        
         zupt_p = self.output_heads["zupt_prob"](final_feature)
         # Apply sigmoid to convert logits to probability [0, 1]
         zupt_p = torch.sigmoid(zupt_p)
