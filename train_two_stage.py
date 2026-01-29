@@ -11,6 +11,12 @@ Usage:
 
 import argparse
 import os
+import gc
+
+# Disable CUDAGraphs globally to prevent "tensor output overwritten" and capture errors
+# This allows torch.compile to work safely with dynamic shapes and QAT
+os.environ["TORCH_CUDAGRAPHS"] = "0"
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -40,7 +46,62 @@ from model.losses import (
 )
 from model.config import Config
 from model.validation import validate_batch_tensors, validate_loss_dict
-from model.qat_tcn import QATScheduler
+from model.qat_tcn import (
+    QATScheduler,
+    prepare_qat_pt2e_model,
+    get_xnnpack_quantizer,
+    is_qat_model
+)
+
+
+def collate_fn_pad_sequences(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Custom collate function that pads variable-length sequences to max length in batch.
+
+    Handles batches with sequences of different lengths by padding to the maximum
+    length in the current batch. Necessary because real data has 1753 timesteps
+    (50.107 Hz × 35s) while simulated data has 1750 timesteps (nominal 50 Hz).
+
+    Args:
+        batch: List of sample dictionaries from dataset
+
+    Returns:
+        Collated batch dict with all sequences padded to max_len in batch
+    """
+    # Find max sequence length in this batch
+    max_len = max(sample["imu_seq_raw"].shape[0] for sample in batch)
+    batch_size = len(batch)
+
+    # Check if normalized data is present
+    has_norm = "imu_seq_norm" in batch[0]
+
+    # Pre-allocate padded tensors
+    imu_seq_raw_padded = torch.zeros(batch_size, max_len, 7)
+    gt_pos_w_padded = torch.zeros(batch_size, max_len, 3)
+    gt_vel_w_padded = torch.zeros(batch_size, max_len, 3)
+    imu_seq_norm_padded = torch.zeros(batch_size, max_len, 7) if has_norm else None
+    seq_lens = torch.zeros(batch_size, dtype=torch.long)
+
+    # Copy data into padded tensors
+    for i, sample in enumerate(batch):
+        seq_len = sample["imu_seq_raw"].shape[0]
+        imu_seq_raw_padded[i, :seq_len] = sample["imu_seq_raw"]
+        gt_pos_w_padded[i, :seq_len] = sample["gt_pos_w"]
+        gt_vel_w_padded[i, :seq_len] = sample["gt_vel_w"]
+        if has_norm:
+            imu_seq_norm_padded[i, :seq_len] = sample["imu_seq_norm"]
+        seq_lens[i] = sample["len"]
+
+    # Build output dictionary
+    collated = {
+        "imu_seq_raw": imu_seq_raw_padded,
+        "gt_pos_w": gt_pos_w_padded,
+        "gt_vel_w": gt_vel_w_padded,
+        "len": seq_lens,
+    }
+    if has_norm:
+        collated["imu_seq_norm"] = imu_seq_norm_padded
+
+    return collated
 
 
 @dataclass
@@ -133,14 +194,6 @@ def compile_model(model: nn.Module, config: TwoStageConfig) -> nn.Module:
     - MPS backend has limited torch.compile support, so compilation is skipped.
     - ESKF filter is NOT compiled due to dynamic tensor reuse that conflicts
       with CUDAGraphs optimization (causes "tensor output overwritten" errors).
-    - CUDAGraphs is disabled to avoid tensor caching issues with recurrent state.
-
-    Args:
-        model: The ESKF-TCN model to compile.
-        config: Training configuration with compile settings.
-
-    Returns:
-        The model with compiled components (or original if compilation disabled/failed).
     """
     # Skip if compile disabled or not available
     if config.compile_mode is None:
@@ -155,24 +208,17 @@ def compile_model(model: nn.Module, config: TwoStageConfig) -> nn.Module:
         print("torch.compile skipped on MPS (limited support)")
         return model
 
-    # Disable CUDAGraphs via environment variable to avoid tensor caching conflicts
-    # with ESKF's recurrent state updates (quaternion multiply, state propagation)
-    import os
-    os.environ["TORCH_CUDAGRAPHS"] = "0"
-
     try:
-        # Compile TCN component only - has static conv ops, benefits most from compilation
+        # Compile TCN component only
+        # Enable dynamic shapes to avoid recompilation for every new sequence length
         model.tcn = torch.compile(
             model.tcn,
             backend=config.compile_backend,
             fullgraph=False,
-            dynamic=False,  # Static shapes for better optimization
+            dynamic=True,  # Crucial for variable length batches
         )
-        print(f"TCN compiled with backend='{config.compile_backend}' (cudagraphs disabled)")
+        print(f"TCN compiled with backend='{config.compile_backend}' (dynamic=True)")
 
-        # NOTE: ESKF filter is intentionally NOT compiled.
-        # The filter has dynamic tensor reuse patterns (quaternion updates, state propagation)
-        # that conflict with CUDAGraphs tensor caching, causing runtime errors.
         print("ESKF filter: eager mode (dynamic control flow incompatible with compile)")
 
     except Exception as e:
@@ -203,15 +249,15 @@ def create_dataloader(
     """
     if device == "cuda":
         # CUDA: Enable parallel loading for faster training
-        # Note: Colab free tier has limited CPUs, use 2 workers max
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=2,           # Parallel data loading (2 for Colab compatibility)
+            num_workers=8,           # Parallel data loading
             pin_memory=True,         # Faster CPU→GPU transfer
             persistent_workers=True, # Keep workers alive between epochs
             prefetch_factor=2,       # Prefetch 2 batches per worker
+            collate_fn=collate_fn_pad_sequences,
         )
     else:
         # MPS/CPU: Single-process loading (MPS has fork issues, CPU is often I/O bound anyway)
@@ -220,6 +266,7 @@ def create_dataloader(
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=0,
+            collate_fn=collate_fn_pad_sequences,
         )
 
 
@@ -352,6 +399,15 @@ def validate(
     return {k: v / max(num_batches, 1) for k, v in total_losses.items()}
 
 
+def cleanup_memory(device: str):
+    """Explicitly release memory."""
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "mps":
+        torch.mps.empty_cache()
+    gc.collect()
+
+
 def train_stage1(config: TwoStageConfig) -> nn.Module:
     """Stage 1: Pretrain on simulated data with frozen ESKF."""
     print("=" * 60)
@@ -384,12 +440,6 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
     # Freeze ESKF params explicitly
     print("Freezing ESKF parameters:")
     freeze_eskf_params(model)
-
-    # QAT Scheduler
-    qat_scheduler = QATScheduler(start_epoch=config.qat_start_epoch, enabled=config.qat_enabled)
-    # Dummy input for QAT tracing (B=1, T=100, D=InputSize)
-    dummy_tcn_input = torch.randn(1, 100, Config.ESKFTCN.TCN_INPUT_SIZE).to(config.device)
-    qat_scheduler.set_example_input(dummy_tcn_input)
 
     # Check dataset files exist
     if not os.path.exists(config.sim_dataset_path):
@@ -433,10 +483,29 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
     start_epoch = 0
     best_val_loss = float("inf")
 
+    # QAT Scheduler - Initialize correctly with is_qat_model check
+    qat_scheduler = QATScheduler(
+        start_epoch=config.qat_start_epoch, 
+        enabled=config.qat_enabled,
+        initial_qat_state=is_qat_model(model)
+    )
+    # Dummy input for QAT tracing (B=1, T=100, D=InputSize)
+    dummy_tcn_input = torch.randn(1, 100, Config.ESKFTCN.TCN_INPUT_SIZE).to(config.device)
+    qat_scheduler.set_example_input(dummy_tcn_input)
+
     # Resume logic
     if config.resume_stage1:
         print(f"Resuming Stage 1 from: {config.resume_stage1}")
-        checkpoint = torch.load(config.resume_stage1, map_location=config.device)
+        # Secure loading with weights_only=True
+        checkpoint = torch.load(config.resume_stage1, map_location=config.device, weights_only=True)
+        
+        # Check if model is already in QAT mode or needs transition
+        if "tcn.tcn_layers.0.weight_fake_quant.scale" in checkpoint["model_state_dict"]:
+             print("Detected QAT checkpoint. Ensuring model is QAT-ready before loading...")
+             # Force QAT prep if not already done
+             if not is_qat_model(model):
+                 model = qat_scheduler.step(model, 1000) # Force enable by passing high epoch
+
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -472,6 +541,9 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
                 epoch_losses[k] += v.item()
 
             pbar.set_postfix({"Loss": f"{losses['total'].item():.3f}"})
+
+        # Memory cleanup at end of epoch
+        cleanup_memory(config.device)
 
         num_batches = len(train_loader)
         epoch_avg = {k: v / num_batches for k, v in epoch_losses.items()}
@@ -544,9 +616,23 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
             )
 
         print(f"Loading model from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=config.device)
-
+        
+        # Initialize model
         model = ESKFTCN_model(device=config.device, eskf_learnable_params=True)
+        
+        # Load checkpoint securely
+        checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=True)
+
+        # Check for QAT state and prepare if needed
+        is_qat_ckpt = any("tcn.tcn_layers.0.weight_fake_quant.scale" in k for k in checkpoint["model_state_dict"].keys())
+        if is_qat_ckpt:
+            print("Detected QAT checkpoint. Ensuring model is QAT-ready before loading...")
+            # We need a dummy scheduler just to perform the prep
+            temp_scheduler = QATScheduler(start_epoch=0, enabled=True, initial_qat_state=False)
+            dummy_input = torch.randn(1, 100, Config.ESKFTCN.TCN_INPUT_SIZE).to(config.device)
+            temp_scheduler.set_example_input(dummy_input)
+            model = temp_scheduler.step(model, 1000) # Force enable
+
         model.load_state_dict(checkpoint["model_state_dict"])
         model = model.to(config.device)
 
@@ -557,8 +643,12 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
     print("Unfreezing ESKF parameters:")
     unfreeze_eskf_params(model)
 
-    # QAT Scheduler
-    qat_scheduler = QATScheduler(start_epoch=config.qat_start_epoch, enabled=config.qat_enabled)
+    # QAT Scheduler - Initialize correctly with is_qat_model check
+    qat_scheduler = QATScheduler(
+        start_epoch=config.qat_start_epoch, 
+        enabled=config.qat_enabled,
+        initial_qat_state=is_qat_model(model)
+    )
     # Dummy input for QAT tracing (B=1, T=100, D=InputSize)
     dummy_tcn_input = torch.randn(1, 100, Config.ESKFTCN.TCN_INPUT_SIZE).to(config.device)
     qat_scheduler.set_example_input(dummy_tcn_input)
@@ -657,6 +747,9 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
                 epoch_losses[k] += v.item()
 
             pbar.set_postfix({"Loss": f"{losses['total'].item():.3f}"})
+
+        # Memory cleanup at end of epoch
+        cleanup_memory(config.device)
 
         num_batches = len(train_loader)
         epoch_avg = {k: v / num_batches for k, v in epoch_losses.items()}

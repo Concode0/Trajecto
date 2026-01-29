@@ -236,6 +236,12 @@ def prepare_qat_pt2e_model(
 
     # Store original TCN for reference
     original_tcn = model.tcn
+    
+    # Unwrap torch.compile if present (OptimizedModule)
+    # This prevents tracing the compiled wrapper which can cause CUDAGraph errors
+    if hasattr(original_tcn, "_orig_mod"):
+        print("[QAT-PT2E] Unwrapping torch.compile OptimizedModule...")
+        original_tcn = original_tcn._orig_mod
 
     # Put model in eval mode for export (required by torch.export)
     model.eval()
@@ -441,6 +447,25 @@ def estimate_quantization_error(
     return mean_error, errors
 
 
+def is_qat_model(model: nn.Module) -> bool:
+    """Check if model is already prepared for QAT (PT2E)."""
+    if not hasattr(model, 'tcn'):
+        return False
+    
+    # Check if TCN is a GraphModule (result of export/prepare)
+    # or if it has fake quantization modules
+    is_graph_module = isinstance(model.tcn, torch.fx.GraphModule)
+    
+    # Check for fake quant nodes/modules
+    has_fake_quant = False
+    for m in model.tcn.modules():
+        if 'FakeQuantize' in type(m).__name__ or hasattr(m, 'activation_post_process'):
+            has_fake_quant = True
+            break
+            
+    return is_graph_module or has_fake_quant
+
+
 class QATScheduler:
     """Manages QAT activation during training using PT2E API.
 
@@ -461,6 +486,7 @@ class QATScheduler:
         start_epoch: int = 10,
         backend: str = "qnnpack",  # Kept for compatibility, XNNPACK used internally
         enabled: bool = True,
+        initial_qat_state: bool = False,
     ):
         """Initialize QAT scheduler.
 
@@ -468,11 +494,12 @@ class QATScheduler:
             start_epoch: Epoch to start QAT (after FP32 warmup)
             backend: Backend hint (XNNPACK used for ARM/ESP32 regardless)
             enabled: If False, QAT is never activated
+            initial_qat_state: If True, assumes model is ALREADY in QAT mode
         """
         self.start_epoch = start_epoch
         self.backend = backend
         self.enabled = enabled
-        self.qat_active = False
+        self.qat_active = initial_qat_state
         self._example_input: Optional[torch.Tensor] = None
 
     def set_example_input(self, example_input: torch.Tensor) -> None:
