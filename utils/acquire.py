@@ -71,7 +71,7 @@ WORD_LIST = [
 
 TARGET_SAMPLING_RATE_HZ = Config.TARGET_SAMPLING_RATE_HZ
 GRAVITY = Config.GRAVITY_MAGNITUDE  # Standard gravity (m/s²) - CODATA 2018
-CUTOFF_FREQ_HZ = 5.0  # Reduced from 20.0 for better noise reduction (see optimize_fsr_zero_phase.py)
+CUTOFF_FREQ_HZ = 5.0  # Reduced from 20.0 for better noise reduction
 FILTER_ORDER = 4
 SEGMENTATION_THRESHOLD = 0.01  # GT iPad screen force (0-1 normalized): exclude true zeros, keep actual writing (was: 0)
 SEGMENTATION_MARGIN = 30

@@ -9,7 +9,7 @@ using StaticArrays
 # --- Timing ---
 const TARGET_SAMPLING_RATE_HZ = 50.107
 const DT = 1.0 / TARGET_SAMPLING_RATE_HZ
-const MAX_SEQUENCE_LENGTH = 1750  # 35 seconds @ 50Hz
+const MAX_SEQUENCE_LENGTH = 1753  # 35 seconds @ 50Hz
 
 # --- Physical Constants ---
 const GRAVITY_MAGNITUDE = 9.80665
