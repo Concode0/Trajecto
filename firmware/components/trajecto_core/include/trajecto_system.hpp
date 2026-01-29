@@ -55,10 +55,10 @@ public:
         step_counter_++;
 
         Eigen::Matrix<float, 6, 1> R_diag;
-        R_diag.setConstant(1e-4f);
+        R_diag.setConstant(R_MIN);
 
         if (tcn_out.valid) {
-            if (tcn_out.zupt_prob > 0.5f) {
+            if (tcn_out.zupt_prob > ZUPT_PROB_THRESHOLD) {
                 is_zupt = true;
             }
             current_step_prob = tcn_out.zupt_prob;
@@ -71,8 +71,8 @@ public:
             // Process R_params for IMU update
             for(int i=0; i<6; i++) {
                  float val = fast_softplus(tcn_out.R_params[i]);
-                 // Clamp to valid range [1e-4, 3.0] (matches Python)
-                 val = std::max(1e-4f, std::min(3.0f, val + 1e-4f));
+                 // Clamp to valid range [R_MIN, R_MAX] (matches Python)
+                 val = std::max(R_MIN, std::min(R_MAX, val + R_MIN));
                  R_diag[i] = val;
             }
         } else {

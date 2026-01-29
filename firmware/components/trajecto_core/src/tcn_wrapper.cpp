@@ -29,7 +29,7 @@ bool TCNWrapper::setup() {
         return false;
     }
 
-    static tflite::MicroMutableOpResolver<20> resolver;
+    static tflite::MicroMutableOpResolver<32> resolver;
     resolver.AddConv2D();
     resolver.AddDepthwiseConv2D();
     resolver.AddFullyConnected();
@@ -40,7 +40,24 @@ bool TCNWrapper::setup() {
     resolver.AddRelu();
     resolver.AddAdd();
     resolver.AddMul();
+    resolver.AddSub();
+    resolver.AddDiv();
     resolver.AddConcatenation();
+    resolver.AddMinimum();
+    resolver.AddMaximum();
+    resolver.AddAbs();
+    resolver.AddNeg();
+    resolver.AddPow();
+    resolver.AddSqrt();
+    resolver.AddRsqrt();
+    resolver.AddSquare();
+    resolver.AddReduceSum();
+    resolver.AddMean();
+    resolver.AddPack();
+    resolver.AddUnpack();
+    resolver.AddSplit();
+    resolver.AddQuantize();
+    resolver.AddDequantize();
 
     tensor_arena_ = new uint8_t[kTensorArenaSize];
 
