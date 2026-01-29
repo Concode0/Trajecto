@@ -171,6 +171,11 @@ def quaternion_to_rotation_matrix(quat_b_to_w: torch.Tensor) -> torch.Tensor:
     quat_norm = F.normalize(quat_b_to_w, p=2, dim=-1)
     w, x, y, z = quat_norm.unbind(-1)
 
+    # Pre-compute all squared and product terms to ensure device consistency
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
     # Standard conversion formula from unit quaternion to rotation matrix:
     # Row 0:
     #   R_00 = 1 - 2y^2 - 2z^2 = w^2 + x^2 - y^2 - z^2
@@ -184,11 +189,13 @@ def quaternion_to_rotation_matrix(quat_b_to_w: torch.Tensor) -> torch.Tensor:
     #   R_20 = 2xz - 2wy
     #   R_21 = 2yz + 2wx
     #   R_22 = 1 - 2x^2 - 2y^2 = w^2 - x^2 - y^2 + z^2
+    # Build rotation matrix using only tensor operations (no Python scalars)
+    two = xx.new_tensor(2.0)  # Create scalar 2.0 on same device/dtype as input
     rot_mat_b_to_w = torch.stack(
         [
-            torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
-            torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
-            torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
+            torch.stack([ww + xx - yy - zz, two*(xy - wz), two*(xz + wy)], -1),
+            torch.stack([two*(xy + wz), ww - xx + yy - zz, two*(yz - wx)], -1),
+            torch.stack([two*(xz - wy), two*(yz + wx), ww - xx - yy + zz], -1),
         ],
         -2,
     )
