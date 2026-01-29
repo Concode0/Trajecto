@@ -122,6 +122,12 @@ class Config:
         ADAPTIVE_GAIN_ESKF = 0.5
         MAHALANOBIS_GATE_THRESHOLD = 30
         VEL_CORR_CLIP_RANGE = 5.0
+        MAX_COVARIANCE_VAL = 2.95  # softplus(2.95) ≈ 3.0
+        
+        # TCN Output Head Bounds
+        ZUPT_PROB_THRESHOLD = 0.5   # Probability above which we consider the pen stationary
+        R_MIN = 1e-4                # Minimum measurement noise (prevents filter overconfidence)
+        R_MAX = 3.0                 # Maximum measurement noise (trust floor)
 
         # ESKF Learnable Parameters (BPTT Control)
         # Set to False to disable backpropagation through ESKF parameters for faster training
@@ -221,12 +227,34 @@ class Config:
         STRIDE = 10
         WEIGHT = 0.5  # Fixed weight, not affected by DWA
 
-    # === Motion Detection ===
-    class MOTION_DETECTION:
-        """Thresholds for motion/static detection in ESKF initialization and processing."""
-        GYRO_VAR_THRESHOLD = 0.002  # rad²/s² - variance threshold for static detection
-        ACCEL_NORM_DIFF_MAX_CLAMP = 20.0  # m/s² - max clamp for accel norm difference
-        FORCE_THRESHOLD_MOVING = 0.01  # Force sensor threshold for movement detection
+    # === Motion Detection & Initialization ===
+    class MOTION:
+        """Thresholds for motion/static detection and initialization."""
+        # ESKF Initialization
+        INIT_STATIC_MIN_S = 2.0  # seconds
+        INIT_MIN_SAMPLES = 20    # Minimum samples for reliable covariance/bias estimation
+        INIT_GYRO_VAR_THRESHOLD = 0.002  # rad²/s²
+        INIT_ACCEL_RELIABLE_MIN = 4.9    # m/s² (~0.5g)
+        INIT_ACCEL_RELIABLE_MAX = 14.7   # m/s² (~1.5g)
+        
+        # P_error Initialization
+        INIT_P_POS = 0.01  # 1cm
+        INIT_P_VEL = 0.001 # 1mm/s
+        INIT_P_ORI_MIN = 1e-4
+        INIT_P_ORI_MAX = 0.1
+        INIT_P_GYRO_BIAS_MIN = 1e-6
+        INIT_P_GYRO_BIAS_MAX = 1e-3
+        INIT_P_ACCEL_BIAS_MIN = 1e-4
+        INIT_P_ACCEL_BIAS_MAX = 1.0
+
+        # Runtime Gating & Safety
+        ACCEL_NORM_DIFF_MAX_CLAMP = 20.0  # m/s²
+        MAHALANOBIS_MAX_CLAMP = 1e6       # Conservative safety limit
+        S_MATRIX_REGULARIZATION = 1e-6    # For numerical stability (Cholesky)
+
+        # Virtual Measurement Adaptive Scale
+        VIRTUAL_MEAS_MAX_SCALE = 0.05
+        VIRTUAL_MEAS_MIN_SCALE = 0.001
 
     # === Data Augmentation Noise ===
     class AUGMENTATION_NOISE:
