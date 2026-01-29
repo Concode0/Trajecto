@@ -85,15 +85,15 @@ class HPOKernel:
         # Too low → overfitting, too high → underfitting
         "dropout": {"type": "float", "range": (0.10, 0.25)},
 
-        # Regularization weight: Tighter range around current default (1e-7)
-        # This penalizes large TCN velocity corrections
-        "reg_weight": {"type": "log_float", "range": (-4.5, -2.0)},  # 3e-8 to 1e-6
+        # Regularization weight: Search around 1e-4
+        # This penalizes large TCN velocity corrections to ensure ESKF remains the primary driver
+        "reg_weight": {"type": "log_float", "range": (-5.0, -3.0)},  # 1e-5 to 1e-3
 
         # === ESKF Parameters ===
         # Mahalanobis threshold: Narrowed to practical range
         # Current default: 30, search around it
         # Lower → stricter gating (fewer outliers), Higher → more lenient
-        "mahalanobis_threshold": {"type": "float", "range": (15.0, 45.0)},
+        "mahalanobis_threshold": {"type": "float", "range": (8.0, 45.0)},
 
         # === TCN Architecture ===
         # Kernel size: Keep 3, 5, 7 (current default: 3)
