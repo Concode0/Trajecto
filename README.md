@@ -1,6 +1,6 @@
 # Trajecto: AI-Enhanced 3D Pen Tracking
 
-<img src="logo.png" width="200" alt="Trajecto Logo">
+<img src="docs/assets/logo.png" width="200" alt="Trajecto Logo">
 
 **Trajecto** is a centimeter-level 3D handwriting reconstruction system that fuses **Deep Learning (TCN)** with **Physics-Based Filtering (ESKF)**. It uses a single low-cost 6-axis IMU (BMI270) to track pen trajectories in real-time on an **ESP32-C3** microcontroller.
 
@@ -9,10 +9,54 @@
 ## 🚧 Project Status: Active Development
 This project is **currently under intensive development**. We are actively refining the hybrid neuro-physical models, optimizing embedded inference, and expanding the ground-truth dataset.
 
-📄 **[Detailed Technical Specification (PDF)](technical_spec.pdf)**
+📄 **[Detailed Technical Specification (PDF)](docs/technical_spec.pdf)**
 *(Note: Documentation is currently incomplete and in active progress.)*
 
 ---
+
+## 🚀 Future Milestones & Ongoing Research
+
+While **Trajecto** has achieved significant precision, we are exploring the following frontiers to push the boundaries of 3D reconstruction:
+
+* **Hardware-In-The-Loop (HITL) HPO:** Developing an automated pipeline for tuning the ESKF-TCN hybrid parameters directly on the ESP32-C3 hardware to maximize on-device efficiency.
+* **Comprehensive Documentation:** Expanding the `technical_spec.pdf` with detailed hardware schematics and signal processing flowcharts to bridge the gap between abstract math and physical implementation.
+
+---
+
+### 📈 Performance Metrics
+
+The $7.7\text{mm}$ precision is not a static value but a result of sustained stability over dynamic movements.
+
+* **Test Duration:** 5-second continuous trajectory segments.
+* **Metric:** Root Mean Square Error (RMSE) between TCN-ESKF estimate and iPad Pro Ground Truth.
+* **Result:** Current SOTA achieved at **$7.7\text{mm}$** within the 5s window, effectively suppressing the inherent cubic drift of the IMU.
+
+### ⚖️ Long-term Scale Stability & Consistency
+
+One of the most critical challenges in IMU-based reconstruction is **Scale Drift**. Trajecto overcomes this by maintaining a near-perfect scale factor across extensive datasets.
+
+* **Dataset Scale:** Evaluated over **40 independent sequences**.
+* **Average Sequence Length:** ~15 seconds per trial.
+* **Scale Consistency:** Maintained **Scale Standard Deviation ($SD_{scale}$) < 1.0**.
+
+> **Insight:** The fact that the scale standard deviation remains below 1.0 across 40 distinct 15-second trials proves the effectiveness of the **Hybrid ESKF-TCN** in suppressing scale explosion. This empirical consistency is a direct result of the **UUB (Uniformly Ultimately Bounded)** stability proven in our theoretical analysis.
+
+
+## 📐 Theoretical Grounding & Stability Proof
+
+This project goes beyond empirical results. The **Trajecto** architecture is built upon a rigorous mathematical foundation that guarantees system stability and convergence.
+
+We provide two versions of the mathematical proof demonstrating the **Uniform Ultimate Boundedness (UUB)** of the error states and the reduction of the **Cramér-Rao Lower Bound (CRLB)** via the Hybrid ESKF-TCN injection.
+
+| Version | Description | Link |
+| :--- | :--- | :--- |
+| **Formal Proof** | Rigorous derivation in LaTeX, confirming Lyapunov stability and rank deficiency resolution. | [📄 **Read the Paper (PDF)**](./docs/Proof_of_Hybrid_Model.pdf) |
+| **Handwriting Log** | The original handwritten derivation notes, capturing the initial intuition and raw logic. | [✍️ **View Original Notes**](./docs/Handwritten_Proof.pdf) |
+
+### Key Theoretical Contributions
+* **Divergence of Pure Integration:** Mathematically proves that open-loop IMU integration leads to unbounded drift due to the rank deficiency of the Fisher Information Matrix (FIM).
+* **CRLB Reduction:** Demonstrates that the TCN-based pseudo-measurement injection strictly reduces the theoretical lower bound of the estimation error ($CRLB_{hybrid} \le CRLB_{base}$).
+* **Lyapunov Stability:** Establishes that the system is Uniformly Ultimately Bounded (UUB) by ensuring the energy dissipation rate ($\beta$) overpowers noise entropy.
 
 ## 🔬 Technical Breakthroughs
 

@@ -10,7 +10,6 @@ data/
 acquired_data/
 results/
 plots/
-docs/
 .gemini/
 .vscode/
 .DS_Store
