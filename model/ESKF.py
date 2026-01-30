@@ -998,6 +998,9 @@ class ErrorStateKalmanFilter(nn.Module):
         batch_size = P_error_pred.shape[0]
         device = P_error_pred.device
 
+        onset = Config.ESKFTCN.ZUPT_DECAY_ONSET
+        exponent = Config.ESKFTCN.ZUPT_DECAY_EXPONENT
+
         if use_zaru:
             # ZUPT + ZARU: Constrain both velocity and angular rate
             meas_dim = 6
@@ -1012,15 +1015,25 @@ class ErrorStateKalmanFilter(nn.Module):
             if tcn_zupt_prob is not None:
                 if tcn_zupt_prob.ndim == 1:
                     tcn_zupt_prob = tcn_zupt_prob.unsqueeze(-1)
-                min_R_val = self.zupt_noise_std**2
-                max_R_val = min_R_val * 100
-                clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
-                R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
-                if R_zupt_scaled_diag.shape[-1] == 1:
-                    R_zupt_scaled_diag = R_zupt_scaled_diag.repeat(1, 3)
 
+                clamped_prob = torch.clamp(tcn_zupt_prob, 1e-4, 1.0)
+
+                prob_above_onset = torch.clamp((clamped_prob - onset) / (1.0 - onset + 1e-6), 0.0, 1.0)
+                alpha = prob_above_onset ** exponent
+
+                min_R_val = self.zupt_noise_std**2
+                max_R_val = min_R_val * 1e6
+
+                log_R_min = torch.log(torch.tensor(min_R_val, device=device))
+                log_R_max = torch.log(torch.tensor(max_R_val, device=device))
+
+                log_R_val = (1.0 - alpha) * log_R_max + alpha * log_R_min
+                R_val = torch.exp(log_R_val)
+
+                R_zupt_scaled_diag = R_val.repeat(1, 3) if R_val.shape[-1] == 1 else R_val
                 # ZARU noise: slightly higher than ZUPT (gyro bias has more uncertainty)
                 R_zaru_scaled_diag = R_zupt_scaled_diag * 2.0
+
                 R_combined_diag = torch.cat([R_zupt_scaled_diag, R_zaru_scaled_diag], dim=-1)
                 R_stationary_matrix = torch.diag_embed(R_combined_diag)
             else:
@@ -1040,12 +1053,23 @@ class ErrorStateKalmanFilter(nn.Module):
             if tcn_zupt_prob is not None:
                 if tcn_zupt_prob.ndim == 1:
                     tcn_zupt_prob = tcn_zupt_prob.unsqueeze(-1)
+
+                clamped_prob = torch.clamp(tcn_zupt_prob, 1e-4, 1.0)
+
+                prob_above_onset = torch.clamp((clamped_prob - onset) / (1.0 - onset + 1e-6), 0.0, 1.0)
+                alpha = prob_above_onset ** exponent
+
                 min_R_val = self.zupt_noise_std**2
-                max_R_val = min_R_val * 100
-                clamped_prob = torch.clamp(tcn_zupt_prob, 0.01, 0.99)
-                R_zupt_scaled_diag = min_R_val * clamped_prob + max_R_val * (1 - clamped_prob)
-                if R_zupt_scaled_diag.shape[-1] == 1:
-                    R_zupt_scaled_diag = R_zupt_scaled_diag.repeat(1, 3)
+                max_R_val = min_R_val * 1e6
+
+                log_R_min = torch.log(torch.tensor(min_R_val, device=device))
+                log_R_max = torch.log(torch.tensor(max_R_val, device=device))
+
+                log_R_val = (1.0 - alpha) * log_R_max + alpha * log_R_min
+                R_val = torch.exp(log_R_val)
+
+                R_zupt_scaled_diag = R_val.repeat(1, 3) if R_val.shape[-1] == 1 else R_val
+
                 R_stationary_matrix = torch.diag_embed(R_zupt_scaled_diag)
             else:
                 R_stationary_matrix = self.get_R_zupt().unsqueeze(0).expand(batch_size, -1, -1)
@@ -1561,7 +1585,7 @@ class ErrorStateKalmanFilter(nn.Module):
                 # Analysis showed high-motion samples suffer more from gyro bias drift.
                 # Range: [MIN_SCALE, MAX_SCALE]
                 motion_normalized = torch.clamp(motion_level / Config.GRAVITY_MAGNITUDE, 0.0, 1.0)
-                
+
                 max_scale = Config.MOTION.VIRTUAL_MEAS_MAX_SCALE
                 min_scale = Config.MOTION.VIRTUAL_MEAS_MIN_SCALE
                 motion_scale = max_scale - (max_scale - min_scale) * motion_normalized
@@ -1615,30 +1639,31 @@ class ErrorStateKalmanFilter(nn.Module):
         else:
             pos_w_new, vel_w_new, quat_b_to_w_new, gyro_bias_b_new, accel_bias_b_new = (pos_w_pred, vel_w_pred, quat_b_to_w_pred, gyro_bias_b_pred, accel_bias_b_pred)
 
-        # --- 3.5. Gradual Velocity Decay ---
-        # Instead of hard reset at threshold, apply smooth decay proportional to zupt_prob.
-        # This prevents discontinuities while still enforcing zero velocity at high confidence.
+
+        # # --- 3.5. Gradual Velocity Decay ---
+        # # Instead of hard reset at threshold, apply smooth decay proportional to zupt_prob.
+        # # This prevents discontinuities while still enforcing zero velocity at high confidence.
+        # #
+        # # decay_weight = clamp((zupt_prob - onset) / (1 - onset), 0, 1) ^ exponent
+        # # vel_new = vel * (1 - decay_weight)
+        # #
+        # # Examples (with onset=0.5, exponent=2):
+        # #   zupt_prob = 0.5  → decay = 0.0  → vel unchanged
+        # #   zupt_prob = 0.75 → decay = 0.25 → vel reduced by 25%
+        # #   zupt_prob = 1.0  → decay = 1.0  → vel = 0
+        # if self.use_tcn_zupt and zupt_prob is not None:
+        #     onset = Config.ESKFTCN.ZUPT_DECAY_ONSET
+        #     exponent = Config.ESKFTCN.ZUPT_DECAY_EXPONENT
         #
-        # decay_weight = clamp((zupt_prob - onset) / (1 - onset), 0, 1) ^ exponent
-        # vel_new = vel * (1 - decay_weight)
+        #     # Compute normalized probability above onset threshold
+        #     prob_above_onset = (zupt_prob - onset) / (1.0 - onset + 1e-6)
+        #     prob_above_onset = torch.clamp(prob_above_onset, min=0.0, max=1.0)
         #
-        # Examples (with onset=0.5, exponent=2):
-        #   zupt_prob = 0.5  → decay = 0.0  → vel unchanged
-        #   zupt_prob = 0.75 → decay = 0.25 → vel reduced by 25%
-        #   zupt_prob = 1.0  → decay = 1.0  → vel = 0
-        if self.use_tcn_zupt and zupt_prob is not None:
-            onset = Config.ESKFTCN.ZUPT_DECAY_ONSET
-            exponent = Config.ESKFTCN.ZUPT_DECAY_EXPONENT
-
-            # Compute normalized probability above onset threshold
-            prob_above_onset = (zupt_prob - onset) / (1.0 - onset + 1e-6)
-            prob_above_onset = torch.clamp(prob_above_onset, min=0.0, max=1.0)
-
-            # Apply exponent for smooth onset (quadratic by default)
-            decay_weight = prob_above_onset ** exponent
-
-            # Apply gradual decay: vel_new = vel * (1 - decay_weight)
-            vel_w_new = vel_w_new * (1.0 - decay_weight.unsqueeze(-1))
+        #     # Apply exponent for smooth onset (quadratic by default)
+        #     decay_weight = prob_above_onset ** exponent
+        #
+        #     # Apply gradual decay: vel_new = vel * (1 - decay_weight)
+        #     vel_w_new = vel_w_new * (1.0 - decay_weight.unsqueeze(-1))
 
         # --- 4. Assemble Features for next TCN step ---
         rot_mat_world_to_body = quaternion_to_rotation_matrix(quat_b_to_w_new).transpose(-2, -1)
