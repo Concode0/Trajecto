@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <memory>
 #include <vector>
 #include <Eigen/Dense>
 #include "eskf.hpp"
@@ -16,13 +18,19 @@ struct TCNOutput {
     Eigen::Vector3f vel_corr;
     Eigen::Matrix<float, 6, 1> R_params;
     float zupt_prob;
-    bool valid; 
+    bool valid;
 };
 
 class TCNWrapper {
 public:
     TCNWrapper();
     ~TCNWrapper();
+
+    // Non-copyable, non-movable (owns TFLite interpreter lifecycle)
+    TCNWrapper(const TCNWrapper&) = delete;
+    TCNWrapper& operator=(const TCNWrapper&) = delete;
+    TCNWrapper(TCNWrapper&&) = delete;
+    TCNWrapper& operator=(TCNWrapper&&) = delete;
 
     bool setup();
 
@@ -42,17 +50,17 @@ private:
         float force_raw,
         const ESKF& eskf,
         const Eigen::Matrix<float, 6, 1>& last_innovation,
-        bool is_zupt,
-        std::vector<float>& out_features
+        bool is_zupt
     );
 
-    const tflite::Model* model_ = nullptr;
-    tflite::MicroInterpreter* interpreter_ = nullptr;
-    uint8_t* tensor_arena_ = nullptr;
+    const tflite::Model* model_ = nullptr;                // Non-owning: points to flash data
+    tflite::MicroInterpreter* interpreter_ = nullptr;     // Non-owning: points to static local
+    std::unique_ptr<uint8_t[]> tensor_arena_;
 
     std::vector<std::vector<float>> state_buffers_;
-    
-    static constexpr int kTensorArenaSize = 120 * 1024; 
+    std::array<float, TCN_INPUT_SIZE> features_;           // Pre-allocated feature buffer
+
+    static constexpr int kTensorArenaSize = 120 * 1024;
     static constexpr int kInputSize = TCN_INPUT_SIZE;
 };
 

@@ -2,30 +2,32 @@
 #include "fast_math_lut.hpp"
 #include <cmath>
 #include <algorithm>
-#include <iostream>
 #include <cstring>
+
+#include "esp_log.h"
 
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/system_setup.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
+static const char* TAG = "TCNWrapper";
+
 extern const unsigned char tcn_model_tflite[];
 extern const unsigned int tcn_model_tflite_len;
 
 namespace trajecto {
 
-TCNWrapper::TCNWrapper() {}
-
-TCNWrapper::~TCNWrapper() {
-    if (interpreter_) delete interpreter_;
-    if (tensor_arena_) delete[] tensor_arena_;
+TCNWrapper::TCNWrapper() {
+    features_.fill(0.0f);
 }
+
+TCNWrapper::~TCNWrapper() = default;
 
 bool TCNWrapper::setup() {
     model_ = tflite::GetModel(tcn_model_tflite);
     if (model_->version() != TFLITE_SCHEMA_VERSION) {
-        std::cerr << "Model schema version mismatch!" << std::endl;
+        ESP_LOGE(TAG, "Model schema version mismatch!");
         return false;
     }
 
@@ -47,11 +49,11 @@ bool TCNWrapper::setup() {
     resolver.AddMaximum();
     resolver.AddAbs();
     resolver.AddNeg();
-    resolver.AddPow();
+    resolver.AddCos();
     resolver.AddSqrt();
     resolver.AddRsqrt();
     resolver.AddSquare();
-    resolver.AddReduceSum();
+    resolver.AddReduceMax();
     resolver.AddMean();
     resolver.AddPack();
     resolver.AddUnpack();
@@ -59,14 +61,14 @@ bool TCNWrapper::setup() {
     resolver.AddQuantize();
     resolver.AddDequantize();
 
-    tensor_arena_ = new uint8_t[kTensorArenaSize];
+    tensor_arena_ = std::make_unique<uint8_t[]>(kTensorArenaSize);
 
     static tflite::MicroInterpreter static_interpreter(
-        model_, resolver, tensor_arena_, kTensorArenaSize);
+        model_, resolver, tensor_arena_.get(), kTensorArenaSize);
     interpreter_ = &static_interpreter;
 
     if (interpreter_->AllocateTensors() != kTfLiteOk) {
-        std::cerr << "AllocateTensors failed!" << std::endl;
+        ESP_LOGE(TAG, "AllocateTensors failed!");
         return false;
     }
 
@@ -85,10 +87,8 @@ void TCNWrapper::extract_features(
     float force_raw,
     const ESKF& eskf,
     const Eigen::Matrix<float, 6, 1>& last_innovation,
-    bool is_zupt,
-    std::vector<float>& out_features
+    bool is_zupt
 ) {
-    out_features.resize(kInputSize);
     const auto& state = eskf.get_state();
 
     // Z-score normalization for IMU data (matches Python)
@@ -138,25 +138,25 @@ void TCNWrapper::extract_features(
     // Build feature vector (order matches Python: base_hybrid_model.py:447-456)
     int idx = 0;
     // 1. gyro_b_norm [3]
-    out_features[idx++] = norm_gyro[0];
-    out_features[idx++] = norm_gyro[1];
-    out_features[idx++] = norm_gyro[2];
+    features_[idx++] = norm_gyro[0];
+    features_[idx++] = norm_gyro[1];
+    features_[idx++] = norm_gyro[2];
     // 2. accel_b_norm [3]
-    out_features[idx++] = norm_accel[0];
-    out_features[idx++] = norm_accel[1];
-    out_features[idx++] = norm_accel[2];
+    features_[idx++] = norm_accel[0];
+    features_[idx++] = norm_accel[1];
+    features_[idx++] = norm_accel[2];
     // 3. force_norm [1]
-    out_features[idx++] = norm_force;
+    features_[idx++] = norm_force;
     // 4. pen_tip_vel_b_norm [3] - isotropic normalized
-    out_features[idx++] = pen_tip_vel_b_norm(0);
-    out_features[idx++] = pen_tip_vel_b_norm(1);
-    out_features[idx++] = pen_tip_vel_b_norm(2);
+    features_[idx++] = pen_tip_vel_b_norm(0);
+    features_[idx++] = pen_tip_vel_b_norm(1);
+    features_[idx++] = pen_tip_vel_b_norm(2);
     // 5. gravity_b_norm [3] - scaled unit vector
-    out_features[idx++] = gravity_b_norm(0);
-    out_features[idx++] = gravity_b_norm(1);
-    out_features[idx++] = gravity_b_norm(2);
+    features_[idx++] = gravity_b_norm(0);
+    features_[idx++] = gravity_b_norm(1);
+    features_[idx++] = gravity_b_norm(2);
     // 6. innovation_norm [6] - Allan variance normalized, clamped
-    for (int i = 0; i < 6; i++) out_features[idx++] = innovation_norm(i);
+    for (int i = 0; i < 6; i++) features_[idx++] = innovation_norm(i);
 }
 
 TCNOutput TCNWrapper::process_step(
@@ -170,11 +170,10 @@ TCNOutput TCNWrapper::process_step(
     TCNOutput result;
     result.valid = true;
 
-    std::vector<float> features;
-    extract_features(accel_raw, gyro_raw, force_raw, eskf, last_innovation, is_zupt, features);
+    extract_features(accel_raw, gyro_raw, force_raw, eskf, last_innovation, is_zupt);
 
     TfLiteTensor* input_feat = interpreter_->input(0);
-    std::memcpy(input_feat->data.f, features.data(), features.size() * sizeof(float));
+    std::memcpy(input_feat->data.f, features_.data(), features_.size() * sizeof(float));
 
     for (int i = 0; i < TCN_NUM_LAYERS; i++) {
         TfLiteTensor* input_state = interpreter_->input(1 + i);
@@ -187,7 +186,7 @@ TCNOutput TCNWrapper::process_step(
     }
 
     if (interpreter_->Invoke() != kTfLiteOk) {
-        std::cerr << "Invoke failed!" << std::endl;
+        ESP_LOGE(TAG, "Invoke failed!");
         result.valid = false;
         return result;
     }

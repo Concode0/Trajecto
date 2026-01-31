@@ -48,6 +48,21 @@ constexpr float TCN_VEL_NOISE_STD = 0.050000f;
 constexpr float MAHALANOBIS_GATE_THRESHOLD = 8.0f;
 constexpr float ZUPT_HARD_RESET_THRESHOLD = 0.98f;
 
+// Log-Space Soft-Thresholding R parameters (from Python ESKF.py:_calculate_stationary_update)
+constexpr float ZUPT_DECAY_ONSET = 0.5f;          // Dead zone below this prob
+constexpr float ZUPT_DECAY_EXPONENT = 2.0f;        // Quadratic ramp above onset
+constexpr float ZUPT_R_MIN_VAL = 1e-4f;            // ZUPT_NOISE_STD² = tight constraint
+constexpr float ZUPT_R_MAX_VAL = 100.0f;           // ZUPT_R_MIN_VAL * 1e6 = very uncertain
+constexpr float ZARU_R_SCALE = 2.0f;               // ZARU R = ZUPT R * 2 (gyro has more uncertainty)
+
+// Precomputed log bounds for geometric interpolation
+constexpr float LOG_R_MIN = -9.21034f;             // log(1e-4)
+constexpr float LOG_R_MAX = 4.60517f;              // log(100)
+
+// Adaptive R bounds (from Config.ESKFTCN)
+constexpr float R_MIN = 1e-4f;   // Minimum measurement noise
+constexpr float R_MAX = 3.0f;    // Maximum measurement noise
+
 // Allan Variance Noise Parameters (for ESKF Q matrix)
 constexpr float VRW_X = 8.3297e-04f, VRW_Y = 6.7196e-04f, VRW_Z = 9.3271e-04f;
 constexpr float ARW_X = 7.1664e-05f, ARW_Y = 7.9283e-05f, ARW_Z = 7.5335e-05f;

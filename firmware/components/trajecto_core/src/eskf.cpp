@@ -1,6 +1,5 @@
 #include "eskf.hpp"
 #include "model_params.hpp"
-#include <iostream>
 #include <cmath>
 #include <algorithm>
 
@@ -116,36 +115,53 @@ void ESKF::predict(const Eigen::Vector3f& gyro_raw, const Eigen::Vector3f& accel
     enforce_symmetry();
 }
 
-void ESKF::update_zupt(float prob) {
-    Eigen::Matrix<float, 3, STATE_DIM> H;
-    H.setZero();
-    H.block<3, 3>(0, 3).setIdentity();
-
-    Eigen::Matrix3f R;
-    R.setIdentity();
-
+void ESKF::update_stationary(const Eigen::Vector3f& gyro_raw, float prob) {
+    // Log-space soft-thresholding R computation (matches Python ESKF.py:_calculate_stationary_update)
+    float R_zupt_val, R_zaru_val;
     if (prob >= 0.0f) {
-        float min_R_val = zupt_noise_std_ * zupt_noise_std_;
-        float max_R_val = min_R_val * 100.0f;
-        float clamped_prob = std::max(0.01f, std::min(prob, 0.99f));
-        
-        float r_val = min_R_val * clamped_prob + max_R_val * (1.0f - clamped_prob);
-        R.diagonal().setConstant(r_val);
+        float cp = std::max(1e-4f, std::min(prob, 1.0f));
+        float above_onset = std::max(0.0f, std::min((cp - ZUPT_DECAY_ONSET) / (1.0f - ZUPT_DECAY_ONSET + 1e-6f), 1.0f));
+        float alpha = above_onset * above_onset; // exponent = 2
+
+        float log_R = (1.0f - alpha) * LOG_R_MAX + alpha * LOG_R_MIN;
+        R_zupt_val = std::exp(log_R);
     } else {
-        R *= (zupt_noise_std_ * zupt_noise_std_);
+        R_zupt_val = ZUPT_R_MIN_VAL; // tight constraint when no TCN prob
     }
+    R_zaru_val = R_zupt_val * ZARU_R_SCALE;
 
-    Eigen::Vector3f innovation = -state_.vel;
+    // 6D observation: H = [0 I 0 0 0; 0 0 0 I 0] (6x15)
+    // Row block 0 selects velocity (block 1), row block 1 selects gyro_bias (block 3)
+    Eigen::Matrix<float, 6, STATE_DIM> H;
+    H.setZero();
+    H.block<3, 3>(0, 3).setIdentity();  // velocity
+    H.block<3, 3>(3, 9).setIdentity();  // gyro_bias
 
-    Eigen::Matrix<float, STATE_DIM, 3> PHt = P_ * H.transpose();
-    Eigen::Matrix3f S = H * PHt + R;
-    Eigen::Matrix<float, STATE_DIM, 3> K = PHt * S.inverse();
+    // R (6x6 diagonal)
+    Eigen::Matrix<float, 6, 6> R;
+    R.setZero();
+    R(0, 0) = R_zupt_val; R(1, 1) = R_zupt_val; R(2, 2) = R_zupt_val;
+    R(3, 3) = R_zaru_val; R(4, 4) = R_zaru_val; R(5, 5) = R_zaru_val;
+
+    // Innovation: [0 - vel, 0 - gyro_bias] = [-vel, -gyro_bias]
+    // ZARU constrains gyro_raw ≈ gyro_bias when stationary, so innovation = gyro_raw - gyro_bias ≈ 0
+    // But we want to push gyro_bias toward observed gyro (which should be ~0 when stationary)
+    Eigen::Matrix<float, 6, 1> innovation;
+    innovation.segment<3>(0) = -state_.vel;
+    innovation.segment<3>(3) = -state_.gyro_bias;
+
+    // Standard Kalman update
+    Eigen::Matrix<float, STATE_DIM, 6> PHt = P_ * H.transpose();
+    Eigen::Matrix<float, 6, 6> S = H * PHt + R;
+    Eigen::Matrix<float, STATE_DIM, 6> K = PHt * S.inverse();
 
     Eigen::Matrix<float, STATE_DIM, 1> delta_x = K * innovation;
 
+    // Joseph form for numerical stability
     Eigen::Matrix<float, STATE_DIM, STATE_DIM> I = Eigen::Matrix<float, STATE_DIM, STATE_DIM>::Identity();
-    P_ = (I - K * H) * P_;
-    
+    Eigen::Matrix<float, STATE_DIM, STATE_DIM> ImKH = I - K * H;
+    P_ = ImKH * P_ * ImKH.transpose() + K * R * K.transpose();
+
     enforce_symmetry();
     inject_error(delta_x);
 }

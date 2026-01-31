@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "src/eskf.cpp"
+        "src/eskf_fixed.cpp"
+        "src/cordic_tables.cpp"
         "src/tcn_wrapper.cpp"
         "src/tcn_model.cc"
         "src/fast_math_lut.cpp"

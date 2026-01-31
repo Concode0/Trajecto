@@ -185,7 +185,7 @@ SwingingDoor::Stats SwingingDoor::get_stats() const {
     s.points_received = rx_count_;
     s.points_sent = tx_count_;
     s.compression_ratio = (rx_count_ > 0) ?
-        static_cast<float>(rx_count_) / std::max(1u, tx_count_) : 1.0f;
+        static_cast<float>(rx_count_) / std::max(uint32_t{1}, tx_count_) : 1.0f;
     return s;
 }
 

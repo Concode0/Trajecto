@@ -1,7 +1,7 @@
 #pragma once
 
+#include <array>
 #include <cmath>
-#include <algorithm>
 
 namespace trajecto {
 
@@ -11,34 +11,42 @@ namespace trajecto {
 constexpr float EXP_MIN = -10.0f;
 constexpr float EXP_MAX = 10.0f;
 constexpr int EXP_LUT_SIZE = 256;
-constexpr float EXP_STEP = (EXP_MAX - EXP_MIN) / (float)(EXP_LUT_SIZE - 1);
+constexpr float EXP_STEP = (EXP_MAX - EXP_MIN) / static_cast<float>(EXP_LUT_SIZE - 1);
 constexpr float EXP_INV_STEP = 1.0f / EXP_STEP;
 
 constexpr float SIGMOID_MIN = -6.0f;
 constexpr float SIGMOID_MAX = 6.0f;
 constexpr int SIGMOID_LUT_SIZE = 256;
-constexpr float SIGMOID_STEP = (SIGMOID_MAX - SIGMOID_MIN) / (float)(SIGMOID_LUT_SIZE - 1);
+constexpr float SIGMOID_STEP = (SIGMOID_MAX - SIGMOID_MIN) / static_cast<float>(SIGMOID_LUT_SIZE - 1);
 constexpr float SIGMOID_INV_STEP = 1.0f / SIGMOID_STEP;
 
+constexpr float SOFTPLUS_LARGE_THRESHOLD = 20.0f;
+
 // ----------------------------------------------------------------------------
-// Precomputed Tables (Declarations)
+// LUT Storage
 // ----------------------------------------------------------------------------
-extern const float* const exp_lut;
-extern const float* const sigmoid_lut;
+struct LutTables {
+    std::array<float, EXP_LUT_SIZE> exp_lut;
+    std::array<float, SIGMOID_LUT_SIZE> sigmoid_lut;
+};
+
+// Returns a reference to the singleton LUT tables.
+// Uses Meyers' singleton (function-local static): thread-safe in C++11+, no SIOF.
+const LutTables& get_lut_tables();
 
 /**
  * @brief Fast Exponential approximation using LUT with Linear Interpolation.
  */
 inline float fast_exp(float x) {
+    const auto& lut = get_lut_tables().exp_lut;
     if (x <= EXP_MIN) return 0.0f;
-    if (x >= EXP_MAX) return exp_lut[EXP_LUT_SIZE - 1]; // Or std::exp(x) if precision needed at high range
+    if (x >= EXP_MAX) return lut[EXP_LUT_SIZE - 1];
 
     float pos = (x - EXP_MIN) * EXP_INV_STEP;
-    int index = (int)pos;
+    int index = static_cast<int>(pos);
     float frac = pos - index;
 
-    // Linear Interpolation
-    return exp_lut[index] + frac * (exp_lut[index + 1] - exp_lut[index]);
+    return lut[index] + frac * (lut[index + 1] - lut[index]);
 }
 
 /**
@@ -46,14 +54,15 @@ inline float fast_exp(float x) {
  *        sigmoid(x) = 1 / (1 + exp(-x))
  */
 inline float fast_sigmoid(float x) {
+    const auto& lut = get_lut_tables().sigmoid_lut;
     if (x <= SIGMOID_MIN) return 0.0f;
     if (x >= SIGMOID_MAX) return 1.0f;
 
     float pos = (x - SIGMOID_MIN) * SIGMOID_INV_STEP;
-    int index = (int)pos;
+    int index = static_cast<int>(pos);
     float frac = pos - index;
 
-    return sigmoid_lut[index] + frac * (sigmoid_lut[index + 1] - sigmoid_lut[index]);
+    return lut[index] + frac * (lut[index + 1] - lut[index]);
 }
 
 /**
@@ -61,8 +70,8 @@ inline float fast_sigmoid(float x) {
  *        Uses fast_exp for range inside LUT, linear approximation for large x.
  */
 inline float fast_softplus(float x) {
-    if (x > 20.0f) return x; // log(1+exp(x)) -> x for large x
-    if (x < -20.0f) return 0.0f; // log(1+0) -> 0
+    if (x > SOFTPLUS_LARGE_THRESHOLD) return x;
+    if (x < -SOFTPLUS_LARGE_THRESHOLD) return 0.0f;
     return std::log(1.0f + fast_exp(x));
 }
 

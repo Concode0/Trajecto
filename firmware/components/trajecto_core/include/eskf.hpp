@@ -35,8 +35,10 @@ public:
     /** @brief Propagate nominal state and error covariance */
     void predict(const Eigen::Vector3f& gyro_raw, const Eigen::Vector3f& accel_raw);
 
-    /** @brief ZUPT update with optional TCN probability */
-    void update_zupt(float prob = -1.0f);
+    /** @brief Stationary update: ZUPT (zero velocity) + ZARU (zero angular rate)
+     *  Uses log-space soft-thresholding for R computation.
+     *  6D observation: vel=0, gyro_bias=0 when stationary. */
+    void update_stationary(const Eigen::Vector3f& gyro_raw, float prob = -1.0f);
 
     /** @brief Apply TCN velocity correction in body frame */
     void update_tcn_vel(const Eigen::Vector3f& vel_corr_body, const Eigen::Matrix<float, 6, 1>& R_params);
