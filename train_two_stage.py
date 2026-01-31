@@ -498,17 +498,23 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
         print(f"Resuming Stage 1 from: {config.resume_stage1}")
         # Secure loading with weights_only=True
         checkpoint = torch.load(config.resume_stage1, map_location=config.device, weights_only=True)
-        
+
         # Check if model is already in QAT mode or needs transition
-        if "tcn.tcn_layers.0.weight_fake_quant.scale" in checkpoint["model_state_dict"]:
+        is_qat_ckpt = any("weight_fake_quant" in k for k in checkpoint["model_state_dict"].keys())
+        if is_qat_ckpt:
              print("Detected QAT checkpoint. Ensuring model is QAT-ready before loading...")
              # Force QAT prep if not already done
              if not is_qat_model(model):
                  model = qat_scheduler.step(model, 1000) # Force enable by passing high epoch
 
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+
+        # Load optimizer/scheduler only if they exist in checkpoint
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
         start_epoch = checkpoint["epoch"] + 1
         best_val_loss = checkpoint.get("val_loss", float("inf"))
         freeze_eskf_params(model)  # Re-freeze after loading
@@ -575,6 +581,8 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
     torch.save({
         "epoch": config.stage1_epochs - 1,
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "val_loss": best_val_loss,
         "stage": 1,
     }, Path(config.checkpoint_dir) / f"{config.model_name}_stage1_final.pth")
@@ -624,7 +632,7 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
         checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=True)
 
         # Check for QAT state and prepare if needed
-        is_qat_ckpt = any("tcn.tcn_layers.0.weight_fake_quant.scale" in k for k in checkpoint["model_state_dict"].keys())
+        is_qat_ckpt = any("weight_fake_quant" in k for k in checkpoint["model_state_dict"].keys())
         if is_qat_ckpt:
             print("Detected QAT checkpoint. Ensuring model is QAT-ready before loading...")
             # We need a dummy scheduler just to perform the prep
@@ -633,7 +641,7 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
             temp_scheduler.set_example_input(dummy_input)
             model = temp_scheduler.step(model, 1000) # Force enable
 
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         model = model.to(config.device)
 
         # Apply torch.compile optimization (if not already compiled from Stage 1)
