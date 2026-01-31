@@ -3,10 +3,7 @@ dependencies:
   ## Required IDF version
   idf:
     version: '>=4.1.0'
-  espp/bmi270:
-    git: https://github.com/esp-cpp/espp.git  # 1. 아키텍트님 깃허브 주소
-    version: main  # 2. PR 올린 그 브랜치 이름 (또는 커밋 해시)
-    path: components/bmi270  # 3. (중요) espp 레포 안에서 해당 컴포넌트 위치
+  espp/bmi270: ^1.0.0
   espp/i2c: ^1.0.31
   espp/task: ^1.0.31
   espp/logger: ^1.0.0
