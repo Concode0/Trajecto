@@ -27,17 +27,25 @@ class StatefulTCNExport(nn.Module):
     """
     def __init__(self, tcn_model: TCN):
         super().__init__()
-        self.layers = tcn_model.tcn_layers
-        self.output_heads = tcn_model.output_heads
+
+        # Y-shaped architecture: backbone + (dynamic_branch & static_branch)
+        self.backbone = tcn_model.backbone
+        self.dynamic_branch = tcn_model.dynamic_branch
+        self.static_branch = tcn_model.static_branch
+        self.dynamic_heads = tcn_model.dynamic_heads
+        self.static_heads = tcn_model.static_heads
+        self.gravity_head = tcn_model.gravity_head
 
         # No input normalization - features are pre-normalized upstream
         # This preserves physical relationships between feature magnitudes
 
-        # Precompute buffer sizes for each layer
+        # Precompute buffer sizes for each layer (all 3 branches)
         self.buffer_sizes = []
-        for layer in self.layers:
+        all_layers = list(tcn_model.backbone) + list(tcn_model.dynamic_branch) + list(tcn_model.static_branch)
+
+        for layer in all_layers:
             # layer is CausalConv1d
-            if layer.separable:
+            if layer.separable and layer.depthwise is not None:
                 # Use depthwise conv params
                 k = layer.depthwise.kernel_size[0]
                 d = layer.depthwise.dilation[0]
@@ -45,7 +53,7 @@ class StatefulTCNExport(nn.Module):
                 # Use standard conv params
                 k = layer.conv.kernel_size[0]
                 d = layer.conv.dilation[0]
-            
+
             # History needed is (Kernel-1) * Dilation
             self.buffer_sizes.append((k - 1) * d)
 
@@ -68,69 +76,109 @@ class StatefulTCNExport(nn.Module):
         
         new_states = []
         
-        for i, layer in enumerate(self.layers):
-            buffer = states[i] # [Batch, C, Hist]
-            
+        state_idx = 0
+
+        # === Backbone (shared) ===
+        for layer in self.backbone:
+            buffer = states[state_idx]  # [Batch, C, Hist]
+
             # Concatenate history with current input on Time (dim 2)
-            # input_window: [Batch, C, Hist + 1]
             input_window = torch.cat([buffer, current_input], dim=2)
-            
-            # Perform Convolution
-            # nn.Conv1d expects [Batch, C, Length] - no transpose needed here
-            
-            if layer.separable:
-                # Depthwise (Space)
-                out = layer.depthwise(input_window) # [Batch, C, 1]
-                # Pointwise (Cross-Channel)
-                out = layer.pointwise(out)          # [Batch, OutC, 1]
+
+            if layer.separable and layer.depthwise is not None:
+                out = layer.depthwise(input_window)  # [Batch, C, 1]
+                out = layer.pointwise(out)  # [Batch, OutC, 1]
             else:
-                out = layer.conv(input_window)      # [Batch, OutC, 1]
-            
+                out = layer.conv(input_window)  # [Batch, OutC, 1]
+
             out = layer.relu(out)
             out = layer.dropout(out)
-            
-            # Update State: The new buffer is the shifted input window
-            # We discard the oldest sample (index 0 in time dim 2) and keep the rest
-            # new_buffer: [Batch, C, Hist]
+
             new_buffer = input_window[:, :, 1:]
             new_states.append(new_buffer)
-            
-            # Output becomes input for next layer
-            # out is [Batch, OutC, 1] - already NCL
-            current_input = out
-            
-        # Final Heads
-        # current_input: [Batch, FinalC, 1] -> Transpose to [Batch, 1, FinalC] for linear layers
-        final_feature = current_input.transpose(1, 2)
+            state_idx += 1
 
-        # Return outputs in a fixed order for ONNX
-        vel_corr_raw = self.output_heads["vel_corr"](final_feature)
-        
-        # Signed log1p: preserves sign, compresses magnitude logarithmically
-        # Better gradient flow than tanh and handles larger dynamic range
+            current_input = out
+
+        backbone_output = current_input  # [Batch, C, 1]
+
+        # === Dynamic Branch ===
+        current_input = backbone_output
+        for layer in self.dynamic_branch:
+            buffer = states[state_idx]
+
+            input_window = torch.cat([buffer, current_input], dim=2)
+
+            if layer.separable and layer.depthwise is not None:
+                out = layer.depthwise(input_window)
+                out = layer.pointwise(out)
+            else:
+                out = layer.conv(input_window)
+
+            out = layer.relu(out)
+            out = layer.dropout(out)
+
+            new_buffer = input_window[:, :, 1:]
+            new_states.append(new_buffer)
+            state_idx += 1
+
+            current_input = out
+
+        dynamic_output = current_input  # [Batch, C, 1]
+
+        # === Static Branch ===
+        current_input = backbone_output
+        for layer in self.static_branch:
+            buffer = states[state_idx]
+
+            input_window = torch.cat([buffer, current_input], dim=2)
+
+            if layer.separable and layer.depthwise is not None:
+                out = layer.depthwise(input_window)
+                out = layer.pointwise(out)
+            else:
+                out = layer.conv(input_window)
+
+            out = layer.relu(out)
+            out = layer.dropout(out)
+
+            new_buffer = input_window[:, :, 1:]
+            new_states.append(new_buffer)
+            state_idx += 1
+
+            current_input = out
+
+        static_output = current_input  # [Batch, C, 1]
+
+        # === Output Heads ===
+        # Convert to [Batch, 1, C] for linear layers
+        dynamic_feat = dynamic_output.transpose(1, 2)  # [Batch, 1, C]
+        static_feat = static_output.transpose(1, 2)   # [Batch, 1, C]
+
+        # Dynamic branch outputs
+        vel_corr_raw = self.dynamic_heads["vel_corr"](dynamic_feat)
+
         vel_log_scale = torch.sign(vel_corr_raw) * torch.log1p(torch.abs(vel_corr_raw))
-        # Scale to physical units and clip to reasonable range
         vel_corr = torch.clamp(
             vel_log_scale * Config.VEL_CORRECTION_SCALE,
             min=-Config.ESKFTCN.VEL_CORR_CLIP_RANGE,
             max=Config.ESKFTCN.VEL_CORR_CLIP_RANGE
         )
 
-        cov_R = self.output_heads["covariance_R"](final_feature)
-        # CRITICAL: Clip covariance output to prevent numerical explosion
-        # Synchronized with training model bounds [Config.ESKFTCN.MAX_COVARIANCE_VAL]
+        cov_R = self.dynamic_heads["covariance_R"](dynamic_feat)
         cov_R = torch.clamp(
             cov_R,
             min=-10.0,
             max=Config.ESKFTCN.MAX_COVARIANCE_VAL
         )
-        
-        zupt_p = self.output_heads["zupt_prob"](final_feature)
-        # Apply sigmoid to convert logits to probability [0, 1]
+
+        # Static branch outputs
+        zupt_p = self.static_heads["zupt_prob"](static_feat)
         zupt_p = torch.sigmoid(zupt_p)
 
-        # Gravity direction in body frame (unit vector for attitude correction)
-        gravity_b = self.output_heads["gravity_b"](final_feature)
+        # Gravity Head: Fuse both branches
+        feat_gravity = torch.cat([dynamic_feat, static_feat], dim=-1)
+        gravity_b = self.gravity_head(feat_gravity)
         gravity_b = F.normalize(gravity_b, p=2, dim=-1, eps=1e-6)
 
         return (vel_corr, cov_R, zupt_p, gravity_b), tuple(new_states)

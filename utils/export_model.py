@@ -87,8 +87,29 @@ def load_model(model_path: str, device: str = "cpu", is_qat: bool = False) -> nn
     )
 
     if os.path.exists(model_path):
-        state_dict = torch.load(model_path, map_location=device)
-        model.load_state_dict(state_dict)
+        checkpoint = torch.load(model_path, map_location=device)
+
+        # Handle both checkpoint dict (with "model_state_dict") and bare state dict
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+
+        # Handle torch.compile() wrapped models (remove _orig_mod. prefix)
+        cleaned_state_dict = {}
+        for key, value in state_dict.items():
+            # Remove ._orig_mod. or _orig_mod. prefix (from torch.compile wrapping)
+            if "._orig_mod." in key:
+                key = key.replace("._orig_mod.", ".", 1)
+            elif key.startswith("_orig_mod."):
+                key = key.replace("_orig_mod.", "", 1)
+            cleaned_state_dict[key] = value
+
+        # Debug: print a few keys
+        sample_keys = list(cleaned_state_dict.keys())[:5]
+        print(f"  Sample cleaned keys: {sample_keys}")
+
+        model.load_state_dict(cleaned_state_dict)
         print(f"  Loaded weights successfully")
     else:
         print(f"  WARNING: Model file not found, using random weights!")
@@ -104,15 +125,55 @@ def load_model(model_path: str, device: str = "cpu", is_qat: bool = False) -> nn
 
 
 def get_state_shapes(model: nn.Module) -> List[Tuple[int, int]]:
-    """Extract state buffer shapes from TCN layers.
+    """Extract state buffer shapes from TCN Y-shaped architecture layers.
 
     Returns:
-        List of (history_length, channels) tuples for each layer
+        List of (history_length, channels) tuples for each layer.
+        Order: backbone layers + dynamic_branch layers + static_branch layers
     """
     state_shapes = []
-    in_ch = model.tcn_input_size
 
-    for layer in model.tcn.tcn_layers:
+    # Backbone
+    in_ch = model.tcn_input_size
+    for layer in model.tcn.backbone:
+        if layer.separable and layer.depthwise is not None:
+            k = layer.depthwise.kernel_size[0]
+            d = layer.depthwise.dilation[0]
+        else:
+            k = layer.conv.kernel_size[0]
+            d = layer.conv.dilation[0]
+
+        hist_len = (k - 1) * d
+        state_shapes.append((hist_len, in_ch))
+
+        if layer.separable and layer.pointwise is not None:
+            in_ch = layer.pointwise.out_channels
+        else:
+            in_ch = layer.conv.out_channels
+
+    backbone_out_ch = in_ch
+
+    # Dynamic Branch (starts with backbone output)
+    in_ch = backbone_out_ch
+    for layer in model.tcn.dynamic_branch:
+        if layer.separable and layer.depthwise is not None:
+            k = layer.depthwise.kernel_size[0]
+            d = layer.depthwise.dilation[0]
+        else:
+            k = layer.conv.kernel_size[0]
+            d = layer.conv.dilation[0]
+
+        hist_len = (k - 1) * d
+        state_shapes.append((hist_len, in_ch))
+
+        if layer.separable and layer.pointwise is not None:
+            in_ch = layer.pointwise.out_channels
+        else:
+            in_ch = layer.conv.out_channels
+
+    # Static Branch (starts with backbone output)
+    in_ch = backbone_out_ch
+    for layer in model.tcn.static_branch:
         if layer.separable and layer.depthwise is not None:
             k = layer.depthwise.kernel_size[0]
             d = layer.depthwise.dilation[0]
@@ -160,7 +221,7 @@ def export_to_onnx(
     output_names = ['vel_corr', 'cov_R', 'zupt_prob', 'gravity_b']
 
     for i, (hist_len, channels) in enumerate(state_shapes):
-        state = torch.zeros(1, hist_len, channels)
+        state = torch.zeros(1, channels, hist_len)  # NCL format: [Batch, Channels, Length]
         state_inputs.append(state)
         input_names.append(f"state_in_{i}")
         output_names.append(f"state_out_{i}")
@@ -181,7 +242,7 @@ def export_to_onnx(
     # Build input info for TFLite conversion
     input_info = [{'name': 'input_feature', 'shape': (1, 1, input_size)}]
     for i, (hist_len, channels) in enumerate(state_shapes):
-        input_info.append({'name': f'state_in_{i}', 'shape': (1, hist_len, channels)})
+        input_info.append({'name': f'state_in_{i}', 'shape': (1, channels, hist_len)})  # NCL format
 
     print(f"  ONNX export complete: {len(input_names)} inputs, {len(output_names)} outputs")
     return input_info
@@ -242,10 +303,10 @@ def generate_calibration_data(
                 normalized = (sensor - imu_mean) / (imu_std + 1e-6)
                 # Take a random timestep
                 t = np.random.randint(0, len(normalized))
-                data[i, 0, :7] = normalized[t, :7]
+                data[i, 0, 0, :7] = normalized[t, :7]
                 # Fill remaining features with reasonable values
                 if shape[-1] > 7:
-                    data[i, 0, 7:] = np.random.randn(shape[-1] - 7) * 0.1
+                    data[i, 0, 0, 7:] = np.random.randn(shape[-1] - 7) * 0.1
         else:
             # Generate synthetic data
             data = np.random.randn(*calib_shape).astype(np.float32) * 0.5
