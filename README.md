@@ -1,4 +1,6 @@
-# Trajecto: AI-Enhanced 3D Pen Tracking
+# Trajecto: Vertical-Integration of AI-Aided 3D Pen Tracking
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE) [![Hardware: CERN OHL-P](https://img.shields.io/badge/Hardware-CERN%20OHL--P-orange.svg)](LICENSE_HARDWARE)
 
 <img src="docs/assets/logo.png" width="200" alt="Trajecto Logo">
 
@@ -159,9 +161,21 @@ Trajecto/
 └── utils/                  # Helper Scripts (Acquire, Convert)
 ```
 
-## 📄 License
+## 🛡️ License & Citation
 
-*   **Software**: Licensed under the **Apache License 2.0**. See [LICENSE](LICENSE).
-*   **Hardware**: Licensed under the **CERN Open Hardware Licence Version 2 - Permissive (CERN-OHL-P)**. See [LICENSE_HARDWARE](LICENSE_HARDWARE).
+### Intellectual Property Notice
+This project is protected under the **Apache License 2.0**. Pursuant to Section 4(d) of the license, all redistributions must preserve the technical attribution notices in the [NOTICE](NOTICE) file.
+* **Patent Pending (KR 10-2025-0201092 / 093)**: Hybrid ESKF-TCN & Hovering Signal De-normalization.
 
-Notice: This project includes technologies for which patents are currently pending (Application related to Hybrid ESKF-TCN and Data Acquisition Methodology).
+### How to Cite
+If you use this architecture or code in your research, please cite it as follows:
+
+> **Kim, E. (2026).** *Trajecto: Robust 3D Pen Tracking with Neural Lyapunov-Certified ESKF.* GitHub Repository. https://github.com/concode0/trajecto
+
+```bibtex
+@software{Kim_Trajecto_2026,
+  author = {Kim, Eunkyum},
+  title = {Trajecto: Robust 3D Pen Tracking with Neural Lyapunov-Certified ESKF},
+  url = {[https://github.com/concode0/trajecto](https://github.com/concode0/trajecto)},
+  year = {2026}
+}
