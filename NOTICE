@@ -33,8 +33,13 @@ Pursuant to Section 4(d) of the Apache License 2.0, any redistribution of this W
 IV. Third-Party Software Notices
 This project includes portions of the following open-source software:
 
-**H5View**: A CLI tool for reading H5 files.
+H5View: A CLI tool for reading H5 files.
     - Original Author: Cyrille Rossant (2012)
     - License: BSD 3-Clause License
     - Modifications: Enhanced with Sample Delete by Eunkyum Kim.
     - The original license terms and disclaimers are preserved within the respective source files.
+
+V. Commercial Use and Licensing
+While the source code is provided under the Apache License 2.0 for academic and non-commercial purposes, the commercial exploitation of the patented technologies (Application Nos. 10-2025-0201092, 10-2025-0201093) and the core Trajecto logic is strictly prohibited without a separate commercial license agreement from the author.
+
+For commercial licensing inquiries, please contact: nemonanconcode@gmail.com
