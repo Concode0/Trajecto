@@ -4,7 +4,7 @@ Trajecto: Real-time 3D Trajectory Reconstruction System
 
 Copyright 2025-2026 Eunkyum Kim
 
-I. Declaration of Technical Sovereignty
+I. Principal Architectures & Methodologies
 This project incorporates original architectures and methodologies developed by Eunkyum Kim, representing a vertical integration of hardware control, state estimation, and deep learning. Key technical pillars include:
 
 Hybrid ESKF-Stateful TCN: A closed-loop control architecture integrating Error-State Kalman Filters with Temporal Convolutional Networks .

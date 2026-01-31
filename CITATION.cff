@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software or the Trajecto architecture, please cite it as below."
+authors:
+  - family-names: "Kim"
+    given-names: "Eunkyum"
+title: "Trajecto: Real-time 3D Trajectory Reconstruction System"
+version: 1.0.0
+date-released: 2026-01-31
+url: "https://github.com/concode0/trajecto"
+preferred-citation:
+  type: generic
+  authors:
+  - family-names: "Kim"
+    given-names: "Eunkyum"
+  title: "Real-time 3D Trajectory Reconstruction System based on Adaptive Hybrid ESKF-Stateful TCN"
+  year: 2025
+  notes: "Patent Application No. 10-2025-0201093 (Republic of Korea)"
