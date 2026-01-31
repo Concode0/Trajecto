@@ -9,10 +9,8 @@
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_log.h"
 #include "esp_timer.h"
-
-// Bosch Driver Headers
-#include "bmi270.h"
 
 // For BLE
 #include "esp_nimble_hci.h"
@@ -30,6 +28,10 @@
 
 using namespace std::chrono_literals;
 
+static const char* TAG = "Trajecto";
+
+// Typedef for the IMU
+using Imu = espp::Bmi270<espp::bmi270::Interface::I2C>;
 
 static const char *device_name = "Trajecto";
 
@@ -55,13 +57,11 @@ static std::atomic<bool> tflite_ok(false);
 static trajecto::protocol::ConfigPayload current_config = {
     .mode = 1,      // Default: Trajectory mode
     .odr_hz = 50,   // Fixed ODR
-    .reserved = {0, 0}
+    .reserved = {0}
 };
 
 // Calibration Control
 static std::atomic<bool> calibration_requested(false);
-static espp::I2c* g_i2c = nullptr;
-static uint8_t g_bmi270_address = 0;
 
 // Semaphore for IMU Data Ready
 static SemaphoreHandle_t imu_sem = nullptr;
@@ -72,51 +72,18 @@ static void send_notification(void *data, size_t len);
 // BMI270 Calibration (CRT & FOC)
 // ============================================================================
 
-struct I2cContext {
-    espp::I2c *i2c;
-    uint8_t address;
-};
-
-static int8_t bmi2_i2c_read_bridge(uint8_t reg_addr, uint8_t *data, uint32_t len, void *intf_ptr) {
-    auto *ctx = static_cast<I2cContext *>(intf_ptr);
-    if (ctx->i2c->read_at_register(ctx->address, reg_addr, data, len)) {
-        return BMI2_OK;
-    }
-    return BMI2_E_COM_FAIL;
-}
-
-static int8_t bmi2_i2c_write_bridge(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr) {
-    auto *ctx = static_cast<I2cContext *>(intf_ptr);
-    
-    constexpr size_t MAX_WRITE_BUFFER_SIZE = 256;
-    if (len + 1 > MAX_WRITE_BUFFER_SIZE) {
-        return BMI2_E_COM_FAIL;
-    }
-
-    uint8_t write_buffer[MAX_WRITE_BUFFER_SIZE];
-    write_buffer[0] = reg_addr;
-    memcpy(&write_buffer[1], data, len);
-
-    if (ctx->i2c->write(ctx->address, write_buffer, len + 1)) {
-        return BMI2_OK;
-    }
-    return BMI2_E_COM_FAIL;
-}
-
-static void bmi2_delay_us_bridge(uint32_t period, void *intf_ptr) {
-    if (period == 0) return;
-    uint32_t delay_ms = (period / 1000) + 1;
-    TickType_t ticks = pdMS_TO_TICKS(delay_ms);
-    if (ticks == 0) ticks = 1;
-    vTaskDelay(ticks);
-}
-
 static const char* NVS_NAMESPACE = "calibration";
 static const char* KEY_GYRO_FOC_X = "gfoc_x";
 static const char* KEY_GYRO_FOC_Y = "gfoc_y";
 static const char* KEY_GYRO_FOC_Z = "gfoc_z";
 
-static bool load_foc_from_nvs(struct bmi2_sens_axes_data* foc) {
+struct GyroOffset {
+    int16_t x;
+    int16_t y;
+    int16_t z;
+};
+
+static bool load_foc_from_nvs(GyroOffset& offset) {
     nvs_handle_t my_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle);
     if (err != ESP_OK) return false;
@@ -125,9 +92,9 @@ static bool load_foc_from_nvs(struct bmi2_sens_axes_data* foc) {
     if (nvs_get_i16(my_handle, KEY_GYRO_FOC_X, &x) == ESP_OK &&
         nvs_get_i16(my_handle, KEY_GYRO_FOC_Y, &y) == ESP_OK &&
         nvs_get_i16(my_handle, KEY_GYRO_FOC_Z, &z) == ESP_OK) {
-        foc->x = x;
-        foc->y = y;
-        foc->z = z;
+        offset.x = x;
+        offset.y = y;
+        offset.z = z;
         nvs_close(my_handle);
         return true;
     }
@@ -135,63 +102,23 @@ static bool load_foc_from_nvs(struct bmi2_sens_axes_data* foc) {
     return false;
 }
 
-static void save_foc_to_nvs(const struct bmi2_sens_axes_data* foc) {
+static void save_foc_to_nvs(const GyroOffset& offset) {
     nvs_handle_t my_handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle) == ESP_OK) {
-        nvs_set_i16(my_handle, KEY_GYRO_FOC_X, foc->x);
-        nvs_set_i16(my_handle, KEY_GYRO_FOC_Y, foc->y);
-        nvs_set_i16(my_handle, KEY_GYRO_FOC_Z, foc->z);
+        nvs_set_i16(my_handle, KEY_GYRO_FOC_X, offset.x);
+        nvs_set_i16(my_handle, KEY_GYRO_FOC_Y, offset.y);
+        nvs_set_i16(my_handle, KEY_GYRO_FOC_Z, offset.z);
         nvs_commit(my_handle);
         nvs_close(my_handle);
     }
 }
 
-static void perform_calibration_with_status() {
+static void perform_calibration_with_status(Imu& imu) {
     using namespace trajecto::protocol;
 
     espp::Logger logger({.tag = "CALIB", .level = espp::Logger::Verbosity::INFO});
     logger.info("Starting runtime calibration...");
-
-    if (!g_i2c || g_bmi270_address == 0) {
-        logger.error("Calibration failed: I2C not initialized");
-
-        struct {
-            Header h;
-            uint8_t status;
-        } rsp;
-        rsp.h.type = PacketType::RSP_CALIB_STATUS;
-        rsp.h.length = sizeof(uint8_t);
-        rsp.status = 2; // Failed
-        send_notification(&rsp, sizeof(rsp));
-        return;
-    }
-
-    // Perform calibration (reuse ensure_calibration logic inline)
-    struct bmi2_dev dev;
-    I2cContext ctx = {g_i2c, g_bmi270_address};
-
-    dev.read = bmi2_i2c_read_bridge;
-    dev.write = bmi2_i2c_write_bridge;
-    dev.delay_us = bmi2_delay_us_bridge;
-    dev.intf = BMI2_I2C_INTF;
-    dev.read_write_len = 32;
-    dev.intf_ptr = &ctx;
-    dev.config_file_ptr = NULL;
-
-    int8_t rslt = bmi270_init(&dev);
-    if (rslt != BMI2_OK) {
-        logger.error("Failed to init raw driver: {}", rslt);
-
-        struct {
-            Header h;
-            uint8_t status;
-        } rsp;
-        rsp.h.type = PacketType::RSP_CALIB_STATUS;
-        rsp.h.length = sizeof(uint8_t);
-        rsp.status = 2; // Failed
-        send_notification(&rsp, sizeof(rsp));
-        return;
-    }
+    std::error_code ec;
 
     logger.warn("========================================");
     logger.warn("STARTING CALIBRATION SEQUENCE");
@@ -199,9 +126,8 @@ static void perform_calibration_with_status() {
     logger.warn("========================================");
 
     // Execute CRT (Sensitivity Fix)
-    rslt = bmi2_do_crt(&dev);
-    if (rslt != BMI2_OK) {
-        logger.error("CRT FAILED code: {}. (Did you move the pen?)", rslt);
+    if (!imu.perform_crt(ec)) {
+        logger.error("CRT FAILED code: {}. (Did you move the pen?)", ec.message());
 
         struct {
             Header h;
@@ -216,15 +142,14 @@ static void perform_calibration_with_status() {
 
     logger.info("CRT SUCCESS! Sensitivity Restored.");
 
-    uint8_t sens_list[1] = {BMI2_GYRO};
-    rslt = bmi2_sensor_enable(sens_list, 1, &dev);
-    if (rslt == BMI2_OK) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        rslt = bmi2_perform_gyro_foc(&dev);
-    }
+    // Enable sensors for FOC (perform_gyro_foc handles this, but good to ensure)
+    // espp driver handles enabling/disabling as needed.
 
-    if (rslt != BMI2_OK) {
-        logger.error("Gyro FOC Failed: {}", rslt);
+    // Slight delay to ensure stability after CRT
+    std::this_thread::sleep_for(100ms);
+
+    if (!imu.perform_gyro_foc(ec)) {
+        logger.error("Gyro FOC Failed: {}", ec.message());
 
         struct {
             Header h;
@@ -239,10 +164,10 @@ static void perform_calibration_with_status() {
 
     logger.info("Gyro FOC Done.");
 
-    struct bmi2_sens_axes_data foc_offset;
-    if (bmi2_read_gyro_offset_comp_axes(&foc_offset, &dev) == BMI2_OK) {
-        save_foc_to_nvs(&foc_offset);
-        logger.info("Calibration Saved to NVS.");
+    GyroOffset offset;
+    if (imu.get_gyro_offset(offset.x, offset.y, offset.z, ec)) {
+        save_foc_to_nvs(offset);
+        logger.info("Calibration Saved to NVS (X={} Y={} Z={}).", offset.x, offset.y, offset.z);
 
         struct {
             Header h;
@@ -267,33 +192,27 @@ static void perform_calibration_with_status() {
 }
 
 // CRITICAL: CRT fixes 17m position error from BMI270 sensitivity drift
-static bool ensure_calibration(espp::I2c *i2c, uint8_t dev_addr) {
+static bool ensure_calibration(Imu& imu) {
     espp::Logger logger({.tag = "CALIB", .level = espp::Logger::Verbosity::INFO});
+    std::error_code ec;
 
-    struct bmi2_sens_axes_data foc_offset;
-    if (load_foc_from_nvs(&foc_offset)) {
-        logger.info("Found saved FOC offsets: X={} Y={} Z={}", foc_offset.x, foc_offset.y, foc_offset.z);
-        logger.info("Calibration will be restored after IMU initialization.");
-        return true;
+    GyroOffset offset;
+    if (load_foc_from_nvs(offset)) {
+        logger.info("Found saved FOC offsets: X={} Y={} Z={}", offset.x, offset.y, offset.z);
+        // Apply offsets
+        if (imu.set_gyro_offset(offset.x, offset.y, offset.z, ec)) {
+             // Enable offset compensation
+             if (imu.set_gyro_offset_enable(true, ec)) {
+                 logger.info("Calibration restored successfully.");
+                 return true;
+             }
+        }
+        logger.error("Failed to restore calibration: {}", ec.message());
+        // If restore fails, fall through to full calibration?
+        // Or just return false? Let's try to calibrate.
     }
 
-    logger.warn("No calibration found in NVS - running CRT+FOC sequence...");
-    struct bmi2_dev dev;
-    I2cContext ctx = {i2c, dev_addr};
-
-    dev.read = bmi2_i2c_read_bridge;
-    dev.write = bmi2_i2c_write_bridge;
-    dev.delay_us = bmi2_delay_us_bridge;
-    dev.intf = BMI2_I2C_INTF;
-    dev.read_write_len = 32;
-    dev.intf_ptr = &ctx;
-    dev.config_file_ptr = NULL;
-
-    int8_t rslt = bmi270_init(&dev);
-    if (rslt != BMI2_OK) {
-        logger.error("Failed to init raw driver: {}", rslt);
-        return false;
-    }
+    logger.warn("No calibration found (or restore failed) - running CRT+FOC sequence...");
 
     logger.warn("========================================");
     logger.warn("STARTING CALIBRATION SEQUENCE");
@@ -301,34 +220,28 @@ static bool ensure_calibration(espp::I2c *i2c, uint8_t dev_addr) {
     logger.warn("========================================");
 
     // Execute CRT (Sensitivity Fix)
-    rslt = bmi2_do_crt(&dev);
-    if (rslt == BMI2_OK) {
+    if (imu.perform_crt(ec)) {
         logger.info("CRT SUCCESS! Sensitivity Restored.");
 
-        uint8_t sens_list[1] = {BMI2_GYRO};
-        rslt = bmi2_sensor_enable(sens_list, 1, &dev);
-        if (rslt == BMI2_OK) {
-             vTaskDelay(pdMS_TO_TICKS(100));
-             rslt = bmi2_perform_gyro_foc(&dev);
-        }
+        std::this_thread::sleep_for(100ms);
 
-        if (rslt == BMI2_OK) {
+        if (imu.perform_gyro_foc(ec)) {
             logger.info("Gyro FOC Done.");
 
-            if (bmi2_read_gyro_offset_comp_axes(&foc_offset, &dev) == BMI2_OK) {
-                save_foc_to_nvs(&foc_offset);
+            if (imu.get_gyro_offset(offset.x, offset.y, offset.z, ec)) {
+                save_foc_to_nvs(offset);
                 logger.info("Calibration Saved to NVS.");
                 return true;
             } else {
-                logger.error("Failed to read back FOC offsets.");
+                logger.error("Failed to read back FOC offsets: {}", ec.message());
                 return false;
             }
         } else {
-            logger.error("Gyro FOC Failed: {}", rslt);
+            logger.error("Gyro FOC Failed: {}", ec.message());
             return false;
         }
     } else {
-        logger.error("CRT FAILED code: {}. (Did you move the pen?)", rslt);
+        logger.error("CRT FAILED code: {}. (Did you move the pen?)", ec.message());
         return false;
     }
 }
@@ -385,7 +298,7 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
         if (attr_handle == trajecto_cmd_val_handle) {
             if (os_mbuf_len(ctxt->om) >= sizeof(trajecto::protocol::Header)) {
-                uint8_t buf[32]; 
+                uint8_t buf[32];
                 uint16_t len = os_mbuf_len(ctxt->om);
                 if (len > sizeof(buf)) len = sizeof(buf);
                 ble_hs_mbuf_to_flat(ctxt->om, buf, len, NULL);
@@ -395,7 +308,7 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
                 switch (header->type) {
                     case PacketType::CMD_PING: {
-                        printf("CMD: Ping\n");
+                        ESP_LOGI(TAG, "CMD: Ping");
                         struct {
                             Header h;
                         } rsp;
@@ -406,7 +319,7 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                     }
 
                     case PacketType::CMD_GET_CONFIG: {
-                        printf("CMD: Get Config\n");
+                        ESP_LOGI(TAG, "CMD: Get Config");
                         struct {
                             Header h;
                             ConfigPayload cfg;
@@ -425,13 +338,13 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
                             if (cfg->mode == 0) {
                                 current_mode = AppMode::STREAMING_RAW;
-                                printf("CMD: Set Mode RAW\n");
+                                ESP_LOGI(TAG, "CMD: Set Mode RAW");
                             } else {
                                 if (tflite_ok) {
                                     current_mode = AppMode::STREAMING_TRAJECTORY;
-                                    printf("CMD: Set Mode TRAJECTORY\n");
+                                    ESP_LOGI(TAG, "CMD: Set Mode TRAJECTORY");
                                 } else {
-                                    printf("CMD: TRAJECTORY mode rejected - TFLite not initialized\n");
+                                    ESP_LOGW(TAG, "CMD: TRAJECTORY mode rejected - TFLite not initialized");
                                     current_mode = AppMode::IDLE;
                                 }
                             }
@@ -454,12 +367,12 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                 if (tflite_ok) {
                                     current_mode = AppMode::STREAMING_TRAJECTORY;
                                 } else {
-                                    printf("CMD: TRAJECTORY mode rejected - TFLite not initialized, using RAW mode\n");
+                                    ESP_LOGW(TAG, "CMD: TRAJECTORY mode rejected - TFLite not initialized, using RAW mode");
                                     current_mode = AppMode::STREAMING_RAW;
                                 }
                             }
                         }
-                        printf("CMD: Start Stream (Mode: %d)\n", (uint8_t)current_mode.load());
+                        ESP_LOGI(TAG, "CMD: Start Stream (Mode: %d)", static_cast<uint8_t>(current_mode.load()));
 
                         struct {
                             Header h;
@@ -472,7 +385,7 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
                     case PacketType::CMD_STOP_STREAM: {
                         current_mode = AppMode::IDLE;
-                        printf("CMD: Stop Stream\n");
+                        ESP_LOGI(TAG, "CMD: Stop Stream");
 
                         struct {
                             Header h;
@@ -484,7 +397,7 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                     }
 
                     case PacketType::CMD_CALIBRATE: {
-                        printf("CMD: Calibrate (requesting...)\n");
+                        ESP_LOGI(TAG, "CMD: Calibrate (requesting...)");
                         calibration_requested = true;
 
                         struct {
@@ -499,7 +412,7 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                     }
 
                     default:
-                        printf("Unknown Command: 0x%02X\n", (uint8_t)header->type);
+                        ESP_LOGW(TAG, "Unknown Command: 0x%02X", static_cast<uint8_t>(header->type));
                         break;
                 }
             }
@@ -519,7 +432,7 @@ static void ble_advertise(void) {
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
-    fields.name = (uint8_t *)device_name;
+    fields.name = reinterpret_cast<uint8_t *>(const_cast<char *>(device_name));
     fields.name_len = strlen(device_name);
     fields.name_is_complete = 1;
 
@@ -538,7 +451,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         if (event->connect.status == 0) {
             conn_handle = event->connect.conn_handle;
             is_connected = true;
-            printf("Connected\n");
+            ESP_LOGI(TAG, "Connected");
 
             using namespace trajecto::protocol;
             struct {
@@ -555,7 +468,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_DISCONNECT:
         is_connected = false;
         current_mode = AppMode::IDLE;
-        printf("Disconnected\n");
+        ESP_LOGI(TAG, "Disconnected");
         ble_advertise();
         break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -573,7 +486,7 @@ void ble_on_sync(void) {
     ble_advertise();
 }
 
-void ble_on_reset(int reason) { (void)reason; }
+void ble_on_reset([[maybe_unused]] int reason) {}
 
 void nimble_host_task(void *param) {
     nimble_port_run();
@@ -640,14 +553,14 @@ extern "C" void app_main(void) {
 
     static constexpr auto i2c_port = I2C_NUM_0;
     static constexpr auto i2c_clock_speed = 400 * 1000;
-    static constexpr gpio_num_t i2c_sda = (gpio_num_t)10;
-    static constexpr gpio_num_t i2c_scl = (gpio_num_t)4;
+    static constexpr gpio_num_t i2c_sda = static_cast<gpio_num_t>(10);
+    static constexpr gpio_num_t i2c_scl = static_cast<gpio_num_t>(4);
     espp::I2c i2c({.port = i2c_port,
                     .sda_io_num = i2c_sda,
                     .scl_io_num = i2c_scl,
                     .sda_pullup_en = GPIO_PULLUP_ENABLE,
                     .scl_pullup_en = GPIO_PULLUP_ENABLE,
-                    .timeout_ms = 200, 
+                    .timeout_ms = 200,
                     .clk_speed = i2c_clock_speed});
 
     uint8_t bmi270_address = Imu::DEFAULT_ADDRESS;
@@ -659,9 +572,6 @@ extern "C" void app_main(void) {
             break;
         }
     }
-
-    g_i2c = &i2c;
-    g_bmi270_address = bmi270_address;
 
     Imu::Config config{
         .device_address = bmi270_address,
@@ -691,46 +601,20 @@ extern "C" void app_main(void) {
         .enable_data_ready = true,
     };
 
+    Imu imu(config);
+
     // --- CRT & FOC Calibration (check/perform if needed) ---
     vTaskDelay(pdMS_TO_TICKS(500));
-    bool calib_ok = ensure_calibration(&i2c, bmi270_address);
+    bool calib_ok = ensure_calibration(imu);
     if (!calib_ok) {
         logger.error("Calibration failed! System may not work correctly.");
     }
 
-    Imu imu(config);
-
     std::error_code ec;
     imu.configure_interrupts(int_config, ec);
 
-    struct bmi2_sens_axes_data foc_offset;
-    if (load_foc_from_nvs(&foc_offset)) {
-        logger.info("Restoring calibration offsets to sensor...");
-        struct bmi2_dev dev;
-        I2cContext ctx = {&i2c, bmi270_address};
-        dev.read = bmi2_i2c_read_bridge;
-        dev.write = bmi2_i2c_write_bridge;
-        dev.delay_us = bmi2_delay_us_bridge;
-        dev.intf = BMI2_I2C_INTF;
-        dev.read_write_len = 32;
-        dev.intf_ptr = &ctx;
-        dev.config_file_ptr = NULL;
-
-        int8_t rslt = bmi2_write_gyro_offset_comp_axes(&foc_offset, &dev);
-        if (rslt == BMI2_OK) {
-            rslt = bmi2_set_gyro_offset_comp(BMI2_ENABLE, &dev);
-            if (rslt == BMI2_OK) {
-                logger.info("Calibration restored successfully!");
-            } else {
-                logger.error("Failed to enable gyro compensation: {}", rslt);
-            }
-        } else {
-            logger.error("Failed to write gyro offsets: {}", rslt);
-        }
-    }
-
     gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_NEGEDGE; 
+    io_conf.intr_type = GPIO_INTR_NEGEDGE;
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << interrupt_pin);
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -783,7 +667,7 @@ extern "C" void app_main(void) {
 
             Eigen::Vector3f accel_vec(accel.x * 9.81f, accel.y * 9.81f, accel.z * 9.81f);
             Eigen::Vector3f gyro_vec(gyro.x * DEG_TO_RAD, gyro.y * DEG_TO_RAD, gyro.z * DEG_TO_RAD);
-            float force_val = (float)fsr_raw;
+            float force_val = static_cast<float>(fsr_raw);
 
             if (is_connected) {
                 using namespace trajecto::protocol;
@@ -796,14 +680,14 @@ extern "C" void app_main(void) {
                     } pkt;
                     pkt.h.type = PacketType::DATA_RAW_IMU;
                     pkt.h.length = sizeof(RawImuPacket);
-                    pkt.p.timestamp_us = (uint32_t)now;
+                    pkt.p.timestamp_us = static_cast<uint32_t>(now);
                     pkt.p.accel[0] = accel_vec.x();
                     pkt.p.accel[1] = accel_vec.y();
                     pkt.p.accel[2] = accel_vec.z();
                     pkt.p.gyro[0] = gyro_vec.x();
                     pkt.p.gyro[1] = gyro_vec.y();
                     pkt.p.gyro[2] = gyro_vec.z();
-                    pkt.p.force = (int16_t)force_val;
+                    pkt.p.force = static_cast<int16_t>(force_val);
                     pkt.p.temperature = temp;
 
                     send_notification(&pkt, sizeof(pkt));
@@ -826,7 +710,7 @@ extern "C" void app_main(void) {
                     } pkt;
                     pkt.h.type = PacketType::DATA_TRAJECTORY;
                     pkt.h.length = sizeof(TrajectoryPacket);
-                    pkt.p.timestamp_us = (uint32_t)now;
+                    pkt.p.timestamp_us = static_cast<uint32_t>(now);
                     pkt.p.pos[0] = state.pos.x();
                     pkt.p.pos[1] = state.pos.y();
                     pkt.p.pos[2] = state.pos.z();
@@ -837,7 +721,7 @@ extern "C" void app_main(void) {
                     pkt.p.quat[1] = state.quat.x();
                     pkt.p.quat[2] = state.quat.y();
                     pkt.p.quat[3] = state.quat.z();
-                    pkt.p.zupt_prob = sys.get_zupt_prob(); 
+                    pkt.p.zupt_prob = sys.get_zupt_prob();
 
                     send_notification(&pkt, sizeof(pkt));
                 }
@@ -867,7 +751,7 @@ extern "C" void app_main(void) {
 
       std::this_thread::sleep_for(100ms);
 
-      perform_calibration_with_status();
+      perform_calibration_with_status(imu);
 
       calibration_requested = false;
 
@@ -879,20 +763,3 @@ extern "C" void app_main(void) {
     std::this_thread::sleep_for(100ms);
   }
 }
-
-/*
-Current Monitor Logs.
-
-# Check it save Calibration (CRT data)
-
-
-[CALIB/I][6.633]: Found saved FOC offsets: X=3 Y=-1 Z=4
-[CALIB/I][6.703]: Restored Calibration from NVS.
-Didn't find op for builtin opcode 'CONCATENATION'
-Failed to get registration from op code CONCATENATION
- 
-AllocateTensors failed!
-[Trajecto System/E][6.703]: Failed to setup Trajecto System (TFLite)!
-accel_x_g,accel_y_g,accel_z_g,gyro_x_rads,gyro_y_rads,gyro_z_rads
-[Trajecto System/I][6.713]: Starting tasks...
-*/
