@@ -43,7 +43,7 @@ Instead of a simple voltage divider, this system uses an active front-end to ens
 
 Hardware designs are licensed under the **CERN Open Hardware Licence Version 2 - Strongly Reciprocal**.
 
-[![License: CERN OHL S v2](https://img.shields.io/badge/License-CERN_OHL_S_v2-blue.svg)](https://opensource.org/licenses/cern-ohl-s)
+[![License: CERN OHL P v2](https://img.shields.io/badge/License-CERN_OHL_P_v2-blue.svg)](https://opensource.org/licenses/cern-ohl-s)
 
 Designed by **Eunkyum Kim**
 Part of the **Trajecto Adaptive Hybrid ESKF-Stateful TCN System**

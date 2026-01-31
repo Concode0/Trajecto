@@ -1,3 +1,16 @@
+# Trajecto: Real-time 3D Trajectory Reconstruction System
+# Copyright 2025-2026 Eunkyum Kim <nemonanconcode@gmail.com>
+#
+# This file incorporates code from H5View (https://github.com/rossant/h5view)
+# Modified by Eunkyum Kim to add Sample Delete Feature.
+#
+# Original H5View License:
+# Copyright (c) 2012, Cyrille Rossant. All rights reserved.
+# Licensed under the BSD 3-Clause License.
+#
+# Entire Work Licensed under the Apache License, Version 2.0.
+# See the LICENSE and NOTICE files for details.
+
 from textual.app import App, ComposeResult
 from textual.widgets import Footer, Header, OptionList, Static, DataTable, Button
 from textual.containers import VerticalScroll, Horizontal, Container, Vertical

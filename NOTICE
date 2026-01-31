@@ -1,0 +1,40 @@
+NOTICE
+Trajecto: Real-time 3D Trajectory Reconstruction System
+
+
+Copyright 2025-2026 Eunkyum Kim
+
+I. Declaration of Technical Sovereignty
+This project incorporates original architectures and methodologies developed by Eunkyum Kim, representing a vertical integration of hardware control, state estimation, and deep learning. Key technical pillars include:
+
+Hybrid ESKF-Stateful TCN: A closed-loop control architecture integrating Error-State Kalman Filters with Temporal Convolutional Networks .
+
+Non-linear Reverse Engineering of Hovering: A methodology for reconstructing physical depth from normalized 2D digitizer signals using exponential modeling .
+
+O(1) Stateful Inference: Optimized real-time inference using ring buffers for resource-constrained edge devices .
+
+
+II. Patent Notice
+Specific implementations and algorithms within this work are protected under the patent laws of the Republic of Korea. These include, but are not limited to:
+
+Patent Application No. 10-2025-0201092: "Method and System for Generating 3D Ground Truth Trajectory based on 2D Digitizer using Non-linear Reverse Engineering of Hovering Signal and Cross-Correlation Synchronization."
+
+Patent Application No. 10-2025-0201093: "Real-time 3D Trajectory Reconstruction System and Method based on Adaptive Hybrid ESKF-Stateful TCN for Edge Devices."
+
+
+III. Licensing and Attribution
+
+Software: Licensed under the Apache License, Version 2.0.
+
+Hardware: Licensed under the CERN Open Hardware Licence Version 2 - Permissive (CERN-OHL-P).
+
+Pursuant to Section 4(d) of the Apache License 2.0, any redistribution of this Work or Derivative Works must include a readable copy of the attribution notices contained within this NOTICE file.
+
+IV. Third-Party Software Notices
+This project includes portions of the following open-source software:
+
+**H5View**: A CLI tool for reading H5 files.
+    - Original Author: Cyrille Rossant (2012)
+    - License: BSD 3-Clause License
+    - Modifications: Enhanced with Sample Delete by Eunkyum Kim.
+    - The original license terms and disclaimers are preserved within the respective source files.
