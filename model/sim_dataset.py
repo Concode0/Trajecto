@@ -175,8 +175,13 @@ class SimulatedDataset(Dataset):
 class MixedDataset(Dataset):
     """Dataset mixing simulated and real data.
 
-    During training, samples are drawn from either sim or real dataset
-    based on the configured ratio.
+    Strategy:
+    - Uses ALL real dataset samples
+    - Augments with simulated samples to match the desired ratio
+
+    If sim_ratio=0.8 and real_dataset has N samples:
+    - num_sim = N * 0.8 / 0.2 = 4*N (to get 80% sim, 20% real)
+    - total = N + 4*N = 5*N
     """
 
     def __init__(
@@ -190,34 +195,58 @@ class MixedDataset(Dataset):
 
         Args:
             sim_dataset: SimulatedDataset instance
-            real_dataset: TrajectoryDataset instance
-            sim_ratio: Probability of sampling from sim_dataset (0.0-1.0)
+            real_dataset: TrajectoryDataset instance (will use all samples)
+            sim_ratio: Desired ratio of sim samples (0.0-1.0)
+                      0.8 means 80% sim, 20% real
             seed: Random seed for reproducibility
         """
         self.sim_dataset = sim_dataset
         self.real_dataset = real_dataset
         self.sim_ratio = sim_ratio
-        self.rng = torch.Generator().manual_seed(seed)
+        self.seed = seed
 
-        # Total size is max of both (with ratio applied)
-        self.total_samples = max(len(sim_dataset), len(real_dataset))
+        num_real = len(real_dataset)
+
+        # Calculate required number of sim samples to match ratio
+        # If sim_ratio = s, then: sim / (sim + real) = s
+        # => sim = real * s / (1 - s)
+        if sim_ratio >= 1.0:
+            # Pure sim dataset
+            self.num_sim = num_real * 100
+            self.num_real = num_real
+            print(f"MixedDataset: Pure simulated data (ratio={sim_ratio})")
+        elif sim_ratio <= 0.0:
+            # Pure real dataset
+            self.num_sim = 0
+            self.num_real = num_real
+            print(f"MixedDataset: Pure real data (ratio={sim_ratio})")
+        else:
+            self.num_real = num_real
+            self.num_sim = int(num_real * sim_ratio / (1.0 - sim_ratio))
+            print(f"MixedDataset: {self.num_real} real + {self.num_sim} sim samples")
+            print(f"  Actual ratio: {self.num_sim / (self.num_sim + self.num_real):.1%} sim")
+
+        self.total_samples = self.num_real + self.num_sim
 
     def __len__(self) -> int:
         return self.total_samples
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Sample from either sim or real dataset based on ratio."""
-        if torch.rand(1, generator=self.rng).item() < self.sim_ratio:
-            return self.sim_dataset[idx % len(self.sim_dataset)]
-        else:
+        """Retrieve sample from combined pool.
+
+        First num_real samples come from real_dataset,
+        remaining num_sim samples come from sim_dataset.
+        """
+        if idx < self.num_real:
+            # Sample from real dataset
             return self.real_dataset[idx % len(self.real_dataset)]
+        else:
+            # Sample from simulated dataset
+            sim_idx = idx - self.num_real
+            return self.sim_dataset[sim_idx % len(self.sim_dataset)]
 
     def get_source(self, idx: int) -> str:
-        """Get the source dataset for a given index (for debugging)."""
-        # Re-seed to match the same random draw
-        temp_rng = torch.Generator().manual_seed(42)
-        for _ in range(idx):
-            torch.rand(1, generator=temp_rng)
-        if torch.rand(1, generator=temp_rng).item() < self.sim_ratio:
-            return "sim"
-        return "real"
+        """Get the source dataset for a given index ('real' or 'sim')."""
+        if idx < self.num_real:
+            return "real"
+        return "sim"
