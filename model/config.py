@@ -136,7 +136,7 @@ class Config:
         MAHALANOBIS_GATE_THRESHOLD = 30
         VEL_CORR_CLIP_RANGE = 5.0
         MAX_COVARIANCE_VAL = 2.95  # softplus(2.95) ≈ 3.0
-        
+
         # TCN Output Head Bounds
         ZUPT_PROB_THRESHOLD = 0.5   # Probability above which we consider the pen stationary
         R_MIN = 1e-4                # Minimum measurement noise (prevents filter overconfidence)
@@ -258,7 +258,7 @@ class Config:
         INIT_GYRO_VAR_THRESHOLD = 0.002  # rad²/s²
         INIT_ACCEL_RELIABLE_MIN = 4.9    # m/s² (~0.5g)
         INIT_ACCEL_RELIABLE_MAX = 14.7   # m/s² (~1.5g)
-        
+
         # P_error Initialization
         INIT_P_POS = 0.01  # 1cm
         INIT_P_VEL = 0.001 # 1mm/s
@@ -289,20 +289,6 @@ class Config:
         GYRO_NOISE_BASE = 1.5e-3
         # Force sensor noise (arbitrary units)
         FORCE_NOISE_BASE = 0.5
-
-    # === Data Preprocessing ===
-    class PREPROCESSING:
-        """Constants for data acquisition and preprocessing pipeline."""
-        # Two-tap synchronization
-        ROI_MARGIN_S = 1.0  # seconds - margin around writing region
-        STATIC_BUFFER_S = 2.0  # seconds - static period before writing for initialization
-        # Force thresholds for segmentation (iPad units)
-        FORCE_THRESHOLD_START = 0.01
-        FORCE_THRESHOLD_END = 0.01
-        # Resampling and filtering
-        MEDIAN_FILTER_WINDOW = 3  # samples
-        SAVGOL_WINDOW = 11  # samples for Savitzky-Golay filter
-        SAVGOL_POLYORDER = 3  # polynomial order for Savitzky-Golay
 
     # === Validation ===
     class VALIDATION:
