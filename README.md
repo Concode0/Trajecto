@@ -46,6 +46,8 @@ One of the most critical challenges in IMU-based reconstruction is **Scale Drift
 
 ## 📐 Theoretical Grounding & Stability Proof
 
+> **"We do not chase the impossible Global Position; We reconstruct the perfect Relative Shape."**
+
 This project goes beyond empirical results. The **Trajecto** architecture is built upon a rigorous mathematical foundation that guarantees system stability and convergence.
 
 We provide two versions of the mathematical proof demonstrating the **Uniform Ultimate Boundedness (UUB)** of the error states and the reduction of the **Cramér-Rao Lower Bound (CRLB)** via the Hybrid ESKF-TCN injection.
@@ -59,6 +61,8 @@ We provide two versions of the mathematical proof demonstrating the **Uniform Ul
 * **Divergence of Pure Integration:** Mathematically proves that open-loop IMU integration leads to unbounded drift due to the rank deficiency of the Fisher Information Matrix (FIM).
 * **CRLB Reduction:** Demonstrates that the TCN-based pseudo-measurement injection strictly reduces the theoretical lower bound of the estimation error ($CRLB_{hybrid} \le CRLB_{base}$).
 * **Lyapunov Stability:** Establishes that the system is Uniformly Ultimately Bounded (UUB) by ensuring the energy dissipation rate ($\beta$) overpowers noise entropy.
+
+> For a detailed discussion on why we shifted the theoretical focus from *Global Stability* to *Partial Stability* and the acknowledgment of physical rank-deficiency, please check the [**Pinned Issue: Theoretical Framework Refinement**](https://github.com/Concode0/Trajecto/issues/2).
 
 ## 🔬 Technical Breakthroughs
 
