@@ -1,45 +1,52 @@
 NOTICE
 Trajecto: Real-time 3D Trajectory Reconstruction System
 
-
-Copyright 2025-2026 Eunkyum Kim
+Copyright 2025-2026 Eunkyum Kim <nemonanconcode@gmail.com>
 
 I. Principal Architectures & Methodologies
-This project incorporates original architectures and methodologies developed by Eunkyum Kim, representing a vertical integration of hardware control, state estimation, and deep learning. Key technical pillars include:
+This project incorporates original architectures and methodologies developed by Eunkyum Kim. Key technical pillars include:
 
-Hybrid ESKF-Stateful TCN: A closed-loop control architecture integrating Error-State Kalman Filters with Temporal Convolutional Networks .
-
-Non-linear Reverse Engineering of Hovering: A methodology for reconstructing physical depth from normalized 2D digitizer signals using exponential modeling .
-
-O(1) Stateful Inference: Optimized real-time inference using ring buffers for resource-constrained edge devices .
+* Hybrid ESKF-Stateful TCN: A closed-loop architecture integrating Error-State Kalman Filters with Temporal Convolutional Networks.
+* Non-linear Reverse Engineering of Hovering: A methodology for reconstructing physical depth from normalized 2D digitizer signals.
+* O(1) Stateful Inference: Optimized real-time inference using ring buffers for resource-constrained edge devices.
 
 
 II. Patent Notice
-Specific implementations and algorithms within this work are protected under the patent laws of the Republic of Korea. These include, but are not limited to:
+Specific implementations and algorithms within this work are protected under the patent laws of the Republic of Korea. Unauthorized commercial exploitation is strictly prohibited.
 
-Patent Application No. 10-2025-0201092: "Method and System for Generating 3D Ground Truth Trajectory based on 2D Digitizer using Non-linear Reverse Engineering of Hovering Signal and Cross-Correlation Synchronization."
-
-Patent Application No. 10-2025-0201093: "Real-time 3D Trajectory Reconstruction System and Method based on Adaptive Hybrid ESKF-Stateful TCN for Edge Devices."
+* Patent Application No. 10-2025-0201092: "Method and System for Generating 3D Ground Truth Trajectory based on 2D Digitizer using Non-linear Reverse Engineering of Hovering Signal and Cross-Correlation Synchronization."
+* Patent Application No. 10-2025-0201093: "Real-time 3D Trajectory Reconstruction System and Method based on Adaptive Hybrid ESKF-Stateful TCN for Edge Devices."
 
 
 III. Licensing and Attribution
+* Software: Licensed under the GNU Affero General Public License v3 (AGPLv3).
+* Hardware: Licensed under the CERN Open Hardware Licence Version 2 - Strongly Reciprocal (CERN-OHL-S).
 
-Software: Licensed under the Apache License, Version 2.0.
+Pursuant to AGPLv3 Section 7(b), any redistribution of this work must preserve the copyright notices, patent declarations, and author attributions contained within this NOTICE file.
 
-Hardware: Licensed under the CERN Open Hardware Licence Version 2 - Permissive (CERN-OHL-P).
-
-Pursuant to Section 4(d) of the Apache License 2.0, any redistribution of this Work or Derivative Works must include a readable copy of the attribution notices contained within this NOTICE file.
 
 IV. Third-Party Software Notices
-This project includes portions of the following open-source software:
+Trajecto incorporates or links to the following third-party software. Use of these libraries is subject to their respective licenses:
 
-H5View: A CLI tool for reading H5 files.
+* Eigen (v3.4+)
+    - License: Mozilla Public License v2.0 (MPL 2.0)
+    - Purpose: High-performance linear algebra operations for ESKF.
+* espp (ESP-IDF C++ Components)
+    - License: MIT License
+    - Purpose: C++ abstractions for ESP32-C3 peripherals and task management.
+* TensorFlow Lite Micro
+    - License: Apache License 2.0
+    - Purpose: On-device TCN inference.
+* Bosch BMI270 Driver
+    - License: BSD 3-Clause License
+    - Purpose: Low-level IMU data acquisition.
+* H5View (Modified)
     - Original Author: Cyrille Rossant (2012)
     - License: BSD 3-Clause License
     - Modifications: Enhanced with Sample Delete by Eunkyum Kim.
-    - The original license terms and disclaimers are preserved within the respective source files.
+
 
 V. Commercial Use and Licensing
-While the source code is provided under the Apache License 2.0 for academic and non-commercial purposes, the commercial exploitation of the patented technologies (Application Nos. 10-2025-0201092, 10-2025-0201093) and the core Trajecto logic is strictly prohibited without a separate commercial license agreement from the author.
+While the source code is available under the AGPLv3 for open-source collaboration and academic research, any commercial use, integration into proprietary products, or removal of the AGPLv3 reciprocity obligations requires a separate commercial license agreement.
 
-For commercial licensing inquiries, please contact: nemonanconcode@gmail.com
+For commercial licensing and patent inquiries, contact: nemonanconcode@gmail.com
