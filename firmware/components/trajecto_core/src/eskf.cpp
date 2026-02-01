@@ -294,6 +294,25 @@ void ESKF::hard_reset_velocity() {
     state_.vel.setZero();
 }
 
+void ESKF::reset_covariance() {
+    // Reset P to conservative initial diagonal values (matches Python _build_reset_covariance)
+    // Used by divergence reset mode when Mahalanobis gating rejects too many updates
+    P_.setZero();
+    P_(0, 0) = P_(1, 1) = P_(2, 2) = INIT_P_POS;
+    P_(3, 3) = P_(4, 4) = P_(5, 5) = INIT_P_VEL;
+    P_(6, 6) = P_(7, 7) = P_(8, 8) = INIT_P_ORI;
+    P_(9, 9) = P_(10, 10) = P_(11, 11) = INIT_P_GYRO_BIAS;
+    P_(12, 12) = P_(13, 13) = P_(14, 14) = INIT_P_ACCEL_BIAS;
+}
+
+void ESKF::reset_covariance_with_zupt() {
+    // Full divergence recovery: reset P + zero velocity + tighten velocity P
+    reset_covariance();
+    state_.vel.setZero();
+    float zupt_var = ZUPT_NOISE_STD * ZUPT_NOISE_STD;
+    P_(3, 3) = P_(4, 4) = P_(5, 5) = zupt_var;
+}
+
 void ESKF::inject_error(const Eigen::Matrix<float, STATE_DIM, 1>& delta_x) {
     Eigen::Vector3f d_pos = delta_x.segment<3>(0);
     Eigen::Vector3f d_vel = delta_x.segment<3>(3);

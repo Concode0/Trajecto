@@ -845,6 +845,30 @@ void ESKFFixed::hard_reset_velocity() {
 }
 
 // ---------------------------------------------------------------------------
+// Reset covariance (divergence recovery)
+// ---------------------------------------------------------------------------
+void ESKFFixed::reset_covariance() {
+    // Clear all off-diagonal blocks, set diagonal blocks to INIT_P values
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; j < 5; ++j) {
+            P_.at(i, j) = ScaledBlock3x3();
+        }
+    }
+    P_.at(0, 0) = ScaledBlock3x3::from_float_diag(INIT_P_POS, INIT_P_POS, INIT_P_POS);
+    P_.at(1, 1) = ScaledBlock3x3::from_float_diag(INIT_P_VEL, INIT_P_VEL, INIT_P_VEL);
+    P_.at(2, 2) = ScaledBlock3x3::from_float_diag(INIT_P_ORI, INIT_P_ORI, INIT_P_ORI);
+    P_.at(3, 3) = ScaledBlock3x3::from_float_diag(INIT_P_GYRO_BIAS, INIT_P_GYRO_BIAS, INIT_P_GYRO_BIAS);
+    P_.at(4, 4) = ScaledBlock3x3::from_float_diag(INIT_P_ACCEL_BIAS, INIT_P_ACCEL_BIAS, INIT_P_ACCEL_BIAS);
+}
+
+void ESKFFixed::reset_covariance_with_zupt() {
+    reset_covariance();
+    state_.vel = Vec3_Q4_27::zero();
+    float zupt_var = ZUPT_NOISE_STD * ZUPT_NOISE_STD;
+    P_.at(1, 1) = ScaledBlock3x3::from_float_diag(zupt_var, zupt_var, zupt_var);
+}
+
+// ---------------------------------------------------------------------------
 // Inject error state corrections
 // ---------------------------------------------------------------------------
 void ESKFFixed::inject_error(

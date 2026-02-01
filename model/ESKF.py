@@ -481,6 +481,8 @@ class ErrorStateKalmanFilter(nn.Module):
         self,
         cache: ESKFSequenceCache,
         block_size: int = 64,
+        reset_events: Optional[torch.Tensor] = None,
+        P_reset: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute covariances using parallel scan with cached matrices.
 
@@ -492,9 +494,16 @@ class ErrorStateKalmanFilter(nn.Module):
         The noise_inj_t is the properly accumulated noise injection from all updates,
         accounting for the transformation by subsequent W matrices.
 
+        Divergence resets are encoded by setting F̃=0, Q̃=P_reset at reset timesteps.
+        Since P[t] = 0 @ P[t-1] @ 0^T + P_reset = P_reset, the scan naturally
+        "forgets" prior covariance history at reset points without breaking
+        the associative operator structure.
+
         Args:
             cache: ESKFSequenceCache with F, Q, W, noise_inj sequences
             block_size: Block size for parallel scan
+            reset_events: Optional (batch, seq_len) bool tensor marking reset timesteps
+            P_reset: Optional (batch, 15, 15) fresh covariance to inject at resets
 
         Returns:
             P_seq: Covariance sequence [batch, seq_len, 15, 15]
@@ -506,6 +515,18 @@ class ErrorStateKalmanFilter(nn.Module):
 
         WQW = torch.einsum("btij,btjk,btlk->btil", cache.W_seq, cache.Q_seq, cache.W_seq)
         Q_unified = WQW + cache.noise_inj_seq
+
+        # Inject divergence resets: F̃=0, Q̃=P_reset at reset timesteps
+        # This makes the scan produce P_reset at those points and propagate
+        # forward from there, consistent with the sequential loop behavior.
+        if reset_events is not None and P_reset is not None and reset_events.any():
+            reset_mask = reset_events.unsqueeze(-1).unsqueeze(-1)  # (batch, seq, 1, 1)
+            F_unified = torch.where(reset_mask, torch.zeros_like(F_unified), F_unified)
+            Q_unified = torch.where(
+                reset_mask,
+                P_reset.unsqueeze(1).expand_as(Q_unified),
+                Q_unified,
+            )
 
         # Parallel covariance scan
         P_seq = parallel_covariance_scan_blocked(F_unified, Q_unified, cache.P_init, block_size)
@@ -1447,6 +1468,10 @@ class ErrorStateKalmanFilter(nn.Module):
         innovation_output = torch.zeros(batch_size, self.obs_dim, device=device, dtype=pos_w.dtype)
         mahalanobis_output = torch.zeros(batch_size, device=device, dtype=pos_w.dtype)
 
+        # Always feed ZuptDetector so buffers stay ready for divergence reset mode.
+        # Previously only called when use_zupt=True; now update() is unconditional.
+        self.zupt_detector.update(accel_b_raw, force_raw)
+
         # Determine if ZUPT should be applied.
         # TCN outputs logits for BCEWithLogitsLoss compatibility; apply sigmoid for probability
         zupt_prob: Optional[torch.Tensor] = None
@@ -1454,7 +1479,7 @@ class ErrorStateKalmanFilter(nn.Module):
             zupt_prob = torch.sigmoid(tcn_output["zupt_prob"]).squeeze(-1)
             is_zupt = zupt_prob > Config.ESKFTCN.ZUPT_PROB_THRESHOLD
         elif self.use_zupt:
-            is_zupt = self.zupt_detector(accel_b_raw, force_raw)
+            is_zupt = self.zupt_detector.detect()  # detect() only, update() already called above
         else:
             is_zupt = torch.zeros(accel_b_raw.shape[0], dtype=torch.bool, device=device)
 

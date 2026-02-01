@@ -142,6 +142,15 @@ class Config:
         R_MIN = 1e-4                # Minimum measurement noise (prevents filter overconfidence)
         R_MAX = 3.0                 # Maximum measurement noise (trust floor)
 
+        # --- Divergence Detection & Reset Mode ---
+        # When Mahalanobis gating rejects too many consecutive updates, P grows
+        # unchecked (positive feedback). This mode detects that condition and
+        # resets covariance + applies classical ZUPT to re-anchor if stationary.
+        USE_DIVERGENCE_RESET = True
+        RESET_REJECTION_THRESHOLD = 5       # rejections in window to trigger reset
+        RESET_REJECTION_WINDOW = 10         # rolling window size (timesteps)
+        RESET_COOLDOWN_STEPS = 20           # min gap between resets (~0.4s @ 50Hz)
+
         # ESKF Learnable Parameters (BPTT Control)
         # Set to False to disable backpropagation through ESKF parameters for faster training
         # This makes R_diag, zupt_noise_std, and virtual_meas_weights fixed (non-learnable)

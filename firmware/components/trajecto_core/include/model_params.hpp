@@ -79,6 +79,21 @@ constexpr float LOG_R_MAX = 4.60517f;              // log(100)
 constexpr float R_MIN = 1e-4f;   // Minimum measurement noise
 constexpr float R_MAX = 3.0f;    // Maximum measurement noise
 
+// Divergence Detection & Reset Mode (from Config.ESKFTCN)
+// When Mahalanobis gating rejects too many consecutive updates, covariance P
+// grows unchecked. This mode detects that condition and resets P + applies ZUPT.
+constexpr bool USE_DIVERGENCE_RESET = true;
+constexpr int RESET_REJECTION_THRESHOLD = 5;   // rejections in window to trigger
+constexpr int RESET_REJECTION_WINDOW = 10;      // rolling window size (timesteps)
+constexpr int RESET_COOLDOWN_STEPS = 20;        // min gap between resets (~0.4s @ 50Hz)
+
+// P_error initialization values for covariance reset (from Config.MOTION)
+constexpr float INIT_P_POS = 0.01f;            // 1cm position uncertainty
+constexpr float INIT_P_VEL = 0.001f;           // 1mm/s velocity uncertainty
+constexpr float INIT_P_ORI = 0.1f;             // orientation uncertainty (max)
+constexpr float INIT_P_GYRO_BIAS = 1e-3f;      // gyro bias uncertainty (max)
+constexpr float INIT_P_ACCEL_BIAS = 1.0f;       // accel bias uncertainty (max)
+
 // Allan Variance Noise Parameters (for ESKF Q matrix)
 constexpr float VRW_X = 8.3297e-04f, VRW_Y = 6.7196e-04f, VRW_Z = 9.3271e-04f;
 constexpr float ARW_X = 7.1664e-05f, ARW_Y = 7.9283e-05f, ARW_Z = 7.5335e-05f;

@@ -69,6 +69,12 @@ public:
 
     void hard_reset_velocity();
 
+    /** @brief Reset covariance to initial values (divergence recovery) */
+    void reset_covariance();
+
+    /** @brief Reset covariance + zero velocity + tighten velocity P (divergence ZUPT) */
+    void reset_covariance_with_zupt();
+
     // Getters
     const NominalStateFixed& get_state_fixed() const { return state_; }
     NominalState get_state() const { return state_.to_float(); }

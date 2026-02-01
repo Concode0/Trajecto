@@ -254,6 +254,45 @@ class BaseFilterTCNModel(nn.Module):
         """
         raise NotImplementedError
 
+    def _build_reset_covariance(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """Builds a fresh 15x15 P_error diagonal from Config.MOTION.INIT_P_* values.
+
+        Used by divergence reset mode to replace a diverged covariance with
+        conservative initial values, breaking the positive feedback loop.
+
+        Args:
+            batch_size: Number of sequences in the batch.
+            dtype: Data type for the tensor.
+            device: Device for the tensor.
+
+        Returns:
+            P_reset: (batch_size, 15, 15) diagonal covariance matrix.
+        """
+        P_reset = torch.zeros(batch_size, 15, 15, device=device, dtype=dtype)
+        # Position uncertainty
+        P_reset[:, 0, 0] = Config.MOTION.INIT_P_POS
+        P_reset[:, 1, 1] = Config.MOTION.INIT_P_POS
+        P_reset[:, 2, 2] = Config.MOTION.INIT_P_POS
+        # Velocity uncertainty
+        P_reset[:, 3, 3] = Config.MOTION.INIT_P_VEL
+        P_reset[:, 4, 4] = Config.MOTION.INIT_P_VEL
+        P_reset[:, 5, 5] = Config.MOTION.INIT_P_VEL
+        # Orientation uncertainty (use max from config range)
+        P_reset[:, 6, 6] = Config.MOTION.INIT_P_ORI_MAX
+        P_reset[:, 7, 7] = Config.MOTION.INIT_P_ORI_MAX
+        P_reset[:, 8, 8] = Config.MOTION.INIT_P_ORI_MAX
+        # Gyro bias uncertainty (use max)
+        P_reset[:, 9, 9] = Config.MOTION.INIT_P_GYRO_BIAS_MAX
+        P_reset[:, 10, 10] = Config.MOTION.INIT_P_GYRO_BIAS_MAX
+        P_reset[:, 11, 11] = Config.MOTION.INIT_P_GYRO_BIAS_MAX
+        # Accel bias uncertainty (use max)
+        P_reset[:, 12, 12] = Config.MOTION.INIT_P_ACCEL_BIAS_MAX
+        P_reset[:, 13, 13] = Config.MOTION.INIT_P_ACCEL_BIAS_MAX
+        P_reset[:, 14, 14] = Config.MOTION.INIT_P_ACCEL_BIAS_MAX
+        return P_reset
+
     def _get_gyro_bias(
         self, filter_output: Tuple[torch.Tensor, ...]
     ) -> torch.Tensor:
@@ -387,10 +426,31 @@ class BaseFilterTCNModel(nn.Module):
         tcn_update_stride = Config.ESKFTCN.TCN_UPDATE_STRIDE
         cached_tcn_output: Optional[Dict[str, torch.Tensor]] = None
 
+        # --- Divergence Reset Mode: Initialize tracking state ---
+        use_divergence_reset = Config.ESKFTCN.USE_DIVERGENCE_RESET
+        if use_divergence_reset:
+            reset_window = Config.ESKFTCN.RESET_REJECTION_WINDOW
+            reset_threshold = Config.ESKFTCN.RESET_REJECTION_THRESHOLD
+            reset_cooldown_cfg = Config.ESKFTCN.RESET_COOLDOWN_STEPS
+            gate_threshold = Config.ESKFTCN.MAHALANOBIS_GATE_THRESHOLD
+            # Rolling window of rejection flags per batch element
+            rejection_history = torch.zeros(
+                batch_size, reset_window, dtype=torch.bool, device=self.device
+            )
+            rejection_history_idx = 0
+            # Per-element cooldown counter (must reach 0 before next reset)
+            cooldown_counter = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
         # --- Block-Parallel Scan: Initialize caching ---
         # When enabled, ESKF caches F, Q, W, noise_inj matrices at each step
-        # for O(log T) parallel covariance computation after the loop
+        # for O(log T) parallel covariance computation after the loop.
+        # Divergence resets are handled by injecting (F=0, Q=P_reset) at reset
+        # timesteps in the cache, which makes the scan "forget" prior P and
+        # restart from P_reset — mathematically compatible with associativity.
         use_block_parallel = Config.ESKFTCN.USE_BLOCK_PARALLEL and self.training
+        # Track reset events for injecting into parallel scan cache
+        if use_divergence_reset and use_block_parallel:
+            reset_events = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=self.device)
         if use_block_parallel and hasattr(self.filter, 'init_cache'):
             # Cache should be on GPU for parallel computation, even when state is on CPU
             self.filter.init_cache(batch_size, seq_len, dtype=imu_data_raw.dtype, device=self.device)
@@ -517,6 +577,104 @@ class BaseFilterTCNModel(nn.Module):
             raw_innovation = tcn_features_from_filter["innovation"]
             filter_innovation_seq.append(raw_innovation)
 
+            # --- Divergence Detection & Reset ---
+            # Track Mahalanobis rejections in a rolling window. When too many
+            # consecutive updates are gated, reset covariance to break the
+            # positive feedback loop (P grows → more rejections → P grows).
+            if use_divergence_reset and t >= reset_window:
+                # Check if this timestep's update was rejected by Mahalanobis gate
+                mahalanobis_sq = tcn_features_from_filter["mahalanobis"].squeeze(-1)
+                was_rejected = mahalanobis_sq > gate_threshold  # (batch_size,)
+
+                # Record in rolling buffer (on same device as rejection_history)
+                if was_rejected.device != rejection_history.device:
+                    was_rejected = was_rejected.to(rejection_history.device)
+                rejection_history[:, rejection_history_idx] = was_rejected
+                rejection_history_idx = (rejection_history_idx + 1) % reset_window
+
+                # Count rejections in window
+                rejection_count = rejection_history.sum(dim=1)  # (batch_size,)
+
+                # Decrement cooldown
+                cooldown_counter = (cooldown_counter - 1).clamp(min=0)
+
+                # Determine which batch elements need reset
+                needs_reset = (
+                    (rejection_count >= reset_threshold)
+                    & (cooldown_counter == 0)
+                )
+
+                if needs_reset.any():
+                    # Move mask to state device for torch.where operations
+                    state_device = state_tuple[0].device
+                    state_dtype = state_tuple[0].dtype
+                    needs_reset_state = needs_reset.to(state_device)
+
+                    # A. Covariance reset: replace P_error with fresh initial values
+                    P_reset = self._build_reset_covariance(
+                        batch_size, state_dtype, state_device
+                    )
+                    # state_tuple layout: (pos_w, vel_w, quat, gyro_bias, accel_bias, P_error)
+                    # P_error is the last element before tcn_features dict (which was stripped)
+                    P_error_current = state_tuple[-1]  # (batch_size, 15, 15)
+                    P_error_reset = torch.where(
+                        needs_reset_state.unsqueeze(-1).unsqueeze(-1),
+                        P_reset,
+                        P_error_current,
+                    )
+                    state_tuple = state_tuple[:-1] + (P_error_reset,)
+
+                    # B. Classical ZUPT: if stationary, zero velocity for reset samples
+                    is_stationary = self.filter.zupt_detector.detect()
+                    if is_stationary.device != state_device:
+                        is_stationary = is_stationary.to(state_device)
+                    apply_zupt = needs_reset_state & is_stationary.to(state_device)
+
+                    if apply_zupt.any():
+                        # Zero the velocity for stationary reset samples
+                        vel_w_current = state_tuple[1]  # (batch_size, 3)
+                        vel_w_zeroed = torch.where(
+                            apply_zupt.unsqueeze(-1),
+                            torch.zeros_like(vel_w_current),
+                            vel_w_current,
+                        )
+                        state_tuple = (state_tuple[0], vel_w_zeroed) + state_tuple[2:]
+
+                        # Tighten velocity covariance for ZUPT'd samples
+                        zupt_noise = Config.ESKFTCN.ZUPT_NOISE_STD ** 2
+                        P_after_zupt = state_tuple[-1].clone()
+                        zupt_mask_expanded = apply_zupt
+                        P_after_zupt[zupt_mask_expanded, 3, 3] = zupt_noise
+                        P_after_zupt[zupt_mask_expanded, 4, 4] = zupt_noise
+                        P_after_zupt[zupt_mask_expanded, 5, 5] = zupt_noise
+                        state_tuple = state_tuple[:-1] + (P_after_zupt,)
+
+                    # C. Invalidate cached TCN output for reset samples
+                    # Force TCN to recompute on next stride boundary instead of
+                    # using stale zero-order-held predictions
+                    if needs_reset.any() and cached_tcn_output is not None:
+                        # If all batch elements reset, clear cache entirely
+                        if needs_reset.all():
+                            cached_tcn_output = None
+                        # Otherwise leave cache for non-reset elements (mixed batch
+                        # is handled by the filter naturally on next TCN update)
+
+                    # D. Flag TCN buffer for reset: overwrite history with current feature
+                    # (deferred until after feature engineering below, using needs_reset_deferred)
+                    needs_reset_deferred = needs_reset.clone()
+
+                    # E. Record reset event for parallel scan injection
+                    if use_block_parallel:
+                        reset_events[:, t] = needs_reset
+
+                    # F. Clear rejection history and start cooldown for reset samples
+                    rejection_history[needs_reset] = False
+                    cooldown_counter[needs_reset] = reset_cooldown_cfg
+                else:
+                    needs_reset_deferred = None
+            else:
+                needs_reset_deferred = None
+
             # --- Feature Engineering for the *next* TCN input ---
             # These features are crucial for the TCN to learn effective corrections.
             # They are derived from normalized IMU data and current filter estimates.
@@ -604,6 +762,19 @@ class BaseFilterTCNModel(nn.Module):
                     -1, receptive_field - 1, -1
                 )
                 first_feature_stored = True
+
+            # --- Deferred TCN Buffer Reset (Divergence Reset Mode) ---
+            # For reset samples, overwrite TCN feature history with the current
+            # feature vector (same pattern as warm-start). This gives TCN clean
+            # context instead of features computed during diverged state.
+            if use_divergence_reset and needs_reset_deferred is not None and needs_reset_deferred.any():
+                reset_end = t + 1  # current position already written
+                for b_idx in range(batch_size):
+                    if needs_reset_deferred[b_idx]:
+                        # Overwrite all history up to current timestep with current feature
+                        tcn_feature_seq[b_idx, :reset_end, :] = tcn_input_vec[b_idx].unsqueeze(0).expand(
+                            reset_end, -1
+                        )
 
             # Log current position and quaternion from the filter for final trajectory calculation.
             positions_w_seq.append(pos_w)
@@ -750,9 +921,19 @@ class BaseFilterTCNModel(nn.Module):
         if use_block_parallel and hasattr(self.filter, 'finalize_cache'):
             cache = self.filter.finalize_cache()
             if cache is not None and cache.P_init is not None:
+                # Inject divergence reset events into parallel scan if applicable
+                scan_reset_events = None
+                scan_P_reset = None
+                if use_divergence_reset and reset_events.any():
+                    scan_reset_events = reset_events
+                    scan_P_reset = self._build_reset_covariance(
+                        batch_size, imu_data_raw.dtype, self.device
+                    )
                 # Use parallel scan for covariance computation
                 stacked_P_error = self.filter.parallel_covariance_from_cache(
-                    cache, block_size=Config.ESKFTCN.BLOCK_SIZE
+                    cache, block_size=Config.ESKFTCN.BLOCK_SIZE,
+                    reset_events=scan_reset_events,
+                    P_reset=scan_P_reset,
                 )
             else:
                 # Fallback to sequential if cache is invalid

@@ -55,6 +55,13 @@ public:
         // Reset stride-based TCN control
         step_counter_ = 0;
         tcn_output_valid_ = false;
+
+        // Reset divergence tracking
+        reset_rejection_idx_ = 0;
+        reset_cooldown_ = 0;
+        for (int i = 0; i < RESET_REJECTION_WINDOW; ++i) {
+            rejection_history_[i] = false;
+        }
     }
 
     void step(const Eigen::Vector3f& accel, const Eigen::Vector3f& gyro, float force) {
@@ -144,6 +151,41 @@ private:
         if (tcn_out.valid && tcn_out.zupt_prob >= ZUPT_HARD_RESET_THRESHOLD) {
             eskf_.hard_reset_velocity();
         }
+
+        // --- Divergence Detection & Reset ---
+        if (USE_DIVERGENCE_RESET) {
+            // Record whether this update was rejected by Mahalanobis gate
+            rejection_history_[reset_rejection_idx_] = (mahalanobis_sq > MAHALANOBIS_GATE_THRESHOLD);
+            reset_rejection_idx_ = (reset_rejection_idx_ + 1) % RESET_REJECTION_WINDOW;
+
+            // Count rejections in rolling window
+            int rejection_count = 0;
+            for (int i = 0; i < RESET_REJECTION_WINDOW; ++i) {
+                if (rejection_history_[i]) rejection_count++;
+            }
+
+            // Decrement cooldown
+            if (reset_cooldown_ > 0) reset_cooldown_--;
+
+            // Trigger reset if threshold exceeded and not in cooldown
+            if (rejection_count >= RESET_REJECTION_THRESHOLD && reset_cooldown_ == 0) {
+                bool is_stationary = eskf_.check_zupt(accel);
+                if (is_stationary) {
+                    eskf_.reset_covariance_with_zupt();
+                } else {
+                    eskf_.reset_covariance();
+                }
+
+                // Invalidate cached TCN output to force fresh inference
+                tcn_output_valid_ = false;
+
+                // Clear rejection history and start cooldown
+                for (int i = 0; i < RESET_REJECTION_WINDOW; ++i) {
+                    rejection_history_[i] = false;
+                }
+                reset_cooldown_ = RESET_COOLDOWN_STEPS;
+            }
+        }
     }
 
 #ifdef TRAJECTO_USE_FIXED_POINT
@@ -223,6 +265,35 @@ private:
         if (tcn_out.valid && tcn_out.zupt_prob >= ZUPT_HARD_RESET_THRESHOLD) {
             eskf_fixed_.hard_reset_velocity();
         }
+
+        // --- Divergence Detection & Reset (fixed-point path) ---
+        if (USE_DIVERGENCE_RESET) {
+            rejection_history_[reset_rejection_idx_] = (mahalanobis_sq > MAHALANOBIS_GATE_THRESHOLD);
+            reset_rejection_idx_ = (reset_rejection_idx_ + 1) % RESET_REJECTION_WINDOW;
+
+            int rejection_count = 0;
+            for (int i = 0; i < RESET_REJECTION_WINDOW; ++i) {
+                if (rejection_history_[i]) rejection_count++;
+            }
+
+            if (reset_cooldown_ > 0) reset_cooldown_--;
+
+            if (rejection_count >= RESET_REJECTION_THRESHOLD && reset_cooldown_ == 0) {
+                bool is_stationary = eskf_fixed_.check_zupt(accel_f);
+                if (is_stationary) {
+                    eskf_fixed_.reset_covariance_with_zupt();
+                    eskf_.reset_covariance_with_zupt();  // Keep shadow in sync
+                } else {
+                    eskf_fixed_.reset_covariance();
+                    eskf_.reset_covariance();
+                }
+                tcn_output_valid_ = false;
+                for (int i = 0; i < RESET_REJECTION_WINDOW; ++i) {
+                    rejection_history_[i] = false;
+                }
+                reset_cooldown_ = RESET_COOLDOWN_STEPS;
+            }
+        }
     }
 #endif
 
@@ -240,6 +311,11 @@ private:
     int step_counter_ = 0;           // Counts timesteps for stride control
     TCNOutput cached_tcn_out_;       // Zero-order hold: cached TCN output
     bool tcn_output_valid_ = false;  // Whether we have a valid cached output
+
+    // Divergence reset tracking
+    bool rejection_history_[RESET_REJECTION_WINDOW] = {};  // Rolling window of gate rejections
+    int reset_rejection_idx_ = 0;    // Current index in rejection ring buffer
+    int reset_cooldown_ = 0;         // Countdown to allow next reset
 };
 
 } // namespace trajecto

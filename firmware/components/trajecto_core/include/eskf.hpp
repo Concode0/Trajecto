@@ -73,6 +73,12 @@ public:
     /** @brief Hard reset velocity to zero (for high-confidence ZUPT) */
     void hard_reset_velocity();
 
+    /** @brief Reset covariance to initial values (divergence recovery) */
+    void reset_covariance();
+
+    /** @brief Reset covariance + zero velocity + tighten velocity P (divergence ZUPT) */
+    void reset_covariance_with_zupt();
+
     // Getters
     const NominalState& get_state() const { return state_; }
     const Eigen::Matrix<float, STATE_DIM, STATE_DIM>& get_covariance() const { return P_; }

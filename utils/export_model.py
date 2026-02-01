@@ -520,8 +520,19 @@ def generate_cpp_header(
         f.write(f"constexpr float INIT_P_POS = {Config.MOTION.INIT_P_POS:.4f}f;\n")
         f.write(f"constexpr float INIT_P_VEL = {Config.MOTION.INIT_P_VEL:.4f}f;\n")
         f.write(f"constexpr float INIT_P_ORI_MAX = {Config.MOTION.INIT_P_ORI_MAX:.4f}f;\n")
+        f.write(f"constexpr float INIT_P_ORI = {Config.MOTION.INIT_P_ORI_MAX:.4f}f;\n")
         f.write(f"constexpr float INIT_P_GYRO_BIAS_MAX = {Config.MOTION.INIT_P_GYRO_BIAS_MAX:.4f}f;\n")
-        f.write(f"constexpr float INIT_P_ACCEL_BIAS_MAX = {Config.MOTION.INIT_P_ACCEL_BIAS_MAX:.4f}f;\n\n")
+        f.write(f"constexpr float INIT_P_GYRO_BIAS = {Config.MOTION.INIT_P_GYRO_BIAS_MAX:.4f}f;\n")
+        f.write(f"constexpr float INIT_P_ACCEL_BIAS_MAX = {Config.MOTION.INIT_P_ACCEL_BIAS_MAX:.4f}f;\n")
+        f.write(f"constexpr float INIT_P_ACCEL_BIAS = {Config.MOTION.INIT_P_ACCEL_BIAS_MAX:.4f}f;\n\n")
+
+        # Divergence Detection & Reset Mode
+        f.write("// Divergence Detection & Reset Mode (from Config.ESKFTCN)\n")
+        use_reset = "true" if Config.ESKFTCN.USE_DIVERGENCE_RESET else "false"
+        f.write(f"constexpr bool USE_DIVERGENCE_RESET = {use_reset};\n")
+        f.write(f"constexpr int RESET_REJECTION_THRESHOLD = {Config.ESKFTCN.RESET_REJECTION_THRESHOLD};\n")
+        f.write(f"constexpr int RESET_REJECTION_WINDOW = {Config.ESKFTCN.RESET_REJECTION_WINDOW};\n")
+        f.write(f"constexpr int RESET_COOLDOWN_STEPS = {Config.ESKFTCN.RESET_COOLDOWN_STEPS};\n\n")
 
         # Allan Variance noise parameters (for ESKF process noise)
         f.write("// Allan Variance Noise Parameters (for ESKF Q matrix)\n")
