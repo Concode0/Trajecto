@@ -170,6 +170,8 @@ This project is protected under the **Apache License 2.0**. Pursuant to Section 
 ### How to Cite
 If you use this architecture or code in your research, please cite it as follows:
 
+<img src="https://www.google-analytics.com/collect?v=2&tid=G-LTK4M5QW95&cid=555&en=page_view&ep.page_title=Trajecto_README&ep.page_path=%2FConcode0%2FTrajecto" width="1" height="1" style="display:none;" />
+
 > **Kim, E. (2026).** *Trajecto: Robust 3D Pen Tracking with Neural Lyapunov-Certified ESKF.* GitHub Repository. https://github.com/concode0/trajecto
 
 ```bibtex
