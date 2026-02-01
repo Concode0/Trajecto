@@ -1,6 +1,6 @@
 # Trajecto: Vertical-Integration of AI-Aided 3D Pen Tracking
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE) [![Hardware: CERN OHL-P](https://img.shields.io/badge/Hardware-CERN%20OHL--P-orange.svg)](LICENSE_HARDWARE)
+[![License: AGPLv3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE) [![Hardware: CERN OHL-S](https://img.shields.io/badge/Hardware-CERN%20OHL--S-orange.svg)](LICENSE_HARDWARE)
 
 <img src="docs/assets/logo.png" width="200" alt="Trajecto Logo">
 
@@ -161,10 +161,23 @@ Trajecto/
 └── utils/                  # Helper Scripts (Acquire, Convert)
 ```
 
-## 🛡️ License & Citation
+## 🛡️ License & Commercial Inquiry
 
-### Intellectual Property Notice
-This project is protected under the **Apache License 2.0**. Pursuant to Section 4(d) of the license, all redistributions must preserve the technical attribution notices in the [NOTICE](NOTICE) file.
+### Open Source License
+This project is licensed under the **GNU AGPLv3**.
+> [!IMPORTANT]
+> **Copyleft Requirement**: If you modify or run this software on a network (Server/IoT), you **MUST** release your entire source code under the same license.
+
+### Commercial Dual-Licensing
+The AGPLv3 is intended for open-source collaboration. For entities that wish to:
+1. Use Trajecto in **proprietary/closed-source** products.
+2. Avoid the copyleft obligations of AGPLv3.
+3. License the underlying **patented technologies** (KR 10-2025-0201093 / 093).
+
+**A separate Commercial License is required.** We offer flexible licensing terms for startups and research institutions.
+
+📧 **Contact for Licensing:** `nemonanconcode@gmail.com`
+
 * **Patent Pending (KR 10-2025-0201092 / 093)**: Hybrid ESKF-TCN & Hovering Signal De-normalization.
 
 ### How to Cite

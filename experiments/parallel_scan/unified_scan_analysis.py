@@ -1,16 +1,16 @@
 # Trajecto: Real-time 3D Trajectory Reconstruction System
-# Copyright 2025-2026 Eunkyum Kim <nemonanconcode@gmail.com>
+# Copyright (C) 2025-2026 Eunkyum Kim <nemonanconcode@gmail.com>
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 #
-# NOTICE: This software is protected under the following ROK Patent Applications:
-# 1. Hybrid ESKF-Stateful TCN Architecture (No. 10-2025-0201093)
-# 2. 3D Ground Truth Generation via Hovering Signal Engineering (No. 10-2025-0201092)
+# [PATENT NOTICE]
+# This implementation is protected under ROK Patent Applications 10-2025-0201093/092.
+# Commercial use without a separate license is strictly prohibited.
 #
-# Commercial use or redistribution of the core logic requires a separate license.
-# For inquiries, contact: nemonanconcode@gmail.com
+# Contact: nemonanconcode@gmail.com
 
 """
 Unified Parallel Scan Analysis: Integrating Update into Transition Operator
