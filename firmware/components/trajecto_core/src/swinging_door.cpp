@@ -50,22 +50,25 @@ void SwingingDoor::process(const Point& point, const SendCallback& send_callback
 
     // First point: always send and set as anchor
     if (!has_anchor_) {
-        send_and_update(point, send_callback);
+        send_and_update(point, send_callback, SendReason::FIRST_POINT);
         return;
     }
 
     // Check forced send conditions
+    SendReason reason = SendReason::DOOR_EXCEEDED;  // Default
     bool force_send = false;
 
     // Condition 1: Time gap too large
     uint32_t time_gap = point.timestamp_us - anchor_.timestamp_us;
     if (time_gap >= max_time_gap_) {
         force_send = true;
+        reason = SendReason::TIME_GAP;
     }
 
     // Condition 2: Buffer full
-    if (buffer_.size() >= max_buffer_) {
+    if (!force_send && buffer_.size() >= max_buffer_) {
         force_send = true;
+        reason = SendReason::BUFFER_FULL;
     }
 
     // Add to buffer
@@ -74,20 +77,30 @@ void SwingingDoor::process(const Point& point, const SendCallback& send_callback
     // Condition 3: Point exceeds door tolerance
     if (!force_send && exceeds_door(point)) {
         force_send = true;
+        // Check if it's due to pen state change
+        if (point.pen_state != anchor_.pen_state) {
+            reason = SendReason::PEN_STATE_CHANGE;
+        } else {
+            reason = SendReason::DOOR_EXCEEDED;
+        }
     }
 
     if (force_send) {
-        // Send second-to-last point (if buffer has at least 2 points)
-        // This ensures smoother interpolation
-        if (buffer_.size() >= 2) {
+        // When max_time_gap triggers, send current point as absolute reference
+        // This prevents error accumulation after long gaps
+        if (reason == SendReason::TIME_GAP) {
+            send_and_update(point, send_callback, reason);
+        }
+        // For other conditions, send second-to-last point for smoother interpolation
+        else if (buffer_.size() >= 2) {
             Point to_send = buffer_[buffer_.size() - 2];
-            send_and_update(to_send, send_callback);
+            send_and_update(to_send, send_callback, reason);
 
             // Keep current point in buffer for next iteration
             buffer_.clear();
             buffer_.push_back(point);
         } else {
-            send_and_update(point, send_callback);
+            send_and_update(point, send_callback, reason);
         }
     } else {
         // Update door to include this point
@@ -98,7 +111,7 @@ void SwingingDoor::process(const Point& point, const SendCallback& send_callback
 void SwingingDoor::flush(const SendCallback& send_callback) {
     // Send last buffered point if any
     if (!buffer_.empty()) {
-        send_and_update(buffer_.back(), send_callback);
+        send_and_update(buffer_.back(), send_callback, SendReason::FLUSH);
     }
 }
 
@@ -186,8 +199,8 @@ void SwingingDoor::update_door(const Point& anchor, const Point& latest) {
     door_upper_.quat = anchor.quat;
 }
 
-void SwingingDoor::send_and_update(const Point& p, const SendCallback& callback) {
-    callback(p);
+void SwingingDoor::send_and_update(const Point& p, const SendCallback& callback, SendReason reason) {
+    callback(p, reason);
 
     anchor_ = p;
     has_anchor_ = true;

@@ -53,7 +53,16 @@ public:
                   quat(1,0,0,0), pen_state(false) {}
     };
 
-    using SendCallback = std::function<void(const Point&)>;
+    enum class SendReason : uint8_t {
+        FIRST_POINT,        // First point in stream
+        TIME_GAP,          // max_time_gap_us exceeded (absolute reference)
+        DOOR_EXCEEDED,     // Trajectory deviated beyond tolerance
+        BUFFER_FULL,       // Buffer capacity reached
+        PEN_STATE_CHANGE,  // Pen up/down transition (keyframe)
+        FLUSH              // Stream ended, flushing buffer
+    };
+
+    using SendCallback = std::function<void(const Point&, SendReason)>;
 
     /**
      * @brief Construct Swinging Door compressor
@@ -76,10 +85,31 @@ public:
      * @brief Process incoming trajectory point
      *
      * @param point New trajectory point from ESKF
-     * @param send_callback Callback to send compressed point via BLE
+     * @param send_callback Callback to send compressed point via BLE (receives Point and SendReason)
      *
      * The callback is invoked only when compression determines a point should be sent.
      * Typical compression ratio: 5-10x (send every 5-10 points instead of all)
+     *
+     * Send behavior:
+     * - When max_time_gap_us exceeded: Sends current point as absolute reference
+     * - When door tolerance exceeded or buffer full: Sends second-to-last buffered point
+     *
+     * This ensures fresh absolute data after long gaps to prevent error accumulation.
+     *
+     * Example usage in main.cpp:
+     * @code
+     * SwingingDoor compressor;
+     * auto callback = [](const SwingingDoor::Point& pt, SwingingDoor::SendReason reason) {
+     *     TrajectoryPacket pkt;
+     *     pkt.timestamp_us = pt.timestamp_us;
+     *     // ... copy pos, vel, quat ...
+     *     pkt.flags = (reason == SendReason::TIME_GAP) ? TRAJ_FLAG_ABSOLUTE_REF : 0;
+     *     if (pt.pen_state) pkt.flags |= TRAJ_FLAG_PEN_DOWN;
+     *     if (reason == SendReason::PEN_STATE_CHANGE) pkt.flags |= TRAJ_FLAG_KEYFRAME;
+     *     send_ble_packet(&pkt);
+     * };
+     * compressor.process(point, callback);
+     * @endcode
      */
     void process(const Point& point, const SendCallback& send_callback);
 
@@ -111,7 +141,7 @@ private:
     void update_door(const Point& anchor, const Point& latest);
 
     // Send point and update state
-    void send_and_update(const Point& p, const SendCallback& callback);
+    void send_and_update(const Point& p, const SendCallback& callback, SendReason reason);
 
     // Configuration
     float pos_tol_;
