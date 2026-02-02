@@ -41,6 +41,7 @@
 // Trajecto System
 #include "trajecto_system.hpp"
 #include "trajecto_protocol.h"
+#include "swinging_door.hpp"
 
 using namespace std::chrono_literals;
 
@@ -71,8 +72,9 @@ static std::atomic<bool> tflite_ok(false);
 
 // Current Configuration
 static trajecto::protocol::ConfigPayload current_config = {
-    .mode = 1,      // Default: Trajectory mode
-    .odr_hz = 50,   // Fixed ODR
+    .mode = 1,        // Default: Trajectory mode
+    .odr_hz = 50,     // Fixed ODR
+    .enable_sda = 1,  // Default: Swinging Door compression enabled
     .reserved = {0}
 };
 
@@ -382,6 +384,8 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                             } else {
                                 if (tflite_ok) {
                                     current_mode = AppMode::STREAMING_TRAJECTORY;
+                                    // Reset swinging door compressor for new stream
+                                    compressor.reset();
                                 } else {
                                     ESP_LOGW(TAG, "CMD: TRAJECTORY mode rejected - TFLite not initialized, using RAW mode");
                                     current_mode = AppMode::STREAMING_RAW;
@@ -400,6 +404,49 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                     }
 
                     case PacketType::CMD_STOP_STREAM: {
+                        // Flush any buffered trajectory points before stopping
+                        if (current_mode == AppMode::STREAMING_TRAJECTORY && current_config.enable_sda) {
+                            auto flush_callback = [](const trajecto::SwingingDoor::Point& pt,
+                                                    trajecto::SwingingDoor::SendReason reason) {
+                                struct __attribute__((packed)) {
+                                    Header h;
+                                    TrajectoryPacket p;
+                                } pkt;
+
+                                pkt.h.type = PacketType::DATA_TRAJECTORY;
+                                pkt.h.length = sizeof(TrajectoryPacket);
+                                pkt.p.timestamp_us = pt.timestamp_us;
+                                pkt.p.pos[0] = pt.position.x();
+                                pkt.p.pos[1] = pt.position.y();
+                                pkt.p.pos[2] = pt.position.z();
+                                pkt.p.vel[0] = pt.velocity.x();
+                                pkt.p.vel[1] = pt.velocity.y();
+                                pkt.p.vel[2] = pt.velocity.z();
+                                pkt.p.quat[0] = pt.quat.w();
+                                pkt.p.quat[1] = pt.quat.x();
+                                pkt.p.quat[2] = pt.quat.y();
+                                pkt.p.quat[3] = pt.quat.z();
+                                pkt.p.zupt_prob = 0.0f;  // Not available in flush context
+
+                                // Set flags for flushed packet
+                                pkt.p.flags = 0;
+                                if (pt.pen_state) {
+                                    pkt.p.flags |= TrajectoryFlags::TRAJ_FLAG_PEN_DOWN;
+                                }
+                                pkt.p.reserved[0] = 0;
+                                pkt.p.reserved[1] = 0;
+                                pkt.p.reserved[2] = 0;
+
+                                send_notification(&pkt, sizeof(pkt));
+                            };
+                            compressor.flush(flush_callback);
+
+                            // Log compression statistics
+                            auto stats = compressor.get_stats();
+                            ESP_LOGI(TAG, "Swinging Door Stats: Received=%lu, Sent=%lu, Ratio=%.2fx",
+                                    stats.points_received, stats.points_sent, stats.compression_ratio);
+                        }
+
                         current_mode = AppMode::IDLE;
                         ESP_LOGI(TAG, "CMD: Stop Stream");
 
@@ -650,6 +697,15 @@ extern "C" void app_main(void) {
         tflite_ok = true;
     }
 
+    // Swinging Door compressor for trajectory stream
+    static trajecto::SwingingDoor compressor(
+        0.001f,   // 1mm position tolerance
+        0.01f,    // 1cm/s velocity tolerance
+        0.01f,    // ~0.57° rotation tolerance
+        50,       // Buffer up to 50 points (1 second @ 50Hz)
+        500000    // Force send every 500ms
+    );
+
     printf("accel_x_g,accel_y_g,accel_z_g,gyro_x_rads,gyro_y_rads,gyro_z_rads,temp_c\n");
 
     auto task_fn = [&]() -> bool {
@@ -720,26 +776,62 @@ extern "C" void app_main(void) {
                     sys.step(accel_vec, gyro_vec, force_val);
                     const auto& state = sys.get_state();
 
-                    struct __attribute__((packed)) {
-                        Header h;
-                        TrajectoryPacket p;
-                    } pkt;
-                    pkt.h.type = PacketType::DATA_TRAJECTORY;
-                    pkt.h.length = sizeof(TrajectoryPacket);
-                    pkt.p.timestamp_us = static_cast<uint32_t>(now);
-                    pkt.p.pos[0] = state.pos.x();
-                    pkt.p.pos[1] = state.pos.y();
-                    pkt.p.pos[2] = state.pos.z();
-                    pkt.p.vel[0] = state.vel.x();
-                    pkt.p.vel[1] = state.vel.y();
-                    pkt.p.vel[2] = state.vel.z();
-                    pkt.p.quat[0] = state.quat.w();
-                    pkt.p.quat[1] = state.quat.x();
-                    pkt.p.quat[2] = state.quat.y();
-                    pkt.p.quat[3] = state.quat.z();
-                    pkt.p.zupt_prob = sys.get_zupt_prob();
+                    // Prepare point for Swinging Door algorithm
+                    trajecto::SwingingDoor::Point point;
+                    point.timestamp_us = static_cast<uint32_t>(now);
+                    point.position = state.pos;
+                    point.velocity = state.vel;
+                    point.quat = state.quat;
+                    point.pen_state = (force_val > 100);  // Pen down if force > threshold
 
-                    send_notification(&pkt, sizeof(pkt));
+                    // Swinging Door callback: sends packet via BLE with appropriate flags
+                    auto send_callback = [&](const trajecto::SwingingDoor::Point& pt,
+                                            trajecto::SwingingDoor::SendReason reason) {
+                        struct __attribute__((packed)) {
+                            Header h;
+                            TrajectoryPacket p;
+                        } pkt;
+
+                        pkt.h.type = PacketType::DATA_TRAJECTORY;
+                        pkt.h.length = sizeof(TrajectoryPacket);
+                        pkt.p.timestamp_us = pt.timestamp_us;
+                        pkt.p.pos[0] = pt.position.x();
+                        pkt.p.pos[1] = pt.position.y();
+                        pkt.p.pos[2] = pt.position.z();
+                        pkt.p.vel[0] = pt.velocity.x();
+                        pkt.p.vel[1] = pt.velocity.y();
+                        pkt.p.vel[2] = pt.velocity.z();
+                        pkt.p.quat[0] = pt.quat.w();
+                        pkt.p.quat[1] = pt.quat.x();
+                        pkt.p.quat[2] = pt.quat.y();
+                        pkt.p.quat[3] = pt.quat.z();
+                        pkt.p.zupt_prob = sys.get_zupt_prob();
+
+                        // Set flags based on send reason
+                        pkt.p.flags = 0;
+                        if (reason == trajecto::SwingingDoor::SendReason::TIME_GAP) {
+                            pkt.p.flags |= TrajectoryFlags::TRAJ_FLAG_ABSOLUTE_REF;
+                        }
+                        if (pt.pen_state) {
+                            pkt.p.flags |= TrajectoryFlags::TRAJ_FLAG_PEN_DOWN;
+                        }
+                        if (reason == trajecto::SwingingDoor::SendReason::PEN_STATE_CHANGE) {
+                            pkt.p.flags |= TrajectoryFlags::TRAJ_FLAG_KEYFRAME;
+                        }
+                        pkt.p.reserved[0] = 0;
+                        pkt.p.reserved[1] = 0;
+                        pkt.p.reserved[2] = 0;
+
+                        send_notification(&pkt, sizeof(pkt));
+                    };
+
+                    // Process through Swinging Door (only sends when necessary)
+                    if (current_config.enable_sda) {
+                        compressor.process(point, send_callback);
+                    } else {
+                        // Bypass compression: send every point
+                        send_callback(point, trajecto::SwingingDoor::SendReason::DOOR_EXCEEDED);
+                    }
                 }
             }
         }
