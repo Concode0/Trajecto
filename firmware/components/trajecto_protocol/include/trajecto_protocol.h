@@ -74,6 +74,14 @@ struct RawImuPacket {
     float temperature; // °C
 };
 
+// -- Trajectory Packet Flags --
+enum TrajectoryFlags : uint8_t {
+    TRAJ_FLAG_NONE = 0x00,
+    TRAJ_FLAG_ABSOLUTE_REF = 0x01,  // Sent due to max_time_gap (absolute reference)
+    TRAJ_FLAG_PEN_DOWN = 0x02,      // Pen is in contact (writing)
+    TRAJ_FLAG_KEYFRAME = 0x04       // Pen state changed (stroke boundary)
+};
+
 // -- Data: Trajectory --
 struct TrajectoryPacket {
     uint32_t timestamp_us;
@@ -81,6 +89,8 @@ struct TrajectoryPacket {
     float vel[3];       // x, y, z (m/s)
     float quat[4];      // w, x, y, z (orientation)
     float zupt_prob;    // Probability of Zero-Velocity
+    uint8_t flags;      // Bitfield of TrajectoryFlags
+    uint8_t reserved[3]; // Padding for 4-byte alignment
 };
 
 #pragma pack(pop)
