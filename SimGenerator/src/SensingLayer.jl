@@ -22,6 +22,9 @@ Enhanced noise features:
 - Physiological tremor (8-12 Hz band)
 - 1/f (pink) noise
 - FSR baseline drift with Ornstein-Uhlenbeck process
+
+References:
+- Elble, R. J., & Koller, W. C. (1990): Tremor
 """
 module SensingLayer
 
