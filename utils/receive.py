@@ -55,6 +55,14 @@ class PacketType(IntEnum):
     DATA_TRAJECTORY = 0x81
 
 
+class TrajectoryFlags(IntEnum):
+    """Trajectory packet flags (bitfield)"""
+    NONE = 0x00
+    ABSOLUTE_REF = 0x01  # Sent due to max_time_gap (absolute reference)
+    PEN_DOWN = 0x02      # Pen is in contact (writing)
+    KEYFRAME = 0x04      # Pen state changed (stroke boundary)
+
+
 @dataclass
 class Header:
     """Packet header: type (1B) + length (1B)"""
@@ -73,10 +81,11 @@ class Header:
 
 @dataclass
 class ConfigPayload:
-    """Config payload: mode (Raw=0/Trajectory=1), ODR, reserved"""
-    mode: int      # 0: Raw, 1: Trajectory
-    odr_hz: int    # Sampling rate (fixed at 50Hz)
-    reserved: tuple = (0, 0)
+    """Config payload: mode (Raw=0/Trajectory=1), ODR, Swinging Door enable"""
+    mode: int         # 0: Raw, 1: Trajectory
+    odr_hz: int       # Sampling rate (fixed at 50Hz)
+    enable_sda: int   # 0: Disabled, 1: Enabled (Swinging Door compression)
+    reserved: int = 0
 
     @staticmethod
     def parse(data: bytes) -> Optional['ConfigPayload']:
@@ -86,12 +95,13 @@ class ConfigPayload:
         return ConfigPayload(
             mode=unpacked[0],
             odr_hz=unpacked[1],
-            reserved=(unpacked[2], unpacked[3])
+            enable_sda=unpacked[2],
+            reserved=unpacked[3]
         )
 
     def pack(self) -> bytes:
         return struct.pack('<BBBB', self.mode, self.odr_hz,
-                          self.reserved[0], self.reserved[1])
+                          self.enable_sda, self.reserved)
 
 
 @dataclass
@@ -119,25 +129,63 @@ class RawImuPacket:
 
 @dataclass
 class TrajectoryPacket:
-    """Trajectory packet (ESKF-TCN output)"""
+    """Trajectory packet (ESKF-TCN output)
+
+    Note: Due to Swinging Door compression, not all trajectory points are transmitted.
+    Points are sent when:
+    - Trajectory deviates beyond tolerance (delta compression)
+    - Time gap exceeds max_time_gap_us (absolute reference, default 500ms)
+    - Buffer fills up
+    - Pen state changes (keyframe)
+
+    The `flags` field explicitly indicates the reason for sending this packet.
+    """
     timestamp_us: int
     pos: tuple    # (x, y, z) in meters
     vel: tuple    # (x, y, z) in m/s
     quat: tuple   # (w, x, y, z) quaternion
     prob_zupt: float  # Zero-velocity probability
+    flags: int    # Bitfield of TrajectoryFlags
 
     @staticmethod
     def parse(data: bytes) -> Optional['TrajectoryPacket']:
-        if len(data) < 48:  # 4 + 12 + 12 + 16 + 4
+        if len(data) < 52:  # 4 + 12 + 12 + 16 + 4 + 1 + 3 (padding)
             return None
-        unpacked = struct.unpack('<Iffffffffff', data[:48])
+        # Format: I=uint32(4) + 11*f=float[11](44) + B=uint8(1) + xxx=pad(3) = 52 bytes
+        # 11 floats = pos[3] + vel[3] + quat[4] + zupt_prob[1]
+        unpacked = struct.unpack('<IfffffffffffBxxx', data[:52])
         return TrajectoryPacket(
             timestamp_us=unpacked[0],
             pos=(unpacked[1], unpacked[2], unpacked[3]),
             vel=(unpacked[4], unpacked[5], unpacked[6]),
             quat=(unpacked[7], unpacked[8], unpacked[9], unpacked[10]),
-            prob_zupt=unpacked[11]
+            prob_zupt=unpacked[11],
+            flags=unpacked[12]
         )
+
+    def is_absolute_reference(self) -> bool:
+        """Check if this packet is marked as absolute reference.
+
+        Returns:
+            True if ABSOLUTE_REF flag is set (sent due to time gap)
+        """
+        return bool(self.flags & TrajectoryFlags.ABSOLUTE_REF)
+
+    def is_pen_down(self) -> bool:
+        """Check if pen is in contact (writing).
+
+        Returns:
+            True if PEN_DOWN flag is set
+        """
+        return bool(self.flags & TrajectoryFlags.PEN_DOWN)
+
+    def is_keyframe(self) -> bool:
+        """Check if this is a keyframe (pen state transition).
+
+        Returns:
+            True if KEYFRAME flag is set (pen up/down transition)
+        """
+        return bool(self.flags & TrajectoryFlags.KEYFRAME)
 
 
 class TrajectoDriver:
@@ -317,7 +365,8 @@ class TrajectoDriver:
                 config = ConfigPayload.parse(payload)
                 if config:
                     self.current_config = config
-                    self._log(f"Config received: Mode={config.mode}, ODR={config.odr_hz}Hz")
+                    sda_status = "Enabled" if config.enable_sda else "Disabled"
+                    self._log(f"Config received: Mode={config.mode}, ODR={config.odr_hz}Hz, SDA={sda_status}")
                     return config
                 else:
                     self._log("Failed to parse config payload")
@@ -326,10 +375,17 @@ class TrajectoDriver:
 
         return None
 
-    async def set_config(self, mode: int, odr_hz: int = 50) -> bool:
-        """Sets device config (mode: 0=Raw, 1=Trajectory; ODR typically 50Hz)."""
-        config = ConfigPayload(mode=mode, odr_hz=odr_hz)
-        self._log(f"Setting config: Mode={mode}, ODR={odr_hz}Hz")
+    async def set_config(self, mode: int, odr_hz: int = 50, enable_sda: int = 1) -> bool:
+        """Sets device config.
+
+        Args:
+            mode: 0=Raw IMU, 1=Trajectory
+            odr_hz: Sampling rate (default 50Hz)
+            enable_sda: 0=Disabled, 1=Enabled Swinging Door compression (default 1)
+        """
+        config = ConfigPayload(mode=mode, odr_hz=odr_hz, enable_sda=enable_sda)
+        sda_status = "Enabled" if enable_sda else "Disabled"
+        self._log(f"Setting config: Mode={mode}, ODR={odr_hz}Hz, SDA={sda_status}")
 
         if not await self._send_command(PacketType.CMD_SET_CONFIG, config.pack()):
             return False
@@ -423,9 +479,20 @@ async def example_trajectory_stream():
     """Example: streams trajectory estimates"""
 
     def on_trajectory(packet: TrajectoryPacket):
+        # Build flags string
+        flags_str = []
+        if packet.is_absolute_reference():
+            flags_str.append("ABS")
+        if packet.is_pen_down():
+            flags_str.append("PEN")
+        if packet.is_keyframe():
+            flags_str.append("KEY")
+        flags_display = "|".join(flags_str) if flags_str else "---"
+
         print(f"[{packet.timestamp_us/1e6:.3f}s] "
               f"Pos: ({packet.pos[0]:6.3f}, {packet.pos[1]:6.3f}, {packet.pos[2]:6.3f}) m | "
-              f"ZUPT: {packet.prob_zupt:.2f}")
+              f"ZUPT: {packet.prob_zupt:.2f} | "
+              f"Flags: {flags_display}")
 
     driver = TrajectoDriver(trajectory_callback=on_trajectory)
 
