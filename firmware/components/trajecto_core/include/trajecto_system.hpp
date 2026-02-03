@@ -28,13 +28,16 @@ namespace trajecto {
 // When not defined, uses the original floating-point Eigen-based ESKF.
 // This can be set via CMakeLists.txt: target_compile_definitions(... -DTRAJECTO_USE_FIXED_POINT)
 
+#define TRAJECTO_USE_FIXED_POINT
+
 class TrajectoSystem {
 public:
     TrajectoSystem() :
 #ifdef TRAJECTO_USE_FIXED_POINT
-        eskf_fixed_(DT),
-#endif
+        eskf_fixed_(DT)
+#else
         eskf_(DT)
+#endif
     {
         last_innovation_.setZero();
     }
@@ -47,8 +50,9 @@ public:
 #ifdef TRAJECTO_USE_FIXED_POINT
         float accel_arr[3] = { accel_init.x(), accel_init.y(), accel_init.z() };
         eskf_fixed_.initialize(accel_arr);
-#endif
+#else
         eskf_.initialize(accel_init);
+#endif
         last_innovation_.setZero();
         initialized_ = true;
 
@@ -95,6 +99,7 @@ public:
 #endif
 
 private:
+#ifndef TRAJECTO_USE_FIXED_POINT
     // Float-point path (original, uses Eigen)
     void step_float(const Eigen::Vector3f& accel, const Eigen::Vector3f& gyro, float force) {
         bool is_zupt_heuristic = eskf_.check_zupt(accel);
@@ -187,6 +192,7 @@ private:
             }
         }
     }
+#endif // !TRAJECTO_USE_FIXED_POINT
 
 #ifdef TRAJECTO_USE_FIXED_POINT
     // Fixed-point path (for ESP32C3 without FPU)
@@ -200,14 +206,14 @@ private:
 
         eskf_fixed_.predict(gyro_f, accel_f);
 
-        // Stride-based TCN: same logic, but use float ESKF for feature extraction
-        // (TCN wrapper still uses float Eigen interface)
-        // We maintain a shadow float ESKF in sync for TCN feature extraction
-        eskf_.predict(gyro, accel);
-
+        // Stride-based TCN: run only every N timesteps (zero-order hold, matches Python training)
         TCNOutput tcn_out;
         if (step_counter_ % TCN_UPDATE_STRIDE == 0) {
-            tcn_out = tcn_.process_step(accel, gyro, force, eskf_, last_innovation_, is_zupt_heuristic);
+            float innovation_f[6];
+            for (int i = 0; i < 6; ++i) innovation_f[i] = last_innovation_[i];
+
+            tcn_out = tcn_.process_step_fixed(accel_f, gyro_f, force,
+                                             eskf_fixed_, innovation_f);
             cached_tcn_out_ = tcn_out;
             tcn_output_valid_ = true;
         } else if (tcn_output_valid_) {
@@ -253,14 +259,8 @@ private:
         float mahalanobis_sq = 0.0f;
         eskf_fixed_.update_imu(accel_f, gyro_f, R_diag_arr, innovation_f, &mahalanobis_sq);
 
-        // Update last_innovation_ for TCN feature extraction (float path)
+        // Update last_innovation_ for TCN feature extraction
         for (int i = 0; i < 6; ++i) last_innovation_[i] = innovation_f[i];
-
-        // Also update float ESKF shadow for TCN (sync bias/quat state)
-        // This is approximate but sufficient for feature extraction
-        Eigen::Matrix<float, 6, 1> R_diag_eigen;
-        for (int i = 0; i < 6; ++i) R_diag_eigen[i] = R_diag_arr[i];
-        eskf_.update_imu(accel, gyro, R_diag_eigen);
 
         if (tcn_out.valid && tcn_out.zupt_prob >= ZUPT_HARD_RESET_THRESHOLD) {
             eskf_fixed_.hard_reset_velocity();
@@ -282,10 +282,8 @@ private:
                 bool is_stationary = eskf_fixed_.check_zupt(accel_f);
                 if (is_stationary) {
                     eskf_fixed_.reset_covariance_with_zupt();
-                    eskf_.reset_covariance_with_zupt();  // Keep shadow in sync
                 } else {
                     eskf_fixed_.reset_covariance();
-                    eskf_.reset_covariance();
                 }
                 tcn_output_valid_ = false;
                 for (int i = 0; i < RESET_REJECTION_WINDOW; ++i) {
@@ -297,10 +295,11 @@ private:
     }
 #endif
 
-    ESKF eskf_;
 #ifdef TRAJECTO_USE_FIXED_POINT
     ESKFFixed eskf_fixed_;
     mutable NominalState cached_float_state_;
+#else
+    ESKF eskf_;
 #endif
     TCNWrapper tcn_;
     Eigen::Matrix<float, 6, 1> last_innovation_;

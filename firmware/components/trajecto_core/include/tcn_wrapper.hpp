@@ -21,6 +21,7 @@
 #include <vector>
 #include <Eigen/Dense>
 #include "eskf.hpp"
+#include "eskf_fixed.hpp"
 #include "model_params.hpp"
 
 namespace tflite {
@@ -57,6 +58,14 @@ public:
         const ESKF& eskf,
         const Eigen::Matrix<float, 6, 1>& last_innovation,
         bool is_zupt
+    );
+
+    TCNOutput process_step_fixed(
+        const float accel_raw[3],
+        const float gyro_raw[3],
+        float force_raw,
+        const ESKFFixed& eskf_fixed,
+        const float last_innovation[6]
     );
 
 private:
