@@ -47,7 +47,7 @@ import sys
 import subprocess
 import tempfile
 import shutil
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 import numpy as np
 import h5py
@@ -397,10 +397,10 @@ def convert_to_tflite(
         tf.lite.OpsSet.TFLITE_BUILTINS,  # For FP32 I/O ops
         tf.lite.OpsSet.TFLITE_BUILTINS_INT8  # For INT8 internal ops
     ]
-    # Keep FP32 I/O - firmware copies float data directly to input tensors
-    # (see tcn_wrapper.cpp: std::memcpy(input_feat->data.f, features.data(), ...))
-    converter.inference_input_type = tf.float32
-    converter.inference_output_type = tf.float32
+    # Use INT8 I/O for full quantization - firmware will quantize/dequantize manually
+    # This eliminates automatic quant/dequant overhead (~2-3ms savings)
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
 
     tflite_model = converter.convert()
 
@@ -412,12 +412,60 @@ def convert_to_tflite(
     print(f"  TFLite model saved: {tflite_path} ({size_kb:.1f} KB)")
 
 
+def extract_quantization_params(tflite_path: str) -> Dict[str, Any]:
+    """Extract INT8 quantization scales and zero-points from TFLite model.
+
+    Args:
+        tflite_path: Path to TFLite model file
+
+    Returns:
+        Dict with keys: input_scales, input_zeros, output_scales, output_zeros
+    """
+    import tensorflow as tf
+
+    print(f"Extracting quantization parameters from: {tflite_path}")
+
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    params = {
+        'input_scales': [],
+        'input_zeros': [],
+        'output_scales': [],
+        'output_zeros': []
+    }
+
+    # Extract input quantization parameters
+    for inp in input_details:
+        quant = inp['quantization_parameters']
+        scale = float(quant['scales'][0]) if len(quant['scales']) > 0 else 1.0
+        zero = int(quant['zero_points'][0]) if len(quant['zero_points']) > 0 else 0
+        params['input_scales'].append(scale)
+        params['input_zeros'].append(zero)
+        print(f"  Input '{inp['name']}': scale={scale:.6f}, zero={zero}")
+
+    # Extract output quantization parameters
+    for out in output_details:
+        quant = out['quantization_parameters']
+        scale = float(quant['scales'][0]) if len(quant['scales']) > 0 else 1.0
+        zero = int(quant['zero_points'][0]) if len(quant['zero_points']) > 0 else 0
+        params['output_scales'].append(scale)
+        params['output_zeros'].append(zero)
+        print(f"  Output '{out['name']}': scale={scale:.6f}, zero={zero}")
+
+    return params
+
+
 def generate_cpp_header(
     output_path: str,
     input_size: int,
     state_shapes: List[Tuple[int, int]],
     scaler_path: str,
-    pen_offset: np.ndarray
+    pen_offset: np.ndarray,
+    quant_params: Optional[Dict[str, Any]] = None
 ) -> None:
     """Generate C++ header with model parameters.
 
@@ -427,6 +475,7 @@ def generate_cpp_header(
         state_shapes: List of (history, channels) per layer
         scaler_path: Path to scaler_stats.h5
         pen_offset: Pen tip offset in body frame [3]
+        quant_params: Optional INT8 quantization parameters (scales, zeros)
     """
     print(f"Generating C++ header: {output_path}")
 
@@ -541,6 +590,34 @@ def generate_cpp_header(
         f.write(f"constexpr float GYRO_BI_X = {Config.GYRO_BI_X:.4e}f, GYRO_BI_Y = {Config.GYRO_BI_Y:.4e}f, GYRO_BI_Z = {Config.GYRO_BI_Z:.4e}f;\n")
         f.write(f"constexpr float ACCEL_BI_X = {Config.ACCEL_BI_X:.4e}f, ACCEL_BI_Y = {Config.ACCEL_BI_Y:.4e}f, ACCEL_BI_Z = {Config.ACCEL_BI_Z:.4e}f;\n\n")
 
+        # INT8 Quantization Parameters (if available)
+        if quant_params is not None:
+            f.write("// INT8 Quantization Parameters\n")
+            num_inputs = len(quant_params['input_scales'])
+            num_outputs = len(quant_params['output_scales'])
+            f.write(f"constexpr int TCN_NUM_INPUTS = {num_inputs};\n")
+            f.write(f"constexpr int TCN_NUM_OUTPUTS = {num_outputs};\n\n")
+
+            # Input scales
+            f.write("constexpr float INPUT_SCALES[] = {")
+            f.write(", ".join(f"{s:.9f}f" for s in quant_params['input_scales']))
+            f.write("};\n")
+
+            # Input zero points
+            f.write("constexpr int8_t INPUT_ZEROS[] = {")
+            f.write(", ".join(str(z) for z in quant_params['input_zeros']))
+            f.write("};\n\n")
+
+            # Output scales
+            f.write("constexpr float OUTPUT_SCALES[] = {")
+            f.write(", ".join(f"{s:.9f}f" for s in quant_params['output_scales']))
+            f.write("};\n")
+
+            # Output zero points
+            f.write("constexpr int8_t OUTPUT_ZEROS[] = {")
+            f.write(", ".join(str(z) for z in quant_params['output_zeros']))
+            f.write("};\n\n")
+
         f.write("} // namespace trajecto\n")
 
     print(f"  Header generated with {len(state_shapes)} layer configs")
@@ -605,9 +682,13 @@ Examples:
     )
 
     # Step 4: Convert to TFLite
+    quant_params = None
     if not args.skip_tflite:
         tflite_path = os.path.join(output_dir, "tcn_model.tflite")
         convert_to_tflite(onnx_path, tflite_path, calib_dir, input_info)
+
+        # Extract quantization parameters for INT8 I/O
+        quant_params = extract_quantization_params(tflite_path)
 
     # Step 5: Generate C++ header
     header_path = os.path.join(output_dir, "model_params.hpp")
@@ -617,7 +698,8 @@ Examples:
         model.tcn_input_size,
         state_shapes,
         scaler_path,
-        pen_offset
+        pen_offset,
+        quant_params
     )
 
     # Cleanup
