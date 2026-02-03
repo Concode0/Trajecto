@@ -15,7 +15,9 @@
  */
 
 #include "tcn_wrapper.hpp"
+#include "tcn_features_fixed.hpp"
 #include "fast_math_lut.hpp"
+#include "model_params.hpp"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -125,18 +127,6 @@ void TCNWrapper::extract_features(
     Eigen::Vector3f gravity_b_raw = R_wb * gravity_w;
     Eigen::Vector3f gravity_b_norm = (gravity_b_raw / GRAVITY_MAGNITUDE) * GRAVITY_NORM_SCALE;
 
-    // Pen tip velocity in body frame
-    Eigen::Vector3f vel_b_linear = R_wb * state.vel;
-    Eigen::Vector3f gyro_corr = gyro_raw - state.gyro_bias;
-    Eigen::Vector3f offset;
-    offset << PEN_TIP_OFFSET[0], PEN_TIP_OFFSET[1], PEN_TIP_OFFSET[2];
-    Eigen::Vector3f vel_tangential = gyro_corr.cross(offset);
-    Eigen::Vector3f pen_tip_vel_b = vel_b_linear + vel_tangential;
-
-    // ISOTROPIC velocity normalization (matches Python)
-    // Python uses: pen_tip_vel_b / (VEL_STD_L2 + 1e-3)
-    Eigen::Vector3f pen_tip_vel_b_norm = pen_tip_vel_b / (VEL_STD_L2 + 1e-3f);
-
     // Innovation normalization using Allan variance (matches Python)
     // Accel channels (0-2): normalize by max VRW
     // Gyro channels (3-5): normalize by max ARW
@@ -151,7 +141,8 @@ void TCNWrapper::extract_features(
         innovation_norm(i) = std::max(-INNOVATION_CLAMP_RANGE, std::min(INNOVATION_CLAMP_RANGE, val));
     }
 
-    // Build feature vector (order matches Python: base_hybrid_model.py:447-456)
+    // Build feature vector (order matches Python: base_hybrid_model.py:743-751)
+    // CRITICAL: 16D total (pen_tip_vel_b_norm removed to match Python)
     int idx = 0;
     // 1. gyro_b_norm [3]
     features_[idx++] = norm_gyro[0];
@@ -163,15 +154,11 @@ void TCNWrapper::extract_features(
     features_[idx++] = norm_accel[2];
     // 3. force_norm [1]
     features_[idx++] = norm_force;
-    // 4. pen_tip_vel_b_norm [3] - isotropic normalized
-    features_[idx++] = pen_tip_vel_b_norm(0);
-    features_[idx++] = pen_tip_vel_b_norm(1);
-    features_[idx++] = pen_tip_vel_b_norm(2);
-    // 5. gravity_b_norm [3] - scaled unit vector
+    // 4. gravity_b_norm [3] - scaled unit vector
     features_[idx++] = gravity_b_norm(0);
     features_[idx++] = gravity_b_norm(1);
     features_[idx++] = gravity_b_norm(2);
-    // 6. innovation_norm [6] - Allan variance normalized, clamped
+    // 5. innovation_norm [6] - Allan variance normalized, clamped
     for (int i = 0; i < 6; i++) features_[idx++] = innovation_norm(i);
 }
 
@@ -219,6 +206,92 @@ TCNOutput TCNWrapper::process_step(
 
     float zupt_logit = out_zupt->data.f[0];
     result.zupt_prob = fast_sigmoid(zupt_logit);
+
+    for (int i = 0; i < TCN_NUM_LAYERS; i++) {
+        TfLiteTensor* out_state = interpreter_->output(3 + i);
+        std::memcpy(state_buffers_[i].data(), out_state->data.f, state_buffers_[i].size() * sizeof(float));
+    }
+
+    return result;
+}
+
+TCNOutput TCNWrapper::process_step_fixed(
+    const float accel_raw[3],
+    const float gyro_raw[3],
+    float force_raw,
+    const ESKFFixed& eskf_fixed,
+    const float last_innovation[6]
+) {
+    TCNOutput result;
+    result.valid = true;
+
+    // Use fixed-point feature extraction
+    extract_features_fixed(accel_raw, gyro_raw, force_raw,
+                          eskf_fixed, last_innovation, features_.data());
+
+    // Quantize inputs if model uses INT8 I/O
+    TfLiteTensor* input_feat = interpreter_->input(0);
+    if (input_feat->type == kTfLiteInt8) {
+        // INT8 model - quantize features
+        for (int i = 0; i < TCN_INPUT_SIZE; ++i) {
+            float f = features_[i];
+            int32_t q = static_cast<int32_t>(std::round(f / INPUT_SCALES[i])) + INPUT_ZEROS[i];
+            q = std::max(static_cast<int32_t>(-128), std::min(static_cast<int32_t>(127), q));
+            input_feat->data.int8[i] = static_cast<int8_t>(q);
+        }
+    } else {
+        // Float32 model - copy directly
+        std::memcpy(input_feat->data.f, features_.data(), TCN_INPUT_SIZE * sizeof(float));
+    }
+
+    // State buffers remain float32 (stateful, not quantized)
+    for (int i = 0; i < TCN_NUM_LAYERS; i++) {
+        TfLiteTensor* input_state = interpreter_->input(1 + i);
+        std::memcpy(input_state->data.f, state_buffers_[i].data(), state_buffers_[i].size() * sizeof(float));
+    }
+
+    if (!interpreter_) {
+        result.valid = false;
+        return result;
+    }
+
+    if (interpreter_->Invoke() != kTfLiteOk) {
+        ESP_LOGE(TAG, "Invoke failed!");
+        result.valid = false;
+        return result;
+    }
+
+    // Dequantize outputs if model uses INT8 I/O
+    TfLiteTensor* out_vel = interpreter_->output(0);
+    TfLiteTensor* out_cov = interpreter_->output(1);
+    TfLiteTensor* out_zupt = interpreter_->output(2);
+
+    if (out_vel->type == kTfLiteInt8) {
+        // INT8 outputs - dequantize
+        for (int i = 0; i < 3; ++i) {
+            int8_t q = out_vel->data.int8[i];
+            result.vel_corr[i] = (static_cast<float>(q) - OUTPUT_ZEROS[0]) * OUTPUT_SCALES[0];
+        }
+
+        for (int i = 0; i < 6; ++i) {
+            int8_t q = out_cov->data.int8[i];
+            result.R_params[i] = (static_cast<float>(q) - OUTPUT_ZEROS[1]) * OUTPUT_SCALES[1];
+        }
+
+        int8_t zupt_q = out_zupt->data.int8[0];
+        float zupt_logit = (static_cast<float>(zupt_q) - OUTPUT_ZEROS[2]) * OUTPUT_SCALES[2];
+        result.zupt_prob = fast_sigmoid(zupt_logit);
+    } else {
+        // Float32 outputs
+        result.vel_corr[0] = out_vel->data.f[0];
+        result.vel_corr[1] = out_vel->data.f[1];
+        result.vel_corr[2] = out_vel->data.f[2];
+
+        for(int i=0; i<6; i++) result.R_params[i] = out_cov->data.f[i];
+
+        float zupt_logit = out_zupt->data.f[0];
+        result.zupt_prob = fast_sigmoid(zupt_logit);
+    }
 
     for (int i = 0; i < TCN_NUM_LAYERS; i++) {
         TfLiteTensor* out_state = interpreter_->output(3 + i);
