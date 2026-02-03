@@ -1059,8 +1059,8 @@ class ErrorStateKalmanFilter(nn.Module):
                 min_R_val = self.zupt_noise_std**2
                 max_R_val = min_R_val * 1e6
 
-                log_R_min = torch.log(torch.tensor(min_R_val, device=device))
-                log_R_max = torch.log(torch.tensor(max_R_val, device=device))
+                log_R_min = torch.log(min_R_val)
+                log_R_max = torch.log(max_R_val)
 
                 log_R_val = (1.0 - alpha) * log_R_max + alpha * log_R_min
                 R_val = torch.exp(log_R_val)
@@ -1097,8 +1097,8 @@ class ErrorStateKalmanFilter(nn.Module):
                 min_R_val = self.zupt_noise_std**2
                 max_R_val = min_R_val * 1e6
 
-                log_R_min = torch.log(torch.tensor(min_R_val, device=device))
-                log_R_max = torch.log(torch.tensor(max_R_val, device=device))
+                log_R_min = torch.log(min_R_val)
+                log_R_max = torch.log(max_R_val)
 
                 log_R_val = (1.0 - alpha) * log_R_max + alpha * log_R_min
                 R_val = torch.exp(log_R_val)
