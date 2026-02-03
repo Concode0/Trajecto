@@ -64,6 +64,10 @@ We provide two versions of the mathematical proof demonstrating the **Uniform Ul
 
 > For a detailed discussion on why we shifted the theoretical focus from *Global Stability* to *Partial Stability* and the acknowledgment of physical rank-deficiency, please check the [**Pinned Issue: Theoretical Framework Refinement**](https://github.com/Concode0/Trajecto/issues/2).
 
+> **"Why Geometric Algebra?"**
+> Traditional filters treat orientation errors as non-linear vectors, leading to rank deficiency.
+> **Trajecto redefines error as a 'Bivector' in Clifford Space ($\mathbb{G}_3$),** allowing the Neural Network to learn the *shape* of the error linearly, not just the *value*.
+
 ## 🔬 Technical Breakthroughs
 
 Trajecto bridges the gap between purely data-driven black boxes and rigid physical models through a novel **Closed-Loop Hybrid Architecture**:
