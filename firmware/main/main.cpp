@@ -84,6 +84,15 @@ static std::atomic<bool> calibration_requested(false);
 // Semaphore for IMU Data Ready
 static SemaphoreHandle_t imu_sem = nullptr;
 
+// Swinging Door compressor for trajectory stream
+static trajecto::SwingingDoor compressor(
+    0.001f,   // 1mm position tolerance
+    0.01f,    // 1cm/s velocity tolerance
+    0.01f,    // ~0.57° rotation tolerance
+    50,       // Buffer up to 50 points (1 second @ 50Hz)
+    500000    // Force send every 500ms
+);
+
 static void send_notification(void *data, size_t len);
 
 // ============================================================================
@@ -697,14 +706,6 @@ extern "C" void app_main(void) {
         tflite_ok = true;
     }
 
-    // Swinging Door compressor for trajectory stream
-    static trajecto::SwingingDoor compressor(
-        0.001f,   // 1mm position tolerance
-        0.01f,    // 1cm/s velocity tolerance
-        0.01f,    // ~0.57° rotation tolerance
-        50,       // Buffer up to 50 points (1 second @ 50Hz)
-        500000    // Force send every 500ms
-    );
 
     printf("accel_x_g,accel_y_g,accel_z_g,gyro_x_rads,gyro_y_rads,gyro_z_rads,temp_c\n");
 
@@ -766,7 +767,7 @@ extern "C" void app_main(void) {
                 }
                 else if (current_mode == AppMode::STREAMING_TRAJECTORY) {
                     if (!tflite_ok) {
-                        current_mode = AppMode::IDLE;
+                        current_mode = AppMode::STREAMING_RAW;
                         logger.warn_rate_limited("Trajectory mode unavailable - TFLite not initialized", 1s);
                         return false;
                     }
