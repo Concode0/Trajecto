@@ -26,10 +26,14 @@ Usage:
 import argparse
 import os
 import gc
+import logging
 
 # Disable CUDAGraphs globally to prevent "tensor output overwritten" and capture errors
 # This allows torch.compile to work safely with dynamic shapes and QAT
 os.environ["TORCH_CUDAGRAPHS"] = "0"
+
+# Suppress symbolic shapes warnings from torch.fx (harmless, related to dynamic sequence lengths)
+logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -499,7 +503,7 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
 
     # QAT Scheduler - Initialize correctly with is_qat_model check
     qat_scheduler = QATScheduler(
-        start_epoch=config.qat_start_epoch, 
+        start_epoch=config.qat_start_epoch,
         enabled=config.qat_enabled,
         initial_qat_state=is_qat_model(model)
     )
@@ -535,7 +539,18 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
 
     for epoch in range(start_epoch, config.stage1_epochs):
         # Apply QAT if scheduled
+        qat_was_active = qat_scheduler.is_active()
         model = qat_scheduler.step(model, epoch)
+
+        # Re-initialize optimizer if QAT was just activated
+        if not qat_was_active and qat_scheduler.is_active():
+            print("[QAT] QAT activated - re-initializing optimizer with new parameters")
+            # Get current learning rate before reinitializing
+            current_lr = optimizer.param_groups[0]['lr']
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = AdamW(trainable_params, lr=current_lr, weight_decay=config.weight_decay)
+            scheduler = CosineAnnealingLR(optimizer, T_max=config.stage1_epochs - epoch, eta_min=1e-6)
+            print(f"[QAT] Optimizer updated with {len(trainable_params)} parameter groups (lr={current_lr:.2e})")
 
         model.train()
         epoch_losses = {k: 0.0 for k in ["total", "mag", "cos", "zupt", "cov", "fft", "reg", "delta"]}
@@ -550,7 +565,7 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
             # Validate losses and print if NaN/Inf detected
             is_valid, error_msg = validate_loss_dict(losses, epoch, i_batch)
             if not is_valid:
-                print(f"\n⚠️  {error_msg}")
+                print(f"\n{error_msg}")
                 continue
 
             losses["total"].backward()
@@ -638,10 +653,10 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
             )
 
         print(f"Loading model from: {checkpoint_path}")
-        
+
         # Initialize model
         model = ESKFTCN_model(device=config.device, eskf_learnable_params=True)
-        
+
         # Load checkpoint securely
         checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=True)
 
@@ -667,7 +682,7 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
 
     # QAT Scheduler - Initialize correctly with is_qat_model check
     qat_scheduler = QATScheduler(
-        start_epoch=config.qat_start_epoch, 
+        start_epoch=config.qat_start_epoch,
         enabled=config.qat_enabled,
         initial_qat_state=is_qat_model(model)
     )
@@ -743,7 +758,33 @@ def train_stage2(config: TwoStageConfig, model: Optional[nn.Module] = None) -> n
 
     for epoch in range(config.stage2_epochs):
         # Apply QAT if scheduled
+        qat_was_active = qat_scheduler.is_active()
         model = qat_scheduler.step(model, epoch)
+
+        # Re-initialize optimizer if QAT was just activated
+        if not qat_was_active and qat_scheduler.is_active():
+            print("[QAT] QAT activated - re-initializing optimizer with new parameters")
+            # Get current learning rates before reinitializing
+            current_tcn_lr = optimizer.param_groups[0]['lr']  # TCN params are first group
+            current_eskf_lr = optimizer.param_groups[1]['lr'] if len(optimizer.param_groups) > 1 else config.stage2_eskf_lr
+
+            # Rebuild parameter groups with new references
+            tcn_params = []
+            eskf_params = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if 'filter.R_diag' in name or 'filter.zupt_noise' in name or 'filter.virtual_meas' in name:
+                    eskf_params.append(param)
+                else:
+                    tcn_params.append(param)
+
+            optimizer = AdamW([
+                {'params': tcn_params, 'lr': current_tcn_lr},
+                {'params': eskf_params, 'lr': current_eskf_lr}
+            ], weight_decay=config.weight_decay)
+            scheduler = CosineAnnealingLR(optimizer, T_max=config.stage2_epochs - epoch, eta_min=1e-7)
+            print(f"[QAT] Optimizer updated: TCN params={len(tcn_params)} (lr={current_tcn_lr:.2e}), ESKF params={len(eskf_params)} (lr={current_eskf_lr:.2e})")
 
         model.train()
         epoch_losses = {k: 0.0 for k in ["total", "mag", "cos", "zupt", "cov", "fft", "reg", "delta"]}
