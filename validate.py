@@ -44,9 +44,16 @@ from model.dataset import TrajectoryDataset
 from model.config import Config
 from model.ESKF_TCN import ESKFTCN_model
 from train_eskf import TrainConfig # Import TrainConfig
+try:
+    from train_two_stage import TwoStageConfig
+except ImportError:
+    TwoStageConfig = None
 
-# Add TrainConfig to safe globals for checkpoint loading
-torch.serialization.add_safe_globals([TrainConfig])
+# Add TrainConfig and TwoStageConfig to safe globals for checkpoint loading
+safe_globals = [TrainConfig]
+if TwoStageConfig:
+    safe_globals.append(TwoStageConfig)
+torch.serialization.add_safe_globals(safe_globals)
 
 def load_model(model_type: str, model_path: str, device: str, mean: torch.Tensor, std: torch.Tensor) -> torch.nn.Module:
     """Initializes and loads the trained model weights."""
@@ -84,9 +91,18 @@ def load_model(model_type: str, model_path: str, device: str, mean: torch.Tensor
 
     # Handle both full checkpoint dict and direct state_dict
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
     else:
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint
+
+    # Clean up state dict keys from torch.compile prefixes
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # Remove '_orig_mod.' if present (handles both 'tcn._orig_mod.xxx' and '_orig_mod.xxx')
+        new_key = k.replace("_orig_mod.", "")
+        new_state_dict[new_key] = v
+
+    model.load_state_dict(new_state_dict)
 
     model.to(device)
     model.eval()
