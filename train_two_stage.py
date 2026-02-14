@@ -71,6 +71,7 @@ from model.qat_tcn import (
     is_qat_model
 )
 
+torch.set_float32_matmul_precision('high')
 
 def collate_fn_pad_sequences(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """Custom collate function that pads variable-length sequences to max length in batch.
@@ -605,6 +606,15 @@ def train_stage1(config: TwoStageConfig) -> nn.Module:
                 "stage": 1,
             }, Path(config.checkpoint_dir) / f"{config.model_name}_stage1_best.pth")
             print("  Saved best Stage 1 model.")
+
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "val_loss": val_losses["total"],
+            "stage": 1,
+        }, Path(config.checkpoint_dir) / f"{config.model_name}_stage1_last.pth")
 
     # Save final stage 1 model
     torch.save({
