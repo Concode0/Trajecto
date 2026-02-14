@@ -294,6 +294,44 @@ def prepare_qat_pt2e_model(
     qat_tcn = prepare_qat_pt2e(exported_tcn, quantizer)
     print("[QAT-PT2E] QAT preparation complete")
 
+    # Preserve important attributes from original TCN that GraphModule doesn't retain
+    print("[QAT-PT2E] Preserving TCN attributes on GraphModule...")
+
+    # Preserve receptive field attributes (main + branch-specific)
+    rf_attributes = [
+        'receptive_field',      # Property -> attribute conversion
+        '_receptive_field',     # Overall RF
+        '_backbone_rf',         # Shared backbone RF
+        '_dynamic_rf',          # Dynamic branch RF (motion-related)
+        '_static_rf',           # Static branch RF (ZUPT/gravity)
+        '_dynamic_total_rf',    # Backbone + dynamic
+        '_static_total_rf',     # Backbone + static
+    ]
+
+    preserved_rfs = {}
+    for attr_name in rf_attributes:
+        if hasattr(original_tcn, attr_name):
+            value = getattr(original_tcn, attr_name)
+            # Remove leading underscore for property-based access
+            clean_name = attr_name.lstrip('_') if attr_name.startswith('_') else attr_name
+            setattr(qat_tcn, clean_name, value)
+            # Also preserve with original name for compatibility
+            if attr_name.startswith('_'):
+                setattr(qat_tcn, attr_name, value)
+            preserved_rfs[attr_name] = value
+
+    if preserved_rfs:
+        print(f"[QAT-PT2E] Preserved receptive fields:")
+        print(f"  Total RF: {preserved_rfs.get('_receptive_field', 'N/A')}")
+        print(f"  Backbone: {preserved_rfs.get('_backbone_rf', 'N/A')}")
+        print(f"  Dynamic branch: {preserved_rfs.get('_dynamic_rf', 'N/A')} (total: {preserved_rfs.get('_dynamic_total_rf', 'N/A')})")
+        print(f"  Static branch: {preserved_rfs.get('_static_rf', 'N/A')} (total: {preserved_rfs.get('_static_total_rf', 'N/A')})")
+
+    # Preserve other potentially useful attributes
+    for attr_name in ['tcn_input_size', 'vel_scale_isotropic']:
+        if hasattr(original_tcn, attr_name):
+            setattr(qat_tcn, attr_name, getattr(original_tcn, attr_name))
+
     # Replace the TCN in the model with the QAT version
     model.tcn = qat_tcn
 

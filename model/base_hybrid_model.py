@@ -365,7 +365,18 @@ class BaseFilterTCNModel(nn.Module):
 
         # Retrieve the TCN's receptive field size. This determines how much
         # historical data the TCN needs to make a prediction.
-        receptive_field = self.tcn.receptive_field
+        # Handle both normal TCN and QAT-converted GraphModule
+        if hasattr(self.tcn, 'receptive_field'):
+            receptive_field = self.tcn.receptive_field
+        else:
+            # Fallback: Calculate from config if TCN is a GraphModule without the attribute
+            # This can happen if QAT conversion didn't preserve the attribute
+            print("[WARNING] TCN missing receptive_field attribute (GraphModule?). Using default calculation.")
+            # Default TCN config: 4 layers, kernel=5, dilations=[1,2,4,8]
+            # RF = sum((kernel-1)*dilation) + 1 = (4*1 + 4*2 + 4*4 + 4*8) + 1 = 61
+            receptive_field = 61  # Conservative estimate for default config
+            # Store it for next time
+            self.tcn.receptive_field = receptive_field
 
         # Buffers for storing sequences of filter outputs and TCN predictions.
         positions_w_seq: List[torch.Tensor] = []
