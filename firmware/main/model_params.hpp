@@ -93,4 +93,16 @@ constexpr float ARW_X = 7.1664e-05f, ARW_Y = 7.9283e-05f, ARW_Z = 7.5335e-05f;
 constexpr float GYRO_BI_X = 1.6441e-05f, GYRO_BI_Y = 2.8196e-05f, GYRO_BI_Z = 1.2203e-05f;
 constexpr float ACCEL_BI_X = 4.3723e-04f, ACCEL_BI_Y = 1.7697e-04f, ACCEL_BI_Z = 2.8099e-04f;
 
+// INT8 Quantization Parameters
+// NOTE: These are placeholder values. Run 'python utils/export_model.py' to generate actual values.
+constexpr int TCN_NUM_INPUTS = 7;  // features + state buffers
+constexpr int TCN_NUM_OUTPUTS = 9; // vel_corr + cov + zupt + state buffers
+
+// Mock scales and zeros - will be replaced by export_model.py
+constexpr float INPUT_SCALES[] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+constexpr int8_t INPUT_ZEROS[] = {0, 0, 0, 0, 0, 0, 0};
+
+constexpr float OUTPUT_SCALES[] = {0.01f, 0.01f, 0.01f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+constexpr int8_t OUTPUT_ZEROS[] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+
 } // namespace trajecto

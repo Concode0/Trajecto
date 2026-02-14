@@ -4,6 +4,7 @@ idf_component_register(
         "src/eskf_fixed.cpp"
         "src/cordic_tables.cpp"
         "src/tcn_wrapper.cpp"
+        "src/tcn_features_fixed.cpp"
         "src/tcn_model.cc"
         "src/fast_math_lut.cpp"
         "src/swinging_door.cpp"
