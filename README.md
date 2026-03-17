@@ -1,3 +1,21 @@
+# Project Status: Post-Mortem & Legacy
+
+**"This repository is a documented failure of the linear paradigm in 3D reconstruction."**
+
+Trajecto was an intensive attempt to solve 3D handwriting tracking using a single IMU and standard filtering (ESKF/TCN). While the engineering stack was fully integrated (L0-L7), I reached a fundamental mathematical deadlock:
+
+The Drift Problem: Standard Linear Algebra and Kalman Filters could not preserve the topological integrity of 3D motion over time, leading to insurmountable sensor drift.
+
+The Realization: Brute-forcing errors with more parameters (TCN) was a "Micro-Fast Follower" trap. The core issue wasn't data volume, but the mathematical foundation (Matrices/Quaternions) itself.
+
+The Pivot: This failure served as the "system logout" point. It directly led to the development of [Versor](https://github.com/Concode0/Versor), where I utilize Geometric Algebra (GA) to redefine intelligence and physical logic from first principles.
+
+---
+
+🏛️ Historical Implementation Details (Archived)
+
+The following content describes the original architecture and development process prior to the post-mortem pivot.
+
 # Trajecto: Vertical-Integration of AI-Aided 3D Pen Tracking
 
 [![License: AGPLv3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE) [![Hardware: CERN OHL-S](https://img.shields.io/badge/Hardware-CERN%20OHL--S-orange.svg)](LICENSE_HARDWARE)
@@ -5,16 +23,6 @@
 <img src="docs/assets/logo.png" width="200" alt="Trajecto Logo">
 
 **Trajecto** is a centimeter-level 3D handwriting reconstruction system that fuses **Deep Learning (TCN)** with **Physics-Based Filtering (ESKF)**. It uses a single low-cost 6-axis IMU (BMI270) to track pen trajectories in real-time on an **ESP32-C3** microcontroller.
-
----
-
-## 🚧 Project Status: Active Development
-This project is **currently under intensive development**. We are actively refining the hybrid neuro-physical models, optimizing embedded inference, and expanding the ground-truth dataset.
-
-📄 **[Detailed Technical Specification (PDF)](docs/technical_spec.pdf)**
-*(Note: Documentation is currently incomplete and in active progress.)*
-
----
 
 ## 🚀 Future Milestones & Ongoing Research
 
@@ -52,10 +60,10 @@ This project goes beyond empirical results. The **Trajecto** architecture is bui
 
 We provide two versions of the mathematical proof demonstrating the **Uniform Ultimate Boundedness (UUB)** of the error states and the reduction of the **Cramér-Rao Lower Bound (CRLB)** via the Hybrid ESKF-TCN injection.
 
-| Version | Description | Link |
-| :--- | :--- | :--- |
-| **Formal Proof** | Rigorous derivation in LaTeX, confirming Lyapunov stability and rank deficiency resolution. | [📄 **Read the Paper (PDF)**](./docs/Proof_of_Hybrid_Model.pdf) |
-| **Handwriting Log** | The original handwritten derivation notes, capturing the initial intuition and raw logic. | [✍️ **View Original Notes**](./docs/Handwritten_Proof.pdf) |
+| Version             | Description                                                                                 | Link                                                           |
+| :------------------ | :------------------------------------------------------------------------------------------ | :------------------------------------------------------------- |
+| **Formal Proof**    | Rigorous derivation in LaTeX, confirming Lyapunov stability and rank deficiency resolution. | [📄 **Read the Paper (PDF)**](./docs/Proof_of_Hybrid_Model.pdf) |
+| **Handwriting Log** | The original handwritten derivation notes, capturing the initial intuition and raw logic.   | [✍️ **View Original Notes**](./docs/Handwritten_Proof.pdf)      |
 
 ### Key Theoretical Contributions
 * **Divergence of Pure Integration:** Mathematically proves that open-loop IMU integration leads to unbounded drift due to the rank deficiency of the Fisher Information Matrix (FIM).
