@@ -1,14 +1,17 @@
-# Project Status: Post-Mortem & Legacy
+# Project Status: Archived (Post-Mortem)
 
-**"This repository is a documented failure of the linear paradigm in 3D reconstruction."**
+Trajecto was an experimental project aimed at solving 3D handwriting tracking using a single IMU and a hybrid ESKF-TCN closed-loop architecture. 
 
-Trajecto was an intensive attempt to solve 3D handwriting tracking using a single IMU and standard filtering (ESKF/TCN). While the engineering stack was fully integrated (L0-L7), I reached a fundamental mathematical deadlock:
+**Key Findings & Limitations**
+During development, I observed that the TCN's predictions within the closed-loop system were essentially functioning as bivector corrections to the ESKF's state vector. This realization highlighted the structural inefficiencies of using standard matrix/quaternion-based filtering for this specific problem space. Consequently, further development on this architecture has been halted.
 
-The Drift Problem: Standard Linear Algebra and Kalman Filters could not preserve the topological integrity of 3D motion over time, leading to insurmountable sensor drift.
+**⚠️ Disclaimer: Unverified & AI-Assisted Codebase**
+Please note that this repository is provided as-is and contains several unverified components:
+* **Incomplete Hardware Validation:** Many modules, particularly the C++ firmware and data analyzers, have not undergone full end-to-end verification on actual hardware.
+* **Code Bloat:** Significant portions of this codebase were generated using AI assistance. As a result, the architecture is quite bloated and has not been rigorously optimized or refactored. 
+* Thorough review and independent validation are strictly required before attempting to use or deploy any part of this system.
 
-The Realization: Brute-forcing errors with more parameters (TCN) was a "Micro-Fast Follower" trap. The core issue wasn't data volume, but the mathematical foundation (Matrices/Quaternions) itself.
-
-The Pivot: This failure served as the "system logout" point. It directly led to the development of [Versor](https://github.com/Concode0/Versor), where I utilize Geometric Algebra (GA) to redefine intelligence and physical logic from first principles.
+This project is now archived. The theoretical insights gained here directly led to the development of [Versor](https://github.com/Concode0/Versor), which explores Geometric Algebra (GA) to address these core geometric challenges from a different foundational perspective.
 
 ---
 
